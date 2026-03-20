@@ -4,7 +4,7 @@ on:
   push:
 
 env:
-  RUST_NIGHTLY_VERSION: "nightly-2025-09-10"
+  RUST_NIGHTLY_VERSION: "nightly-2026-03-17"
 
 jobs:
   check:

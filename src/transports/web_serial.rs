@@ -126,6 +126,7 @@ impl WebSerialHandler {
 
     async fn run(mut self) {
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let mut stop_task = stop_rx.into_future().fuse();
 
         let reader = ReadableStreamDefaultReader::new(&self.port.readable()).unwrap();
         let writer = self.port.writable().get_writer().unwrap();
@@ -134,7 +135,7 @@ impl WebSerialHandler {
         let mut read_task = Box::pin(Self::read_task(&reader, self.event_tx.clone()).fuse());
 
         futures::select! {
-            _ = stop_rx.fuse() => {
+            _ = stop_task => {
                 warn!("handler stopped");
             }
 

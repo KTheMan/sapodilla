@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, io::Cursor, ops::RangeInclusive};
 
 use egui::{Id, Modal, Pos2, ProgressBar, Ui, Vec2};
+use egui_dnd::{DragDropItem, Handle, dnd};
 use egui_extras::{
     Column, TableBuilder,
     syntax_highlighting::{CodeTheme, code_view_ui},
@@ -255,6 +256,17 @@ fn packet_details(ui: &mut Ui, has_exactly_one: bool, index: usize, packet: &Avo
         });
 }
 
+struct EnumeratedItem<T> {
+    item: T,
+    index: usize,
+}
+
+impl<T> DragDropItem for EnumeratedItem<T> {
+    fn id(&self) -> Id {
+        Id::new(self.index)
+    }
+}
+
 pub fn loaded_images(
     ui: &mut Ui,
     dpi: f32,
@@ -270,9 +282,19 @@ pub fn loaded_images(
     egui::ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            for (index, image) in loaded_images.iter_mut().enumerate() {
-                image_controls(ui, dpi, canvas_size, image, index, &mut remove);
-                ui.add_space(16.0);
+            let response = dnd(ui, "Images").with_animation_time(0.0).show(
+                loaded_images
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, item)| EnumeratedItem { item, index }),
+                |ui, EnumeratedItem { item, index }, handle, _dragging| {
+                    image_controls(ui, dpi, canvas_size, item, index, &mut remove, handle);
+                    ui.add_space(16.0);
+                },
+            );
+
+            if response.is_drag_finished() {
+                response.update_vec(loaded_images);
             }
         });
 
@@ -288,16 +310,19 @@ pub fn image_controls(
     image: &mut LoadedImage,
     index: usize,
     remove_index: &mut Option<usize>,
+    handle: Handle<'_>,
 ) {
     ui.horizontal(|ui| {
-        let (response, painter) = ui.allocate_painter(Vec2::splat(50.0), egui::Sense::empty());
+        handle.ui(ui, |ui| {
+            let (response, painter) = ui.allocate_painter(Vec2::splat(50.0), egui::Sense::empty());
 
-        painter.image(
-            image.sized_texture.id,
-            response.rect,
-            egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+            painter.image(
+                image.sized_texture.id,
+                response.rect,
+                egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        });
 
         ui.vertical(|ui| {
             ui.spacing_mut().interact_size.x = 72.0;
@@ -416,7 +441,7 @@ pub fn cut_controls(
 
     let mut buffer = cut_tuning.buffer / dpi * 25.4;
     ui.add(
-        egui::Slider::new(&mut buffer, 0.0..=5.0)
+        egui::Slider::new(&mut buffer, -1.0..=5.0)
             .suffix(" mm")
             .text("Padding Distance"),
     )
