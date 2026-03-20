@@ -34,7 +34,7 @@ pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
     let response = scene
         .show(ui, &mut canvas_rect, |ui| {
             Frame::canvas(ui.style())
-                .fill(Color32::WHITE)
+                .fill(state.background_color32())
                 .inner_margin(0.0)
                 .stroke(Stroke::new(4.0, Color32::BLACK))
                 .show(ui, |ui| {

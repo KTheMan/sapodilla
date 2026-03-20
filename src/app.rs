@@ -1,8 +1,8 @@
 use std::{borrow::Cow, collections::VecDeque, io::Write, sync::mpsc};
 
-use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
+use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
-use image::{EncodableLayout, GenericImageView};
+use image::{EncodableLayout, GenericImageView, ImageEncoder};
 use serde::Deserialize;
 use sha1::Digest;
 use strum::IntoEnumIterator;
@@ -64,6 +64,7 @@ pub struct SapodillaApp {
 
     pub canvas_rect: egui::Rect,
     pub loaded_images: Vec<LoadedImage>,
+    pub background_color: [u8; 3],
 
     pub error: Option<anyhow::Error>,
 }
@@ -201,6 +202,7 @@ impl SapodillaApp {
 
             canvas_rect: egui::Rect::ZERO,
             loaded_images: Default::default(),
+            background_color: [255, 255, 255],
 
             error: None,
         }
@@ -236,13 +238,21 @@ impl SapodillaApp {
         });
     }
 
+    pub fn background_color32(&self) -> Color32 {
+        Color32::from_rgb(
+            self.background_color[0],
+            self.background_color[1],
+            self.background_color[2],
+        )
+    }
+
     fn render_image(&self) -> image::DynamicImage {
         let canvas = self.get_canvas().size;
 
         let mut buf = image::ImageBuffer::from_pixel(
             canvas.x as u32,
             canvas.y as u32,
-            image::Rgba::<u8>([255, 255, 255, 255]),
+            image::Rgba(self.background_color32().to_array()),
         );
 
         for loaded_image in &self.loaded_images {
@@ -668,11 +678,21 @@ impl SapodillaApp {
 
             if ui.button("Export Canvas").clicked() {
                 let im = self.render_image();
-                let buf = encode_image(&im);
+
+                let mut buf = Vec::with_capacity(1024 * 1024);
+                let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+                encoder
+                    .write_image(
+                        im.to_rgba8().as_bytes(),
+                        im.width(),
+                        im.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .unwrap();
 
                 spawn(async move {
                     let Some(handle) = rfd::AsyncFileDialog::new()
-                        .set_file_name("canvas.jpg")
+                        .set_file_name("canvas.png")
                         .save_file()
                         .await
                     else {
@@ -909,6 +929,14 @@ impl eframe::App for SapodillaApp {
                         });
                     }
                 }
+
+                ui.separator();
+                ui.heading("Canvas");
+
+                ui.horizontal(|ui| {
+                    ui.label("Background Color");
+                    ui.color_edit_button_srgb(&mut self.background_color);
+                });
 
                 if !self.loaded_images.is_empty() {
                     ui.separator();
