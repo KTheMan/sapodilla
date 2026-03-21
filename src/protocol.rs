@@ -474,7 +474,7 @@ impl Default for CutterCalibration {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum ModeType {
     Print,
     PrintAndCut,

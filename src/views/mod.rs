@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::{
     app::{Action, ContextSender, LoadedImage},
     cut::CutTuning,
-    protocol::{self, AvocadoId, AvocadoPacket, AvocadoPacketReader, ProtocolError},
+    protocol::{self, AvocadoId, AvocadoPacket, AvocadoPacketReader, ModeType, ProtocolError},
     spawn,
 };
 
@@ -272,6 +272,7 @@ pub fn loaded_images(
     dpi: f32,
     canvas_size: Vec2,
     loaded_images: &mut Vec<LoadedImage>,
+    mode_type: ModeType,
 ) {
     ui.heading("Images");
 
@@ -288,7 +289,16 @@ pub fn loaded_images(
                     .enumerate()
                     .map(|(index, item)| EnumeratedItem { item, index }),
                 |ui, EnumeratedItem { item, index }, handle, _dragging| {
-                    image_controls(ui, dpi, canvas_size, item, index, &mut remove, handle);
+                    image_controls(
+                        ui,
+                        dpi,
+                        canvas_size,
+                        item,
+                        index,
+                        &mut remove,
+                        handle,
+                        mode_type,
+                    );
                     ui.add_space(16.0);
                 },
             );
@@ -303,6 +313,7 @@ pub fn loaded_images(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn image_controls(
     ui: &mut Ui,
     dpi: f32,
@@ -311,6 +322,7 @@ pub fn image_controls(
     index: usize,
     remove_index: &mut Option<usize>,
     handle: Handle<'_>,
+    mode_type: ModeType,
 ) {
     ui.horizontal(|ui| {
         handle.ui(ui, |ui| {
@@ -392,6 +404,11 @@ pub fn image_controls(
             if ui.small_button("Remove").clicked() {
                 *remove_index = Some(index);
             }
+
+            if mode_type.has_cutting() {
+                ui.checkbox(&mut image.enable_cutting, "Cut")
+                    .on_hover_text("Enable cut line generation for this image");
+            }
         });
     });
 }
@@ -438,6 +455,7 @@ pub fn cut_controls(
     );
 
     ui.checkbox(&mut cut_tuning.internal, "Allow Internal Cuts");
+    ui.checkbox(&mut cut_tuning.white_transparent, "Make White Transparent");
 
     let mut buffer = cut_tuning.buffer / dpi * 25.4;
     ui.add(

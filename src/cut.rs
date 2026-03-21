@@ -4,9 +4,13 @@ use egui::Vec2;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use geo::{
     Buffer, ChaikinSmoothing, Contains, Coord, Euclidean, Intersects, LineString, MultiPolygon,
-    Polygon, Rect, Scale, Simplify, Validation, Winding, coord, line_measures::LengthMeasurable,
+    Polygon, Rect, Scale, SimplifyVwPreserve, Validation, Winding, coord,
+    line_measures::LengthMeasurable,
 };
-use image::imageops::{self, FilterType};
+use image::{
+    GrayImage, Luma,
+    imageops::{self, FilterType},
+};
 use imageproc::contours::BorderType;
 use itertools::Itertools;
 use tracing::{debug, error, trace, warn};
@@ -23,7 +27,7 @@ pub enum CutAction {
 pub struct CutResult {
     pub has_intersections: bool,
     pub off_canvas: bool,
-    pub polygons: Vec<MultiPolygon<f32>>,
+    pub line_strings: Vec<LineString<f32>>,
 }
 
 #[derive(Clone)]
@@ -33,6 +37,7 @@ pub struct CutTuning {
     pub smoothing: usize,
     pub simplify: f32,
     pub internal: bool,
+    pub white_transparent: bool,
 }
 
 impl Default for CutTuning {
@@ -43,6 +48,7 @@ impl Default for CutTuning {
             smoothing: 2,
             simplify: 1.5,
             internal: false,
+            white_transparent: true,
         }
     }
 }
@@ -86,14 +92,11 @@ impl CutGenerator {
             total,
         })?;
 
-        let mut polygons = Vec::new();
+        let mut line_strings = Vec::new();
 
         for (index, image) in self.images.iter().enumerate() {
-            let polygon = self.image(image);
-
-            if let Some(polygon) = polygon {
-                polygons.push(polygon);
-            }
+            let paths = self.image(image);
+            line_strings.extend_from_slice(&paths);
 
             self.tx.unbounded_send(CutAction::Progress {
                 completed: index + 1,
@@ -101,7 +104,7 @@ impl CutGenerator {
             })?;
         }
 
-        let has_intersections = polygons
+        let has_intersections = line_strings
             .iter()
             .combinations(2)
             .any(|polygons| polygons[0].intersects(polygons[1]));
@@ -114,20 +117,20 @@ impl CutGenerator {
         )
         .to_polygon();
 
-        let off_canvas = polygons
+        let off_canvas = line_strings
             .iter()
             .any(|polygons| !canvas_polygon.contains(polygons));
 
         self.tx.unbounded_send(CutAction::Done(CutResult {
             has_intersections,
             off_canvas,
-            polygons,
+            line_strings,
         }))?;
 
         Ok(())
     }
 
-    fn image(&self, image: &LoadedImage) -> Option<MultiPolygon<f32>> {
+    fn image(&self, image: &LoadedImage) -> Vec<LineString<f32>> {
         trace!("starting processing image");
 
         // Resize image to the expected dimensions. Doesn't need to be a high
@@ -137,32 +140,46 @@ impl CutGenerator {
             &image.image,
             size.x as u32,
             size.y as u32,
-            FilterType::Nearest,
+            FilterType::Gaussian,
         );
 
-        // Invert the colors, unlike a normal image we need blacks to be visible
-        // but don't care about white. Normally transparent pixels turn black
-        // but we need them to be white for our inversion.
-        let mut im = image::ImageBuffer::from_pixel(
-            resized.width(),
-            resized.height(),
-            image::Rgba([255, 255, 255, 255]),
-        );
-        image::imageops::overlay(&mut im, &resized, 0, 0);
-        imageops::colorops::invert(&mut im);
+        let threshold = if self.tuning.white_transparent {
+            // Invert the colors, unlike a normal image we need blacks to be visible
+            // but don't care about white. Normally transparent pixels turn black
+            // but we need them to be white for our inversion.
+            let mut im = image::ImageBuffer::from_pixel(
+                resized.width(),
+                resized.height(),
+                image::Rgba([255, 255, 255, 255]),
+            );
+            image::imageops::overlay(&mut im, &resized, 0, 0);
+            imageops::colorops::invert(&mut im);
 
-        // `find_contours` only works on grayscale images, so convert it.
-        let grayscale = imageops::grayscale(&im);
+            let grayscale = imageops::grayscale(&im);
 
-        let contours = imageproc::contours::find_contours::<u32>(&grayscale);
+            imageproc::contrast::threshold(
+                &grayscale,
+                5,
+                imageproc::contrast::ThresholdType::Binary,
+            )
+        } else {
+            GrayImage::from_fn(resized.width(), resized.height(), |x, y| {
+                let image::Rgba([_, _, _, alpha]) = resized.get_pixel(x, y);
+
+                if *alpha > 127 { Luma([255]) } else { Luma([0]) }
+            })
+        };
+
+        let contours = imageproc::contours::find_contours::<u32>(&threshold);
 
         // Keep track of the outer parts of contours separately from holes, so
         // we can construct a MultiPolygon with an exterior and interiors.
         let mut outers = HashMap::new();
         let mut holes: HashMap<usize, Vec<LineString<f32>>> = HashMap::new();
+        let mut frame_index: Option<usize> = None;
 
         for (index, contour) in contours.into_iter().enumerate() {
-            // Create the line from the points in the contour, offest by the
+            // Create the line from the points in the contour, offset by the
             // position of the image in the canvas. We need to have these
             // offsets here to check if anything overlaps.
             let mut line_string = LineString::from_iter(contour.points.into_iter().map(|point| {
@@ -174,99 +191,85 @@ impl CutGenerator {
 
             line_string.close();
 
-            if !line_string.is_valid() {
-                warn!("line string was not valid");
+            if let Err(err) = line_string.check_validation() {
+                warn!("line string was not valid: {err}",);
                 continue;
             }
 
             // Based on the border type, determine where to put this polygon.
             // It's also possible for a hole to not have a parent, and in those
-            // cases we can promote it to a outer type.
+            // cases we need to add the whole image frame as an outer line.
             match contour.border_type {
                 BorderType::Outer => {
                     line_string.make_cw_winding();
+                    debug!(index, "adding outer");
                     outers.insert(index, line_string);
                 }
                 BorderType::Hole => {
-                    if let Some(parent) = contour.parent {
-                        line_string.make_ccw_winding();
-                        holes.entry(parent).or_default().push(line_string);
-                    } else {
-                        warn!(index, "hole did not have parent, using as outer");
-                        line_string.make_cw_winding();
-                        outers.insert(index, line_string);
-                    };
+                    line_string.make_ccw_winding();
+                    let hole_key = contour.parent.unwrap_or(*frame_index.get_or_insert(index));
+                    holes.entry(hole_key).or_default().push(line_string);
                 }
             }
         }
 
+        let get_frame = || {
+            let coords = [
+                coord! { x: 0.0, y: 0.0 },
+                coord! { x: 0.0, y: size.y },
+                coord! { x: size.x, y: size.y },
+                coord! { x: size.x, y: 0.0},
+                coord! { x: 0.0, y: 0.0},
+            ];
+
+            let offset = coord! { x: image.offset.x, y: image.offset.y };
+            LineString::new(coords.into_iter().map(|coord| coord + offset).collect())
+        };
+
+        // If the outers is empty try to get the frame index, otherwise insert
+        // the image frame at 0.
         if outers.is_empty() {
-            warn!("image had no sections");
-            return None;
+            outers.insert(frame_index.unwrap_or(0), get_frame());
         }
 
-        // Now we can create polygons from our line strings, filtering out the
-        // ones that are too small.
-        let mut polygons = Vec::with_capacity(outers.len());
-        for (index, outer) in outers {
-            let outer_length = outer.length(&Euclidean);
-            if outer_length < self.tuning.minimum_length {
-                debug!(
-                    outer_length,
-                    minimum_length = self.tuning.minimum_length,
-                    "exterior length was too short"
-                );
-                continue;
-            } else {
-                debug!(outer_length);
-            }
+        // Create polygons from the line segments, only keeping interiors if we
+        // want to cut them.
+        let polygons: Vec<Polygon<f32>> = outers
+            .into_iter()
+            .map(|(index, line)| {
+                Polygon::new(
+                    line,
+                    if self.tuning.internal {
+                        holes.remove(&index).unwrap_or_default()
+                    } else {
+                        vec![]
+                    },
+                )
+            })
+            .collect();
 
-            let holes = if self.tuning.internal {
-                holes
-                    .remove(&index)
-                    .map(|line_strings| self.filter_small_holes(line_strings).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let polygon = Polygon::new(outer, holes);
-            polygons.push(polygon);
-        }
-
-        // And now that we've filtered everything, we can refine the polygons
-        // based on our tuning settings to smooth, simplify, and buffer it to
-        // make it a reasonable cut path.
-        let mut refined_polygons = Vec::with_capacity(polygons.len());
-        for polygon in polygons.iter() {
-            if !self.tuning.internal
-                && polygons
-                    .iter()
-                    .any(|other| other != polygon && other.contains(polygon))
-            {
-                warn!("polygon was contained by other when we didn't want internal holes");
-                continue;
-            }
-
-            let simplified_polygon = polygon
-                .chaikin_smoothing(self.tuning.smoothing)
-                .simplify(self.tuning.simplify);
-
-            let buffered_polygon = simplified_polygon.buffer(self.tuning.buffer);
-
-            // We only want to grow our shapes, so we don't have to worry about
-            // the exterior becoming too small. We do however have to worry
-            // about it for the interiors.
-            refined_polygons.extend(buffered_polygon.0.into_iter().map(|polygon| {
+        // Wrap up our polygons by expanding them as needed, applying
+        // simplification and smoothing, and filtering out areas that ended up
+        // smaller than we want to cut.
+        MultiPolygon::new(polygons)
+            .buffer(self.tuning.buffer)
+            .simplify_vw_preserve(self.tuning.simplify)
+            .chaikin_smoothing(self.tuning.smoothing)
+            .into_iter()
+            .filter_map(|polygon| {
                 let (exterior, interiors) = polygon.into_inner();
-                let interiors = self.filter_small_holes(interiors).collect();
-                Polygon::new(exterior, interiors)
-            }));
-        }
-
-        trace!("finished processing image");
-
-        Some(MultiPolygon::new(refined_polygons))
+                if exterior.length(&Euclidean) < self.tuning.minimum_length {
+                    return None;
+                }
+                let interiors = self.filter_small_holes(interiors);
+                Some(Polygon::new(exterior, interiors.collect()))
+            })
+            .flat_map(|polygon| {
+                let (exterior, mut interiors) = polygon.into_inner();
+                interiors.push(exterior);
+                interiors
+            })
+            .collect()
     }
 
     fn filter_small_holes(
@@ -292,13 +295,13 @@ impl CutGenerator {
     /// Mirror generated cut lines for sending to the device.
     #[allow(dead_code)]
     pub fn mirror_cuts<'a>(
-        polygons: impl IntoIterator<Item = &'a MultiPolygon<f32>>,
+        line_strings: impl IntoIterator<Item = &'a LineString<f32>>,
         canvas_size: Vec2,
-    ) -> impl Iterator<Item = MultiPolygon<f32>> {
+    ) -> impl Iterator<Item = LineString<f32>> {
         let point = Coord::from((canvas_size.x, canvas_size.y / 2.0));
 
-        polygons
+        line_strings
             .into_iter()
-            .map(move |polygon| polygon.scale_around_point(1.0, -1.0, point))
+            .map(move |line_string| line_string.scale_around_point(1.0, -1.0, point))
     }
 }

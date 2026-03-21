@@ -2,6 +2,7 @@ use std::{borrow::Cow, collections::VecDeque, io::Write, sync::mpsc};
 
 use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
+use geo::LineString;
 use image::{EncodableLayout, GenericImageView, ImageEncoder};
 use serde::Deserialize;
 use sha1::Digest;
@@ -53,7 +54,7 @@ pub struct SapodillaApp {
     pub packets: VecDeque<AvocadoPacket>,
     pub viewing_packet: Option<AvocadoPacket>,
     pub cut_tuning: CutTuning,
-    pub cut_shapes: Vec<geo::MultiPolygon<f32>>,
+    pub cut_shapes: Vec<LineString<f32>>,
     pub has_intersections: bool,
     pub off_canvas: bool,
     pub cut_progress: Option<(usize, usize)>,
@@ -103,6 +104,7 @@ pub struct LoadedImage {
     pub offset: Pos2,
     pub scale: Vec2,
     pub scale_locked: bool,
+    pub enable_cutting: bool,
 
     // We need this handle so egui doesn't drop the texture.
     #[allow(dead_code)]
@@ -134,6 +136,7 @@ impl LoadedImage {
             offset: offset.unwrap_or(Pos2::ZERO),
             scale: Vec2::splat(1.0),
             scale_locked: true,
+            enable_cutting: true,
             handle,
         })
     }
@@ -377,7 +380,7 @@ impl SapodillaApp {
                     }
                     CutAction::Done(result) => {
                         self.has_intersections = result.has_intersections;
-                        self.cut_shapes = result.polygons;
+                        self.cut_shapes = result.line_strings;
                         self.cut_progress = None;
                         self.off_canvas = result.off_canvas;
                     }
@@ -913,7 +916,11 @@ impl eframe::App for SapodillaApp {
 
                         let tx = self.tx.clone();
                         let mut rx = CutGenerator::start(
-                            self.loaded_images.clone(),
+                            self.loaded_images
+                                .iter()
+                                .filter(|image| image.enable_cutting)
+                                .cloned()
+                                .collect(),
                             self.cut_tuning.clone(),
                             self.get_canvas(),
                         );
@@ -945,6 +952,7 @@ impl eframe::App for SapodillaApp {
                         DEVICES[self.selected_device].dpi,
                         self.get_canvas().size,
                         &mut self.loaded_images,
+                        DEVICES[self.selected_device].modes[self.selected_mode].mode_type,
                     );
                 }
             });
@@ -1046,20 +1054,18 @@ fn encode_image(im: &image::DynamicImage) -> Vec<u8> {
 }
 
 fn encode_plt(
-    cut_shapes: &[geo::MultiPolygon<f32>],
+    cut_shapes: &[LineString<f32>],
     cutter_calibration: CutterCalibration,
     canvas_size: &CanvasSize,
 ) -> Vec<u8> {
     let mut buf = b"IN VER0.1.0 KP42".to_vec();
 
-    let flipped = CutGenerator::mirror_cuts(cut_shapes.iter(), canvas_size.size);
+    let mut flipped: Vec<_> =
+        CutGenerator::mirror_cuts(cut_shapes.iter(), canvas_size.size).collect();
 
-    let mut polygons: Vec<_> = flipped
-        .flat_map(|multi_polygon| multi_polygon.0.into_iter())
-        .collect();
-    polygons.sort_by(|a, b| {
-        let a_start = *a.exterior().0.first().unwrap();
-        let b_start = *b.exterior().0.first().unwrap();
+    flipped.sort_by(|a, b| {
+        let a_start = *a.0.first().unwrap();
+        let b_start = *b.0.first().unwrap();
 
         a_start
             .y
@@ -1067,12 +1073,8 @@ fn encode_plt(
             .then(a_start.x.total_cmp(&b_start.x))
     });
 
-    for polygon in polygons {
-        write_line_string(&cutter_calibration, &mut buf, polygon.exterior());
-
-        for interior in polygon.interiors() {
-            write_line_string(&cutter_calibration, &mut buf, interior);
-        }
+    for line in flipped {
+        write_line_string(&cutter_calibration, &mut buf, &line);
     }
 
     write!(buf, " U6476,0 @ ").unwrap();

@@ -3,7 +3,7 @@ use egui::{
     Stroke, Ui,
     emath::{self, RectTransform},
 };
-use geo::MultiPolygon;
+use geo::LineString;
 use tracing::instrument;
 
 use crate::{SapodillaApp, protocol::DEVICES};
@@ -129,32 +129,19 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
 }
 
 #[instrument(skip_all)]
-fn paint_polygons(to_screen: &RectTransform, painter: &Painter, cut_shapes: &[MultiPolygon<f32>]) {
-    let mut count = 0;
+fn paint_polygons(to_screen: &RectTransform, painter: &Painter, cut_shapes: &[LineString<f32>]) {
+    for (count, line_string) in cut_shapes.iter().enumerate() {
+        // Make each cut line visually distinguishable.
+        let stroke = Stroke::new(CUT_LINE_WIDTH, FUN_COLORS[count % FUN_COLORS.len()]);
 
-    for multi_polygon in cut_shapes.iter() {
-        for polygon in multi_polygon.iter() {
-            // Make each cut line visually distinguishable.
-            let stroke = Stroke::new(CUT_LINE_WIDTH, FUN_COLORS[count % FUN_COLORS.len()]);
+        // Create a line shape for each line from all our polygons.
+        let shapes = line_string.lines().map(|line| {
+            let start = to_screen.transform_pos(Pos2::new(line.start.x, line.start.y));
+            let end = to_screen.transform_pos(Pos2::new(line.end.x, line.end.y));
 
-            // Get the lines for the exterior and interior shapes.
-            let lines = polygon.exterior().lines().chain(
-                polygon
-                    .interiors()
-                    .iter()
-                    .flat_map(|interior| interior.lines()),
-            );
+            Shape::line(vec![start, end], stroke)
+        });
 
-            // Create a line shape for each line from all our polygons.
-            let shapes = lines.map(|line| {
-                let start = to_screen.transform_pos(Pos2::new(line.start.x, line.start.y));
-                let end = to_screen.transform_pos(Pos2::new(line.end.x, line.end.y));
-
-                Shape::line(vec![start, end], stroke)
-            });
-
-            painter.extend(shapes);
-            count += 1;
-        }
+        painter.extend(shapes);
     }
 }
