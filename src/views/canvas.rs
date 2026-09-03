@@ -105,8 +105,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         );
     }
 
-    let mut artwork_transform_changed =
-        interact_transform_handles(ui, state, response.id, &to_screen, scene_scale);
+    let mut artwork_transform_changed = false;
     let transform_active_image_id = state
         .canvas_transform_gesture
         .as_ref()
@@ -215,8 +214,10 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         }
     }
 
+    artwork_transform_changed |=
+        interact_transform_handles(ui, state, response.id, &to_screen, scene_scale);
     if artwork_transform_changed {
-        invalidate_auto_cutlines(state);
+        state.synchronize_cut_geometry();
     }
 
     if state.show_cutlines {
@@ -406,7 +407,15 @@ fn resize_from_corner(
             .max(f32::EPSILON);
         let maximum = (MAX_IMAGE_SCALE / scale.x.abs().max(f32::EPSILON))
             .min(MAX_IMAGE_SCALE / scale.y.abs().max(f32::EPSILON));
-        let factor = (local_delta.dot(diagonal) / denominator).clamp(minimum, maximum);
+        let requested_factor = local_delta.dot(diagonal) / denominator;
+        let factor = if minimum <= maximum {
+            requested_factor.clamp(minimum, maximum)
+        } else {
+            // A persisted non-uniform scale can make the minimum-size and
+            // maximum-scale constraints mutually exclusive. Prefer a finite,
+            // positive image over panicking while the user repairs the scale.
+            minimum
+        };
         (size * factor, scale * factor)
     } else {
         let width =
@@ -482,7 +491,8 @@ fn interact_transform_handles(
                 CursorIcon::ResizeNwSe
             } else {
                 CursorIcon::ResizeNeSw
-            });
+            })
+            .on_hover_text("Drag to resize · Hold Shift to toggle aspect lock");
         if response.drag_started() {
             gesture = Some(TransformGesture::Resize {
                 image_id: image_id.clone(),
@@ -533,7 +543,8 @@ fn interact_transform_handles(
             canvas_id.with(("rotate", image_id.as_str())),
             Sense::drag(),
         )
-        .on_hover_cursor(CursorIcon::Crosshair);
+        .on_hover_cursor(CursorIcon::Crosshair)
+        .on_hover_text("Drag to rotate · Hold Shift to snap to 15°");
     if rotate_response.drag_started() {
         gesture = Some(TransformGesture::Rotate {
             image_id: image_id.clone(),
@@ -638,24 +649,6 @@ fn paint_transform_controls(
     );
 }
 
-fn invalidate_auto_cutlines(state: &mut SapodillaApp) {
-    let count = state.auto_cut_count.min(state.cut_shapes.len());
-    if count == 0 {
-        return;
-    }
-    state.cut_shapes.drain(..count);
-    state.cut_modes.drain(..count.min(state.cut_modes.len()));
-    state
-        .cutline_owners
-        .drain(..count.min(state.cutline_owners.len()));
-    state
-        .cutline_locked
-        .drain(..count.min(state.cutline_locked.len()));
-    state.auto_cut_count = 0;
-    state.selected_cut_path = None;
-    state.selected_cut_node = None;
-}
-
 fn nice_step_ceiling(value: f32) -> f32 {
     if !value.is_finite() || value <= 0.0 {
         return 1.0;
@@ -683,7 +676,12 @@ fn adaptive_grid_step_mm(
     let base = requested_mm.clamp(0.5, 100.0);
     let screen_requirement = MIN_GRID_SCREEN_SPACING / (pixels_per_mm * scene_scale).max(0.001);
     let count_requirement = extent_pixels / pixels_per_mm / MAX_GRID_LINES_PER_AXIS as f32;
-    nice_step_ceiling(base.max(screen_requirement).max(count_requirement))
+    let required = screen_requirement.max(count_requirement);
+    if required <= base {
+        base
+    } else {
+        base * nice_step_ceiling(required / base)
+    }
 }
 
 fn tick_positions(extent_pixels: f32, step_pixels: f32) -> Vec<f32> {
@@ -695,7 +693,8 @@ fn tick_positions(extent_pixels: f32, step_pixels: f32) -> Vec<f32> {
         return Vec::new();
     }
     let count = (extent_pixels / step_pixels).floor() as usize;
-    (0..=count.min(MAX_GRID_LINES_PER_AXIS))
+    (0..=count)
+        .take(MAX_GRID_LINES_PER_AXIS)
         .map(|index| index as f32 * step_pixels)
         .collect()
 }
@@ -810,7 +809,7 @@ fn paint_rulers(
     let tick_color = Color32::from_gray(75);
     let first_x = (((visible.left() - canvas_rect.left()) / step_pixels).floor() as isize).max(0);
     let last_x = (((visible.right() - canvas_rect.left()) / step_pixels).ceil() as usize)
-        .min(MAX_GRID_LINES_PER_AXIS);
+        .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
     for index in first_x as usize..=last_x {
         let x = canvas_rect.left() + index as f32 * step_pixels;
         if x > canvas_rect.right() {
@@ -838,7 +837,7 @@ fn paint_rulers(
 
     let first_y = (((visible.top() - canvas_rect.top()) / step_pixels).floor() as isize).max(0);
     let last_y = (((visible.bottom() - canvas_rect.top()) / step_pixels).ceil() as usize)
-        .min(MAX_GRID_LINES_PER_AXIS);
+        .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
     for index in first_y as usize..=last_y {
         let y = canvas_rect.top() + index as f32 * step_pixels;
         if y > canvas_rect.bottom() {
@@ -1011,10 +1010,21 @@ mod tests {
     fn adaptive_grid_uses_nice_steps_and_caps_line_count() {
         let pixels_per_mm = 10.0;
         let step = adaptive_grid_step_mm(0.5, pixels_per_mm, 0.1, 1_000_000.0);
-        assert!(matches!(step, 200.0 | 500.0 | 1_000.0));
+        assert_eq!(step, 250.0);
         let ticks = tick_positions(1_000_000.0, step * pixels_per_mm);
-        assert!(ticks.len() <= MAX_GRID_LINES_PER_AXIS + 1);
+        assert!(ticks.len() <= MAX_GRID_LINES_PER_AXIS);
         assert!(ticks.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[test]
+    fn grid_preserves_requested_spacing_until_adaptation_is_needed() {
+        for requested in [6.0, 25.0, 75.0] {
+            assert_eq!(
+                adaptive_grid_step_mm(requested, 10.0, 1.0, 1_000.0),
+                requested
+            );
+        }
+        assert_eq!(adaptive_grid_step_mm(6.0, 10.0, 0.01, 1_000.0), 300.0);
     }
 
     #[test]
@@ -1108,6 +1118,27 @@ mod tests {
     }
 
     #[test]
+    fn aspect_locked_resize_handles_extreme_persisted_scales_without_panicking() {
+        let scale = Vec2::new(2_000.0, 0.0001);
+        let natural = Vec2::splat(100.0);
+        let size = natural * scale;
+        let result = resize_from_corner(
+            Pos2::ZERO,
+            size,
+            scale,
+            natural,
+            23.0,
+            0,
+            Pos2::new(-20.0, -20.0),
+            true,
+        )
+        .unwrap();
+        assert!(result.0.x.is_finite() && result.0.y.is_finite());
+        assert!(result.1.x.is_finite() && result.1.y.is_finite());
+        assert!(result.1.x > 0.0 && result.1.y > 0.0);
+    }
+
+    #[test]
     fn rotation_is_normalized_and_shift_snaps_to_fifteen_degrees() {
         let center = Pos2::new(50.0, 50.0);
         assert!((rotation_from_pointer(center, Pos2::new(50.0, 0.0), false)).abs() < 0.001);
@@ -1125,6 +1156,56 @@ mod tests {
             let normalized = normalize_degrees(degrees);
             assert!((-180.0..180.0).contains(&normalized));
         }
+    }
+
+    #[test]
+    fn transform_handle_registered_after_artwork_wins_pointer_capture() {
+        fn run_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (bool, bool) {
+            let mut body_dragged = false;
+            let mut handle_dragged = false;
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let body = ui.interact(
+                        Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(110.0, 110.0)),
+                        Id::new("test-artwork"),
+                        Sense::drag(),
+                    );
+                    let handle = ui.interact(
+                        Rect::from_center_size(Pos2::new(50.0, 50.0), Vec2::splat(18.0)),
+                        Id::new("test-handle"),
+                        Sense::drag(),
+                    );
+                    body_dragged = body.dragged();
+                    handle_dragged = handle.dragged();
+                });
+            });
+            (body_dragged, handle_dragged)
+        }
+
+        let context = egui::Context::default();
+        run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(50.0, 50.0))],
+        );
+        run_frame(
+            &context,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(50.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let (body_dragged, handle_dragged) = run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(75.0, 75.0))],
+        );
+        assert!(!body_dragged);
+        assert!(handle_dragged);
     }
 
     #[test]

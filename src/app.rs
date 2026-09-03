@@ -88,7 +88,40 @@ pub enum Action {
         job_id: u64,
         error: anyhow::Error,
     },
-    Cut(CutAction),
+    Cut {
+        source_geometry: CutGeometrySnapshot,
+        action: CutAction,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutGeometrySnapshot {
+    device: usize,
+    mode: usize,
+    canvas_size: usize,
+    images: Vec<CutImageGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CutImageGeometry {
+    id: String,
+    offset: [u32; 2],
+    scale: [u32; 2],
+    rotation_degrees: u32,
+    visible: bool,
+    enable_cutting: bool,
+}
+
+fn update_cut_geometry_snapshot(
+    previous: &mut Option<CutGeometrySnapshot>,
+    current: CutGeometrySnapshot,
+) -> bool {
+    if previous.as_ref() == Some(&current) {
+        false
+    } else {
+        *previous = Some(current);
+        true
+    }
 }
 
 pub struct SapodillaApp {
@@ -129,6 +162,7 @@ pub struct SapodillaApp {
     pub manual_cut_shapes: Vec<LineString<f32>>,
     pub cut_modes: Vec<CutMode>,
     pub auto_cut_count: usize,
+    cut_geometry_snapshot: Option<CutGeometrySnapshot>,
     pub has_intersections: bool,
     pub off_canvas: bool,
     pub cut_progress: Option<(usize, usize)>,
@@ -459,6 +493,7 @@ impl SapodillaApp {
             manual_cut_shapes: Vec::new(),
             cut_modes: Vec::new(),
             auto_cut_count: 0,
+            cut_geometry_snapshot: None,
             has_intersections: false,
             off_canvas: false,
             cut_progress: None,
@@ -517,6 +552,51 @@ impl SapodillaApp {
 
             error: None,
         }
+    }
+
+    fn current_cut_geometry(&self) -> CutGeometrySnapshot {
+        CutGeometrySnapshot {
+            device: self.selected_device,
+            mode: self.selected_mode,
+            canvas_size: self.selected_canvas_size,
+            images: self
+                .loaded_images
+                .iter()
+                .map(|image| CutImageGeometry {
+                    id: image.id.clone(),
+                    offset: [image.offset.x.to_bits(), image.offset.y.to_bits()],
+                    scale: [image.scale.x.to_bits(), image.scale.y.to_bits()],
+                    rotation_degrees: image.rotation_degrees.to_bits(),
+                    visible: image.visible,
+                    enable_cutting: image.enable_cutting,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn synchronize_cut_geometry(&mut self) {
+        let current = self.current_cut_geometry();
+        if !update_cut_geometry_snapshot(&mut self.cut_geometry_snapshot, current) {
+            return;
+        }
+        self.cut_progress = None;
+        self.invalidate_auto_cutlines();
+    }
+
+    fn invalidate_auto_cutlines(&mut self) {
+        let count = self.auto_cut_count.min(self.cut_shapes.len());
+        if count == 0 {
+            return;
+        }
+        self.cut_shapes.drain(..count);
+        self.cut_modes.drain(..count.min(self.cut_modes.len()));
+        self.cutline_owners
+            .drain(..count.min(self.cutline_owners.len()));
+        self.cutline_locked
+            .drain(..count.min(self.cutline_locked.len()));
+        self.auto_cut_count = 0;
+        self.selected_cut_path = None;
+        self.selected_cut_node = None;
     }
 
     fn get_transport(&self) -> Rc<Mutex<Transport>> {
@@ -1884,52 +1964,64 @@ impl SapodillaApp {
                     self.active_queue_jobs.retain(|_, active| *active != job_id);
                     self.error = Some(error);
                 }
-                Action::Cut(action) => match action {
-                    CutAction::Progress { completed, total } => {
-                        self.cut_progress = Some((completed, total));
+                Action::Cut {
+                    source_geometry,
+                    action,
+                } => {
+                    if source_geometry != self.current_cut_geometry() {
+                        if matches!(action, CutAction::Done(_)) {
+                            self.cut_progress = None;
+                        }
+                        continue;
                     }
-                    CutAction::Done(result) => {
-                        let manual_owners = (0..self.manual_cut_shapes.len())
-                            .map(|index| {
-                                self.cutline_owners
-                                    .get(self.auto_cut_count + index)
-                                    .cloned()
-                                    .flatten()
-                            })
-                            .collect::<Vec<_>>();
-                        let manual_locks = (0..self.manual_cut_shapes.len())
-                            .map(|index| {
-                                self.cutline_locked
-                                    .get(self.auto_cut_count + index)
-                                    .copied()
-                                    .unwrap_or(false)
-                            })
-                            .collect::<Vec<_>>();
-                        let next_modes = modes_after_regeneration(
-                            &self.cut_modes,
-                            self.auto_cut_count,
-                            result.line_strings.len(),
-                            self.manual_cut_shapes.len(),
-                        );
-                        self.has_intersections = result.has_intersections;
-                        self.auto_cut_count = result.line_strings.len();
-                        self.cut_shapes = result.line_strings;
-                        self.cut_modes = next_modes;
-                        self.cutline_owners = vec![None; self.auto_cut_count];
-                        self.cutline_locked = vec![false; self.auto_cut_count];
-                        self.cut_shapes.extend(self.manual_cut_shapes.clone());
-                        self.cutline_owners.extend(manual_owners);
-                        self.cutline_locked.extend(manual_locks);
-                        self.cut_progress = None;
-                        self.off_canvas = result.off_canvas;
+                    match action {
+                        CutAction::Progress { completed, total } => {
+                            self.cut_progress = Some((completed, total));
+                        }
+                        CutAction::Done(result) => {
+                            let manual_owners = (0..self.manual_cut_shapes.len())
+                                .map(|index| {
+                                    self.cutline_owners
+                                        .get(self.auto_cut_count + index)
+                                        .cloned()
+                                        .flatten()
+                                })
+                                .collect::<Vec<_>>();
+                            let manual_locks = (0..self.manual_cut_shapes.len())
+                                .map(|index| {
+                                    self.cutline_locked
+                                        .get(self.auto_cut_count + index)
+                                        .copied()
+                                        .unwrap_or(false)
+                                })
+                                .collect::<Vec<_>>();
+                            let next_modes = modes_after_regeneration(
+                                &self.cut_modes,
+                                self.auto_cut_count,
+                                result.line_strings.len(),
+                                self.manual_cut_shapes.len(),
+                            );
+                            self.has_intersections = result.has_intersections;
+                            self.auto_cut_count = result.line_strings.len();
+                            self.cut_shapes = result.line_strings;
+                            self.cut_modes = next_modes;
+                            self.cutline_owners = vec![None; self.auto_cut_count];
+                            self.cutline_locked = vec![false; self.auto_cut_count];
+                            self.cut_shapes.extend(self.manual_cut_shapes.clone());
+                            self.cutline_owners.extend(manual_owners);
+                            self.cutline_locked.extend(manual_locks);
+                            self.cut_progress = None;
+                            self.off_canvas = result.off_canvas;
+                        }
                     }
-                },
+                }
             }
         }
         self.dispatch_queued_jobs();
     }
 
     fn print_canvas(&mut self) {
+        self.synchronize_cut_geometry();
         let mode_type = DEVICES[self.selected_device].modes[self.selected_mode].mode_type;
         let capabilities = if mode_type.has_cutting() {
             vec!["print", "cut"]
@@ -2633,6 +2725,7 @@ impl SapodillaApp {
 impl eframe::App for SapodillaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_actions();
+        self.synchronize_cut_geometry();
         self.cut_modes.resize(self.cut_shapes.len(), CutMode::Kiss);
         self.cut_modes.truncate(self.cut_shapes.len());
         self.cutline_owners.resize(self.cut_shapes.len(), None);
@@ -3281,11 +3374,13 @@ impl eframe::App for SapodillaApp {
                         )
                         .clicked()
                     {
+                        self.synchronize_cut_geometry();
                         self.has_intersections = false;
                         self.off_canvas = false;
                         self.cut_progress = None;
 
                         let tx = self.tx.clone();
+                        let source_geometry = self.current_cut_geometry();
                         let mut rx = CutGenerator::start(
                             self.loaded_images
                                 .iter()
@@ -3300,7 +3395,10 @@ impl eframe::App for SapodillaApp {
                             while let Some(action) = rx.next().await {
                                 debug!(?action, "got cut action");
 
-                                if let Err(err) = tx.send(Action::Cut(action)) {
+                                if let Err(err) = tx.send(Action::Cut {
+                                    source_geometry: source_geometry.clone(),
+                                    action,
+                                }) {
                                     error!("could not send cut action: {err}");
                                 }
                             }
@@ -3364,6 +3462,7 @@ impl eframe::App for SapodillaApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             views::canvas_editor(ui, self);
+            self.synchronize_cut_geometry();
 
             ctx.input(|i| {
                 if i.raw.dropped_files.is_empty() {
@@ -3815,6 +3914,44 @@ fn current_timestamp_millis() -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn cut_geometry(offset_x: f32) -> CutGeometrySnapshot {
+        CutGeometrySnapshot {
+            device: 0,
+            mode: 0,
+            canvas_size: 0,
+            images: vec![CutImageGeometry {
+                id: "image-a".into(),
+                offset: [offset_x.to_bits(), 0.0_f32.to_bits()],
+                scale: [1.0_f32.to_bits(), 1.0_f32.to_bits()],
+                rotation_degrees: 0.0_f32.to_bits(),
+                visible: true,
+                enable_cutting: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn every_geometry_snapshot_change_invalidates_once() {
+        let original = cut_geometry(10.0);
+        let transformed = cut_geometry(20.0);
+        let mut tracked = None;
+        assert!(update_cut_geometry_snapshot(&mut tracked, original.clone()));
+        assert!(!update_cut_geometry_snapshot(&mut tracked, original));
+        assert!(update_cut_geometry_snapshot(
+            &mut tracked,
+            transformed.clone()
+        ));
+        assert_eq!(tracked, Some(transformed));
+    }
+
+    #[test]
+    fn asynchronous_cut_result_key_rejects_later_sidebar_transform() {
+        let generation_source = cut_geometry(10.0);
+        let after_sidebar_move = cut_geometry(11.0);
+        assert_ne!(generation_source, after_sidebar_move);
+        assert_eq!(generation_source, cut_geometry(10.0));
+    }
 
     #[test]
     fn template_relationships_survive_reorder_and_clear_after_delete() {
