@@ -9,7 +9,7 @@ use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
 use geo::{BoundingRect, Coord, LineString, Rect as GeoRect};
 use image::{EncodableLayout, GenericImageView, ImageEncoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use strum::IntoEnumIterator;
 use tracing::{debug, error, info, trace};
@@ -37,6 +37,7 @@ const MATERIAL_PROFILES_STORAGE_KEY: &str = "sapodilla.material-profiles.v1";
 const LIBRARY_FOLDERS_STORAGE_KEY: &str = "sapodilla.library-folders.v1";
 const LIBRARY_CYCLE_STORAGE_KEY: &str = "sapodilla.library-cycle.v1";
 const LIBRARY_CONSUMED_STORAGE_KEY: &str = "sapodilla.library-consumed-ahead.v1";
+const CANVAS_VIEW_STORAGE_KEY: &str = "sapodilla.canvas-view.v1";
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const LIBRARY_PAGE_SIZE: usize = 100;
 const MAX_LIBRARY_FILL_ATTEMPTS: usize = 512;
@@ -160,6 +161,9 @@ pub struct SapodillaApp {
     pub pack_allow_rotation: bool,
     pub show_cutlines: bool,
     pub show_safe_area: bool,
+    pub show_grid: bool,
+    pub show_rulers: bool,
+    pub grid_spacing_mm: f32,
     pub snap_to_guides: bool,
     pub edit_cutlines: bool,
     pub selected_cut_path: Option<usize>,
@@ -176,6 +180,23 @@ pub struct SapodillaApp {
     pub background_ml_running: bool,
 
     pub error: Option<anyhow::Error>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct CanvasViewPreferences {
+    show_grid: bool,
+    show_rulers: bool,
+    grid_spacing_mm: f32,
+}
+
+impl Default for CanvasViewPreferences {
+    fn default() -> Self {
+        Self {
+            show_grid: true,
+            show_rulers: true,
+            grid_spacing_mm: 10.0,
+        }
+    }
 }
 
 pub struct ContextSender<A> {
@@ -376,6 +397,16 @@ impl SapodillaApp {
                 eframe::get_value::<BTreeSet<usize>>(storage, LIBRARY_CONSUMED_STORAGE_KEY)
             })
             .unwrap_or_default();
+        let canvas_view = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<CanvasViewPreferences>(storage, CANVAS_VIEW_STORAGE_KEY)
+            })
+            .map(|mut view| {
+                view.grid_spacing_mm = view.grid_spacing_mm.clamp(0.5, 100.0);
+                view
+            })
+            .unwrap_or_default();
         let library = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
         let (library_disk_paths, library_has_more) =
@@ -462,6 +493,9 @@ impl SapodillaApp {
             pack_allow_rotation: true,
             show_cutlines: true,
             show_safe_area: true,
+            show_grid: canvas_view.show_grid,
+            show_rulers: canvas_view.show_rulers,
+            grid_spacing_mm: canvas_view.grid_spacing_mm,
             snap_to_guides: true,
             edit_cutlines: false,
             selected_cut_path: None,
@@ -2622,6 +2656,8 @@ impl eframe::App for SapodillaApp {
                 }
                 ui.separator();
                 ui.toggle_value(&mut self.snap_to_guides, "Snap");
+                ui.toggle_value(&mut self.show_grid, "Grid");
+                ui.toggle_value(&mut self.show_rulers, "Rulers");
                 ui.toggle_value(&mut self.show_cutlines, "Cut preview");
                 ui.toggle_value(&mut self.edit_cutlines, "Edit nodes");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3282,6 +3318,16 @@ impl eframe::App for SapodillaApp {
                     ui.checkbox(&mut self.show_safe_area, "Safe area");
                     ui.checkbox(&mut self.snap_to_guides, "Smart snapping");
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_grid, "Grid");
+                    ui.checkbox(&mut self.show_rulers, "Rulers");
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.grid_spacing_mm, 0.5..=100.0)
+                        .logarithmic(true)
+                        .suffix(" mm")
+                        .text("Grid spacing"),
+                );
                 ui.add(
                     egui::Slider::new(&mut self.pack_gap_mm, 0.0..=10.0)
                         .suffix(" mm")
@@ -3400,6 +3446,15 @@ impl eframe::App for SapodillaApp {
             storage,
             LIBRARY_CONSUMED_STORAGE_KEY,
             &self.library_consumed_ahead,
+        );
+        eframe::set_value(
+            storage,
+            CANVAS_VIEW_STORAGE_KEY,
+            &CanvasViewPreferences {
+                show_grid: self.show_grid,
+                show_rulers: self.show_rulers,
+                grid_spacing_mm: self.grid_spacing_mm.clamp(0.5, 100.0),
+            },
         );
     }
 }

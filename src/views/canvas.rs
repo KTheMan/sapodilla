@@ -1,6 +1,6 @@
 use egui::{
-    Color32, Frame, Key, KeyboardShortcut, Modifiers, Painter, Pos2, Rect, Scene, Sense, Shape,
-    Stroke, Ui, Vec2,
+    Align2, Color32, FontId, Frame, Key, KeyboardShortcut, Modifiers, Painter, Pos2, Rect, Scene,
+    Sense, Shape, Stroke, Ui, Vec2,
     emath::{self, RectTransform},
 };
 use geo::LineString;
@@ -15,6 +15,9 @@ use crate::{
 };
 
 const CUT_LINE_WIDTH: f32 = 3.0;
+const MIN_GRID_SCREEN_SPACING: f32 = 24.0;
+const MAX_GRID_LINES_PER_AXIS: usize = 512;
+const RULER_SIZE: f32 = 24.0;
 
 const DELETE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
 const BACKSPACE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Backspace);
@@ -60,6 +63,24 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         Rect::from_min_size(Pos2::ZERO, response.rect.size()),
         response.rect,
     );
+
+    let scene_scale = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .map(|transform| transform.scaling)
+        .unwrap_or(1.0)
+        .max(0.001);
+    let dpi = DEVICES[state.selected_device].dpi;
+    if state.show_grid {
+        paint_grid(
+            &painter,
+            response.rect,
+            size,
+            dpi,
+            state.grid_spacing_mm,
+            scene_scale,
+        );
+    }
 
     let mut hovers = Vec::new();
     let mut remove = None;
@@ -151,7 +172,6 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
     }
 
     if state.show_cutlines {
-        let dpi = DEVICES[state.selected_device].dpi;
         for phase in preview_cut_phases(
             &state.cut_shapes,
             &state.cut_modes,
@@ -225,6 +245,18 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         painter.rect_stroke(rect, 0, stroke, egui::StrokeKind::Outside);
     }
 
+    if state.show_rulers {
+        paint_rulers(
+            &painter,
+            response.rect,
+            ui.clip_rect(),
+            size,
+            dpi,
+            state.grid_spacing_mm,
+            scene_scale,
+        );
+    }
+
     if let Some(remove) = remove {
         state.loaded_images.remove(remove);
         state.selected_images.retain(|selected| *selected != remove);
@@ -233,6 +265,231 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
                 *selected -= 1;
             }
         }
+    }
+}
+
+fn nice_step_ceiling(value: f32) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+    let magnitude = 10.0_f32.powf(value.log10().floor());
+    let normalized = value / magnitude;
+    let nice = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * magnitude
+}
+
+fn adaptive_grid_step_mm(
+    requested_mm: f32,
+    pixels_per_mm: f32,
+    scene_scale: f32,
+    extent_pixels: f32,
+) -> f32 {
+    let base = requested_mm.clamp(0.5, 100.0);
+    let screen_requirement = MIN_GRID_SCREEN_SPACING / (pixels_per_mm * scene_scale).max(0.001);
+    let count_requirement = extent_pixels / pixels_per_mm / MAX_GRID_LINES_PER_AXIS as f32;
+    nice_step_ceiling(base.max(screen_requirement).max(count_requirement))
+}
+
+fn tick_positions(extent_pixels: f32, step_pixels: f32) -> Vec<f32> {
+    if !extent_pixels.is_finite()
+        || !step_pixels.is_finite()
+        || extent_pixels < 0.0
+        || step_pixels <= 0.0
+    {
+        return Vec::new();
+    }
+    let count = (extent_pixels / step_pixels).floor() as usize;
+    (0..=count.min(MAX_GRID_LINES_PER_AXIS))
+        .map(|index| index as f32 * step_pixels)
+        .collect()
+}
+
+fn paint_grid(
+    painter: &Painter,
+    canvas_rect: Rect,
+    canvas_size: Vec2,
+    dpi: f32,
+    requested_mm: f32,
+    scene_scale: f32,
+) {
+    let pixels_per_mm = dpi / 25.4;
+    let step_mm = adaptive_grid_step_mm(
+        requested_mm,
+        pixels_per_mm,
+        scene_scale,
+        canvas_size.x.max(canvas_size.y),
+    );
+    let step_pixels = step_mm * pixels_per_mm;
+    let minor = Stroke::new(
+        0.75 / scene_scale,
+        Color32::from_rgba_unmultiplied(80, 96, 112, 42),
+    );
+    let major = Stroke::new(
+        1.25 / scene_scale,
+        Color32::from_rgba_unmultiplied(60, 80, 100, 78),
+    );
+    let clipped = painter.with_clip_rect(canvas_rect);
+    for (index, x) in tick_positions(canvas_size.x, step_pixels)
+        .into_iter()
+        .enumerate()
+    {
+        let stroke = if index % 5 == 0 { major } else { minor };
+        let x = canvas_rect.left() + x;
+        clipped.line_segment(
+            [
+                Pos2::new(x, canvas_rect.top()),
+                Pos2::new(x, canvas_rect.bottom()),
+            ],
+            stroke,
+        );
+    }
+    for (index, y) in tick_positions(canvas_size.y, step_pixels)
+        .into_iter()
+        .enumerate()
+    {
+        let stroke = if index % 5 == 0 { major } else { minor };
+        let y = canvas_rect.top() + y;
+        clipped.line_segment(
+            [
+                Pos2::new(canvas_rect.left(), y),
+                Pos2::new(canvas_rect.right(), y),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn paint_rulers(
+    painter: &Painter,
+    canvas_rect: Rect,
+    viewport_rect: Rect,
+    canvas_size: Vec2,
+    dpi: f32,
+    requested_mm: f32,
+    scene_scale: f32,
+) {
+    let visible = canvas_rect.intersect(viewport_rect);
+    if !visible.is_positive() {
+        return;
+    }
+
+    let pixels_per_mm = dpi / 25.4;
+    let step_mm = adaptive_grid_step_mm(
+        requested_mm,
+        pixels_per_mm,
+        scene_scale,
+        canvas_size.x.max(canvas_size.y),
+    );
+    let step_pixels = step_mm * pixels_per_mm;
+    let band = RULER_SIZE / scene_scale;
+    let stroke_width = 1.0 / scene_scale;
+    let top_band = Rect::from_min_max(
+        visible.min,
+        Pos2::new(
+            visible.right(),
+            (visible.top() + band).min(visible.bottom()),
+        ),
+    );
+    let left_band = Rect::from_min_max(
+        visible.min,
+        Pos2::new(
+            (visible.left() + band).min(visible.right()),
+            visible.bottom(),
+        ),
+    );
+    let overlay = painter.with_clip_rect(visible);
+    let fill = Color32::from_rgba_unmultiplied(245, 248, 250, 232);
+    overlay.rect_filled(top_band, 0.0, fill);
+    overlay.rect_filled(left_band, 0.0, fill);
+    overlay.line_segment(
+        [top_band.left_bottom(), top_band.right_bottom()],
+        Stroke::new(stroke_width, Color32::from_gray(105)),
+    );
+    overlay.line_segment(
+        [left_band.right_top(), left_band.right_bottom()],
+        Stroke::new(stroke_width, Color32::from_gray(105)),
+    );
+
+    let font = FontId::monospace(9.0 / scene_scale);
+    let tick_color = Color32::from_gray(75);
+    let first_x = (((visible.left() - canvas_rect.left()) / step_pixels).floor() as isize).max(0);
+    let last_x = (((visible.right() - canvas_rect.left()) / step_pixels).ceil() as usize)
+        .min(MAX_GRID_LINES_PER_AXIS);
+    for index in first_x as usize..=last_x {
+        let x = canvas_rect.left() + index as f32 * step_pixels;
+        if x > canvas_rect.right() {
+            break;
+        }
+        let major = index % 5 == 0;
+        let tick = if major { band * 0.5 } else { band * 0.25 };
+        overlay.line_segment(
+            [
+                Pos2::new(x, top_band.bottom()),
+                Pos2::new(x, top_band.bottom() - tick),
+            ],
+            Stroke::new(stroke_width, tick_color),
+        );
+        if major && x >= left_band.right() {
+            overlay.text(
+                Pos2::new(x + 2.0 / scene_scale, top_band.top() + 2.0 / scene_scale),
+                Align2::LEFT_TOP,
+                format_tick(index as f32 * step_mm),
+                font.clone(),
+                tick_color,
+            );
+        }
+    }
+
+    let first_y = (((visible.top() - canvas_rect.top()) / step_pixels).floor() as isize).max(0);
+    let last_y = (((visible.bottom() - canvas_rect.top()) / step_pixels).ceil() as usize)
+        .min(MAX_GRID_LINES_PER_AXIS);
+    for index in first_y as usize..=last_y {
+        let y = canvas_rect.top() + index as f32 * step_pixels;
+        if y > canvas_rect.bottom() {
+            break;
+        }
+        let major = index % 5 == 0;
+        let tick = if major { band * 0.5 } else { band * 0.25 };
+        overlay.line_segment(
+            [
+                Pos2::new(left_band.right(), y),
+                Pos2::new(left_band.right() - tick, y),
+            ],
+            Stroke::new(stroke_width, tick_color),
+        );
+        if major && y >= top_band.bottom() {
+            overlay.text(
+                Pos2::new(left_band.left() + 2.0 / scene_scale, y + 2.0 / scene_scale),
+                Align2::LEFT_TOP,
+                format_tick(index as f32 * step_mm),
+                font.clone(),
+                tick_color,
+            );
+        }
+    }
+    overlay.rect_filled(top_band.intersect(left_band), 0.0, Color32::from_gray(225));
+    overlay.text(
+        top_band.intersect(left_band).center(),
+        Align2::CENTER_CENTER,
+        "mm",
+        font,
+        tick_color,
+    );
+}
+
+fn format_tick(value_mm: f32) -> String {
+    if value_mm.fract().abs() < 0.001 {
+        format!("{value_mm:.0}")
+    } else {
+        format!("{value_mm:.1}")
     }
 }
 
@@ -353,6 +610,31 @@ fn preview_cut_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_grid_spacing_uses_selected_device_dpi() {
+        let dpi = 254.0;
+        let step_mm = adaptive_grid_step_mm(10.0, dpi / 25.4, 1.0, 1_000.0);
+        assert_eq!(step_mm, 10.0);
+        assert!((step_mm * dpi / 25.4 - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn adaptive_grid_uses_nice_steps_and_caps_line_count() {
+        let pixels_per_mm = 10.0;
+        let step = adaptive_grid_step_mm(0.5, pixels_per_mm, 0.1, 1_000_000.0);
+        assert!(matches!(step, 200.0 | 500.0 | 1_000.0));
+        let ticks = tick_positions(1_000_000.0, step * pixels_per_mm);
+        assert!(ticks.len() <= MAX_GRID_LINES_PER_AXIS + 1);
+        assert!(ticks.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[test]
+    fn invalid_tick_inputs_do_not_iterate() {
+        assert!(tick_positions(100.0, 0.0).is_empty());
+        assert!(tick_positions(f32::NAN, 10.0).is_empty());
+        assert_eq!(nice_step_ceiling(f32::NAN), 1.0);
+    }
 
     #[test]
     fn preview_omits_disabled_geometry_and_preserves_modes() {
