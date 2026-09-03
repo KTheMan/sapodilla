@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::io::Cursor;
 
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -13,7 +12,7 @@ use web_sys::{
 
 use crate::{
     protocol::{self, AvocadoPacket},
-    transports::{TransportControl, TransportEvent, TransportStatus},
+    transports::{TransportControl, TransportEvent, TransportStatus, framing::FrameDecoder},
 };
 
 #[derive(Debug)]
@@ -222,6 +221,7 @@ impl WebSerialHandler {
         mut event_tx: mpsc::UnboundedSender<TransportEvent>,
     ) -> anyhow::Result<()> {
         let mut buf: Vec<u8> = Vec::new();
+        let mut decoder = FrameDecoder::default();
 
         loop {
             let result = JsFuture::from(reader.read())
@@ -246,35 +246,16 @@ impl WebSerialHandler {
                 continue;
             }
 
-            let existing_buf_len = buf.len();
             let new_data_len = usize::try_from(data.length()).unwrap();
+            buf.resize(new_data_len, 0);
+            data.copy_to(&mut buf);
+            trace!("read {} bytes", data.length());
 
-            buf.resize(buf.len() + new_data_len, 0);
-            data.copy_to(&mut buf[existing_buf_len..existing_buf_len + new_data_len]);
-            trace!(
-                "read {} bytes, total buffer is {} bytes",
-                data.length(),
-                buf.len()
-            );
-
-            let mut cursor = Cursor::new(&mut buf);
-            let packet = match protocol::AvocadoPacket::read_one(&mut cursor) {
-                Ok(packet) => packet,
-                Err(protocol::ProtocolError::Reader(err))
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    trace!("had eof, continuing to next read");
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            };
-
-            let read_bytes = usize::try_from(cursor.position()).unwrap();
-            buf.drain(0..read_bytes);
-
-            debug!(read_bytes, "got packet: {packet:?}");
-
-            event_tx.send(TransportEvent::Packet(packet)).await?;
+            for packet in decoder.push(&buf) {
+                let packet = packet?;
+                debug!("got packet: {packet:?}");
+                event_tx.send(TransportEvent::Packet(packet)).await?;
+            }
         }
     }
 }

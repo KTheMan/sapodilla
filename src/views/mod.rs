@@ -273,10 +273,11 @@ pub fn loaded_images(
     canvas_size: Vec2,
     loaded_images: &mut Vec<LoadedImage>,
     mode_type: ModeType,
-) {
+) -> bool {
     ui.heading("Images");
 
     let mut remove = None;
+    let mut changed = false;
 
     ui.spacing_mut().scroll.floating = false;
 
@@ -305,12 +306,15 @@ pub fn loaded_images(
 
             if response.is_drag_finished() {
                 response.update_vec(loaded_images);
+                changed = true;
             }
         });
 
     if let Some(remove) = remove {
         loaded_images.remove(remove);
+        changed = true;
     }
+    changed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +343,12 @@ pub fn image_controls(
         ui.vertical(|ui| {
             ui.spacing_mut().interact_size.x = 72.0;
             ui.spacing_mut().item_spacing.y = 8.0;
+
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut image.name);
+                ui.checkbox(&mut image.visible, "Visible");
+                ui.checkbox(&mut image.locked, "Lock");
+            });
 
             ui.horizontal(|ui| {
                 ui.monospace("X:");
@@ -404,6 +414,13 @@ pub fn image_controls(
             if ui.small_button("Remove").clicked() {
                 *remove_index = Some(index);
             }
+
+            ui.add(
+                egui::DragValue::new(&mut image.rotation_degrees)
+                    .speed(0.25)
+                    .range(-180.0..=180.0)
+                    .suffix("° rotation"),
+            );
 
             if mode_type.has_cutting() {
                 ui.checkbox(&mut image.enable_cutting, "Cut")

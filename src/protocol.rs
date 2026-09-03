@@ -116,13 +116,13 @@ impl AvocadoPacket {
         }
 
         let version = reader.read_u8().map_err(ProtocolError::Reader)?;
-        let _reserved = reader.read_u8().map_err(ProtocolError::Reader)?;
+        let reserved = reader.read_u8().map_err(ProtocolError::Reader)?;
 
-        let content_type = Self::read_enum(reader, "content_type")?;
+        let content_type: ContentType = Self::read_enum(reader, "content_type")?;
         trace!(?content_type);
-        let interaction_type = Self::read_enum(reader, "interaction_type")?;
+        let interaction_type: InteractionType = Self::read_enum(reader, "interaction_type")?;
         trace!(?interaction_type);
-        let encoding_type = Self::read_enum(reader, "encoding_type")?;
+        let encoding_type: EncodingType = Self::read_enum(reader, "encoding_type")?;
         trace!(?encoding_type);
 
         let terminal_id = reader
@@ -142,12 +142,13 @@ impl AvocadoPacket {
             .map_err(ProtocolError::Reader)?;
         trace!(msg_package_num);
 
-        let flags = reader
+        let packed_flags = reader
             .read_u16::<LittleEndian>()
             .map_err(ProtocolError::Reader)?;
-        trace!("flags: {flags:016b}");
+        trace!("flags: {packed_flags:016b}");
 
-        let flags = AvocadoFlags::unpack(flags).ok_or(ProtocolError::InvalidData("flags"))?;
+        let flags =
+            AvocadoFlags::unpack(packed_flags).ok_or(ProtocolError::InvalidData("flags"))?;
         trace!(?flags);
 
         let mut data = vec![0u8; usize::from(flags.length)];
@@ -156,7 +157,24 @@ impl AvocadoPacket {
             .map_err(ProtocolError::Reader)?;
         trace!("data: {}", hex::encode(&data));
 
-        let _checksum = reader.read_u8().map_err(ProtocolError::Reader)?;
+        let checksum = reader.read_u8().map_err(ProtocolError::Reader)?;
+        let mut checksum_data = Vec::with_capacity(19 + data.len());
+        checksum_data.extend([
+            version,
+            reserved,
+            content_type.to_primitive(),
+            interaction_type.to_primitive(),
+            encoding_type.to_primitive(),
+        ]);
+        checksum_data.extend(terminal_id.to_le_bytes());
+        checksum_data.extend(msg_number.to_le_bytes());
+        checksum_data.extend(msg_package_total.to_le_bytes());
+        checksum_data.extend(msg_package_num.to_le_bytes());
+        checksum_data.extend(packed_flags.to_le_bytes());
+        checksum_data.extend(&data);
+        if checksum != Self::checksum(&checksum_data) {
+            return Err(ProtocolError::InvalidData("checksum"));
+        }
 
         let suffix = reader.read_u8().map_err(ProtocolError::Reader)?;
         if suffix != WRAPPER {
@@ -180,10 +198,14 @@ impl AvocadoPacket {
 
     #[instrument(skip_all)]
     pub fn encode(&self) -> Vec<u8> {
+        assert!(
+            self.data.len() <= 0x03ff,
+            "Avocado packet payload exceeds the 10-bit length field"
+        );
         let mut buf = Vec::with_capacity(self.data.len() + 22);
 
         buf.push(WRAPPER);
-        buf.push(100); // version
+        buf.push(self.version);
         buf.push(0); // reserved
         buf.push(self.content_type.to_primitive());
         buf.push(self.interaction_type.to_primitive());
@@ -222,12 +244,16 @@ impl AvocadoPacket {
 }
 
 pub struct AvocadoPacketReader<R> {
-    reader: R,
+    reader: std::io::BufReader<R>,
+    finished: bool,
 }
 
-impl<R> AvocadoPacketReader<R> {
+impl<R: std::io::Read> AvocadoPacketReader<R> {
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader: std::io::BufReader::new(reader),
+            finished: false,
+        }
     }
 }
 
@@ -238,12 +264,29 @@ where
     type Item = Result<AvocadoPacket, ProtocolError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match AvocadoPacket::read_one(&mut self.reader) {
-            Ok(packet) => Some(Ok(packet)),
-            Err(ProtocolError::Reader(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+        use std::io::BufRead as _;
+
+        if self.finished {
+            return None;
+        }
+        match self.reader.fill_buf() {
+            Ok([]) => {
+                self.finished = true;
                 None
             }
-            Err(err) => Some(Err(err)),
+            Ok(_) => match AvocadoPacket::read_one(&mut self.reader) {
+                Ok(packet) => Some(Ok(packet)),
+                Err(err) => {
+                    // Do not turn a truncated frame into a clean end-of-stream,
+                    // and do not repeatedly yield the same I/O failure.
+                    self.finished = true;
+                    Some(Err(err))
+                }
+            },
+            Err(err) => {
+                self.finished = true;
+                Some(Err(ProtocolError::Reader(err)))
+            }
         }
     }
 }
@@ -429,24 +472,62 @@ pub struct AvocadoResult<T> {
     pub result: T,
 }
 
+/// Firmware revisions have returned `get-job-info.result` as either a status
+/// object or a one-element array. Keep that wire variation out of queue logic.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum JobStatusResult {
+    One(JobStatusInfo),
+    Many(Vec<JobStatusInfo>),
+}
+
+impl JobStatusResult {
+    pub fn into_for_job(self, job_id: u32) -> Option<JobStatusInfo> {
+        match self {
+            Self::One(info) => (info.job_id == job_id).then_some(info),
+            Self::Many(infos) => infos.into_iter().find(|info| info.job_id == job_id),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct JobStatusInfo {
+    #[serde(alias = "job_id")]
     pub job_id: u32,
+    #[serde(alias = "job_state")]
     pub job_state: JobState,
+    #[serde(alias = "job_sub_state")]
     pub job_sub_state: JobSubState,
-    pub copies: u8,
-    pub printing_page_number: u8,
-    pub user_account: String,
-    pub channel: u32,
-    pub media_size: u32,
-    pub media_type: u32,
-    pub job_type: u32,
-    pub document_format: u32,
-    pub file_size: u32,
-    pub transfer_status: u32,
-    pub transfer_size: u32,
+    #[serde(default)]
+    pub copies: Option<u8>,
+    #[serde(default, alias = "printing_page_number")]
+    pub printing_page_number: Option<u8>,
+    #[serde(default, alias = "user_account")]
+    pub user_account: Option<String>,
+    #[serde(default)]
+    pub channel: Option<u32>,
+    #[serde(default, alias = "media_size")]
+    pub media_size: Option<u32>,
+    #[serde(default, alias = "media_type")]
+    pub media_type: Option<u32>,
+    #[serde(default, alias = "job_type")]
+    pub job_type: Option<u32>,
+    #[serde(default, alias = "document_format")]
+    pub document_format: Option<u32>,
+    #[serde(default, alias = "file_size")]
+    pub file_size: Option<u32>,
+    #[serde(default, alias = "transfer_status")]
+    pub transfer_status: Option<u32>,
+    #[serde(default, alias = "transfer_size")]
+    pub transfer_size: Option<u32>,
+    #[serde(default, alias = "job_state_reason")]
+    pub job_state_reason: Option<serde_json::Value>,
+    #[serde(default, alias = "cutting_progress")]
+    pub cutting_progress: Option<serde_json::Value>,
+    #[serde(default, alias = "cut_contours")]
+    pub cut_contours: Option<serde_json::Value>,
 }
 
 #[allow(dead_code)]
@@ -556,6 +637,96 @@ mod tests {
     }
 
     #[test]
+    fn read_one_rejects_corrupted_checksum() {
+        let mut data = JSON_REQUEST_DATA.to_vec();
+        let checksum = data.len() - 2;
+        data[checksum] ^= 0x01;
+        let error = AvocadoPacket::read_one(&mut Cursor::new(data)).unwrap_err();
+        assert!(matches!(error, ProtocolError::InvalidData("checksum")));
+    }
+
+    #[test]
+    fn packet_reader_reports_a_truncated_frame_once() {
+        let truncated = &JSON_REQUEST_DATA[..JSON_REQUEST_DATA.len() - 3];
+        let mut packets = AvocadoPacketReader::new(Cursor::new(truncated));
+        assert!(matches!(
+            packets.next(),
+            Some(Err(ProtocolError::Reader(error)))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert!(packets.next().is_none());
+        assert!(
+            AvocadoPacketReader::new(Cursor::new(Vec::<u8>::new()))
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn job_status_accepts_snake_case_and_missing_optional_diagnostics() {
+        let status: JobStatusInfo = serde_json::from_value(serde_json::json!({
+            "job_id": 7,
+            "job_state": 9,
+            "job_sub_state": 9000,
+            "cutting_progress": 75
+        }))
+        .unwrap();
+        assert_eq!(status.job_id, 7);
+        assert_eq!(status.cutting_progress, Some(serde_json::json!(75)));
+        assert_eq!(status.file_size, None);
+    }
+
+    #[test]
+    fn job_status_result_accepts_object_and_array_firmware_shapes() {
+        for value in [
+            serde_json::json!({
+                "result": {
+                    "job-id": 7,
+                    "job-state": "9",
+                    "job-sub-state": "9000"
+                }
+            }),
+            serde_json::json!({
+                "result": [{
+                    "job_id": 8,
+                    "job_state": 9,
+                    "job_sub_state": 9000,
+                    "printing_page_number": 2,
+                    "media_size": 5013,
+                    "document_format": 1,
+                    "transfer_status": 100,
+                    "transfer_size": 2048
+                }]
+            }),
+        ] {
+            let response: AvocadoResult<JobStatusResult> =
+                serde_json::from_value(value).expect("valid firmware response shape");
+            let expected_id = match &response.result {
+                JobStatusResult::One(_) => 7,
+                JobStatusResult::Many(_) => 8,
+            };
+            let status = response
+                .result
+                .into_for_job(expected_id)
+                .expect("requested status");
+            assert_eq!(status.job_state, JobState::Completed);
+            assert_eq!(status.job_sub_state, JobSubState::CompletedNone);
+            if status.job_id == 8 {
+                assert_eq!(status.printing_page_number, Some(2));
+                assert_eq!(status.media_size, Some(5013));
+                assert_eq!(status.document_format, Some(1));
+                assert_eq!(status.transfer_status, Some(100));
+                assert_eq!(status.transfer_size, Some(2048));
+            }
+        }
+
+        let response: AvocadoResult<JobStatusResult> =
+            serde_json::from_value(serde_json::json!({ "result": [] }))
+                .expect("empty arrays are a valid, temporarily missing result");
+        assert!(response.result.into_for_job(9).is_none());
+    }
+
+    #[test]
     fn test_encode() {
         let packet = AvocadoPacket {
             version: 100,
@@ -594,5 +765,176 @@ mod tests {
                 0x7E,
             ]
         );
+    }
+
+    #[test]
+    fn encode_preserves_version_and_round_trips_packet() {
+        let packet = AvocadoPacket {
+            version: 101,
+            content_type: ContentType::Data,
+            interaction_type: InteractionType::Response,
+            encoding_type: EncodingType::Hexadecimal,
+            encryption_mode: EncryptionMode::RC4,
+            terminal_id: 0x0102_0304,
+            msg_number: 99,
+            msg_package_total: 3,
+            msg_package_num: 2,
+            is_subpackage: true,
+            data: vec![0x00, 0x7e, 0xff],
+        };
+
+        let encoded = packet.encode();
+        let decoded = AvocadoPacket::read_one(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.version, 101);
+        assert_eq!(decoded.content_type, ContentType::Data);
+        assert_eq!(decoded.interaction_type, InteractionType::Response);
+        assert_eq!(decoded.encoding_type, EncodingType::Hexadecimal);
+        assert_eq!(decoded.encryption_mode, EncryptionMode::RC4);
+        assert_eq!(decoded.terminal_id, 0x0102_0304);
+        assert_eq!(decoded.msg_number, 99);
+        assert_eq!(decoded.msg_package_total, 3);
+        assert_eq!(decoded.msg_package_num, 2);
+        assert!(decoded.is_subpackage);
+        assert_eq!(decoded.data, vec![0x00, 0x7e, 0xff]);
+    }
+
+    #[test]
+    #[should_panic(expected = "payload exceeds the 10-bit length field")]
+    fn encode_rejects_payload_that_cannot_be_represented() {
+        let packet = AvocadoPacket {
+            version: 100,
+            content_type: ContentType::Data,
+            interaction_type: InteractionType::Request,
+            encoding_type: EncodingType::Hexadecimal,
+            encryption_mode: EncryptionMode::None,
+            terminal_id: 1,
+            msg_number: 1,
+            msg_package_total: 1,
+            msg_package_num: 1,
+            is_subpackage: false,
+            data: vec![0; 1024],
+        };
+        let _ = packet.encode();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FixturePoint {
+        x: f64,
+        y: f64,
+    }
+
+    fn parse_plt_paths(plt: &str) -> Vec<Vec<FixturePoint>> {
+        let mut paths = Vec::<Vec<FixturePoint>>::new();
+        let mut current = None;
+        for token in plt.split_ascii_whitespace() {
+            let Some(kind) = token.as_bytes().first().copied() else {
+                continue;
+            };
+            if !matches!(kind, b'U' | b'D') {
+                continue;
+            }
+            let Some((y, x)) = token[1..].split_once(',') else {
+                continue;
+            };
+            let point = FixturePoint {
+                x: x.parse().unwrap(),
+                y: y.parse().unwrap(),
+            };
+            if kind == b'U' {
+                current = Some(paths.len());
+                paths.push(vec![point]);
+            } else if let Some(index) = current {
+                let path = &mut paths[index];
+                let repeats_seating_point =
+                    path.len() == 1 && path[0].x == point.x && path[0].y == point.y;
+                if !repeats_seating_point {
+                    path.push(point);
+                }
+            }
+        }
+        // A final blade-up-only group is the park position, not a cut path.
+        if paths.last().is_some_and(|path| path.len() == 1) {
+            paths.pop();
+        }
+        paths
+    }
+
+    fn point_segment_distance(point: FixturePoint, a: FixturePoint, b: FixturePoint) -> f64 {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let length_squared = dx * dx + dy * dy;
+        if length_squared == 0.0 {
+            return (point.x - a.x).hypot(point.y - a.y);
+        }
+        let projection =
+            (((point.x - a.x) * dx + (point.y - a.y) * dy) / length_squared).clamp(0.0, 1.0);
+        (point.x - (a.x + projection * dx)).hypot(point.y - (a.y + projection * dy))
+    }
+
+    fn directed_path_deviation(from: &[Vec<FixturePoint>], to: &[Vec<FixturePoint>]) -> f64 {
+        let segments: Vec<_> = to
+            .iter()
+            .flat_map(|path| path.windows(2).map(|pair| (pair[0], pair[1])))
+            .collect();
+        from.iter()
+            .flatten()
+            .map(|point| {
+                segments
+                    .iter()
+                    .map(|(a, b)| point_segment_distance(*point, *a, *b))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    fn symmetric_hausdorff(a: &[Vec<FixturePoint>], b: &[Vec<FixturePoint>]) -> f64 {
+        directed_path_deviation(a, b).max(directed_path_deviation(b, a))
+    }
+
+    #[test]
+    fn oracle_plt_fixture_and_hausdorff_thresholds_are_repeatable() {
+        // Captured fixture provenance and its MIT license are recorded in
+        // THIRD_PARTY_NOTICES.md and beside this fixture.
+        const SQUARE: &str = include_str!("../tests/fixtures/honeymaro-pixcut/square-exact.plt");
+        const OVERCUT: &str = include_str!("../tests/fixtures/honeymaro-pixcut/square-overcut.plt");
+        assert_eq!(
+            SQUARE,
+            "IN VER0.1.0 KP1 U2029,1016 D2029,1016 D5077,1016 D5077,3048 D2029,3048 D2029,1016 U6476,0  @ "
+        );
+
+        let reference = parse_plt_paths(SQUARE);
+        let overcut = parse_plt_paths(OVERCUT);
+        assert_eq!(reference.len(), 1);
+        assert_eq!(reference[0].len(), 5);
+        assert_eq!(overcut.len(), 1);
+        assert!(overcut[0].len() > reference[0].len());
+
+        // The oracle suite uses 12 units (~0.3 mm) for approximate matches and
+        // 24 units (~0.6 mm) for loose matches. Exercise both sides of those
+        // deterministic quantitative gates without depending on vertex counts.
+        let shifted_near: Vec<_> = reference
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|point| FixturePoint {
+                        x: point.x + 8.0,
+                        y: point.y + 8.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let shifted_far: Vec<_> = reference
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|point| FixturePoint {
+                        x: point.x + 18.0,
+                        y: point.y + 18.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(symmetric_hausdorff(&reference, &shifted_near) <= 12.0);
+        assert!(symmetric_hausdorff(&reference, &shifted_far) > 24.0);
     }
 }
