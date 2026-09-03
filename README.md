@@ -24,6 +24,7 @@ The hosted browser build is available at [gh.knnygrdn.com/sapodilla](https://gh.
 - [x] Canvas Editor
     - [x] Image upload
     - [x] Drag/drop placement, scaling, rotation, locking, and visibility
+    - [x] DPI-aware rulers, configurable grid, and direct resize/rotation handles
     - [x] Reorderable layers, multi-selection, sheet alignment, and smart snapping
     - [x] Brightness, contrast, saturation, and hue controls
     - [x] One-click local edge-background removal

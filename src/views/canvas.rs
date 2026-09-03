@@ -1,6 +1,6 @@
 use egui::{
-    Color32, Frame, Key, KeyboardShortcut, Modifiers, Painter, Pos2, Rect, Scene, Sense, Shape,
-    Stroke, Ui, Vec2,
+    Align2, Color32, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut, Modifiers, Painter,
+    Pos2, Rect, Scene, Sense, Shape, Stroke, Ui, Vec2,
     emath::{self, RectTransform},
 };
 use geo::LineString;
@@ -15,11 +15,37 @@ use crate::{
 };
 
 const CUT_LINE_WIDTH: f32 = 3.0;
+const MIN_GRID_SCREEN_SPACING: f32 = 24.0;
+const MAX_GRID_LINES_PER_AXIS: usize = 512;
+const RULER_SIZE: f32 = 24.0;
+const TRANSFORM_HANDLE_SIZE: f32 = 9.0;
+const TRANSFORM_HIT_SIZE: f32 = 18.0;
+const ROTATION_HANDLE_OFFSET: f32 = 32.0;
+const MIN_IMAGE_SIZE: f32 = 1.0;
+const MAX_IMAGE_SCALE: f32 = 1_000.0;
 
 const DELETE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
 const BACKSPACE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Backspace);
 
 const NORMAL_UV: Rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+
+#[derive(Clone, Debug)]
+pub(crate) enum TransformGesture {
+    Resize {
+        image_id: String,
+        corner: usize,
+        offset: Pos2,
+        size: Vec2,
+        scale: Vec2,
+        natural_size: Vec2,
+        rotation_degrees: f32,
+        aspect_locked: bool,
+    },
+    Rotate {
+        image_id: String,
+        center: Pos2,
+    },
+}
 
 pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
     let scene = Scene::new().zoom_range(0.1..=3.0);
@@ -61,6 +87,31 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         response.rect,
     );
 
+    let scene_scale = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .map(|transform| transform.scaling)
+        .unwrap_or(1.0)
+        .max(0.001);
+    let dpi = DEVICES[state.selected_device].dpi;
+    if state.show_grid {
+        paint_grid(
+            &painter,
+            response.rect,
+            size,
+            dpi,
+            state.grid_spacing_mm,
+            scene_scale,
+        );
+    }
+
+    let mut artwork_transform_changed = false;
+    let transform_active_image_id = state
+        .canvas_transform_gesture
+        .as_ref()
+        .map(transform_gesture_image_id)
+        .map(str::to_owned);
+
     let mut hovers = Vec::new();
     let mut remove = None;
 
@@ -71,8 +122,13 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         let pos_in_screen = to_screen.transform_pos(image.visual_offset());
         let image_rect = Rect::from_min_size(pos_in_screen, image.rotated_size());
 
-        let rect_id = response.id.with(idx);
-        let rect_response = ui.interact(image_rect, rect_id, Sense::drag());
+        let rect_id = response.id.with(("artwork", image.id.as_str()));
+        let sense = if state.edit_cutlines {
+            Sense::hover()
+        } else {
+            Sense::drag()
+        };
+        let rect_response = ui.interact(image_rect, rect_id, sense);
 
         if rect_response.clicked() {
             let command = ui.input(|i| i.modifiers.command || i.modifiers.shift);
@@ -92,9 +148,14 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
             }
         }
 
-        if !image.locked {
+        let handle_owns_gesture = transform_active_image_id.as_deref() == Some(&image.id);
+        if !image.locked && !handle_owns_gesture && !state.edit_cutlines {
+            if rect_response.drag_delta() != Vec2::ZERO {
+                artwork_transform_changed = true;
+            }
             image.offset += rect_response.drag_delta();
             if state.snap_to_guides && rect_response.dragged() {
+                let snap_tolerance = 6.0 / scene_scale;
                 let visual = image.visual_offset();
                 let visual_size = image.rotated_size();
                 let targets_x = [0.0, size.x / 2.0, size.x];
@@ -111,14 +172,14 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
                 ];
                 for anchor in anchors_x {
                     for target in targets_x {
-                        if (anchor - target).abs() <= 6.0 {
+                        if (anchor - target).abs() <= snap_tolerance {
                             image.offset.x += target - anchor;
                         }
                     }
                 }
                 for anchor in anchors_y {
                     for target in targets_y {
-                        if (anchor - target).abs() <= 6.0 {
+                        if (anchor - target).abs() <= snap_tolerance {
                             image.offset.y += target - anchor;
                         }
                     }
@@ -129,7 +190,10 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         if rect_response.hovered() {
             hovers.push(image_rect);
         }
-        if state.selected_images.contains(&idx) && !hovers.contains(&image_rect) {
+        if state.selected_images.contains(&idx)
+            && state.selected_images.len() != 1
+            && !hovers.contains(&image_rect)
+        {
             hovers.push(image_rect);
         }
 
@@ -150,8 +214,13 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         }
     }
 
+    artwork_transform_changed |=
+        interact_transform_handles(ui, state, response.id, &to_screen, scene_scale);
+    if artwork_transform_changed {
+        state.synchronize_cut_geometry();
+    }
+
     if state.show_cutlines {
-        let dpi = DEVICES[state.selected_device].dpi;
         for phase in preview_cut_phases(
             &state.cut_shapes,
             &state.cut_modes,
@@ -225,6 +294,20 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         painter.rect_stroke(rect, 0, stroke, egui::StrokeKind::Outside);
     }
 
+    paint_transform_controls(&painter, state, &to_screen, scene_scale);
+
+    if state.show_rulers {
+        paint_rulers(
+            &painter,
+            response.rect,
+            ui.clip_rect(),
+            size,
+            dpi,
+            state.grid_spacing_mm,
+            scene_scale,
+        );
+    }
+
     if let Some(remove) = remove {
         state.loaded_images.remove(remove);
         state.selected_images.retain(|selected| *selected != remove);
@@ -233,6 +316,567 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
                 *selected -= 1;
             }
         }
+    }
+}
+
+fn transform_gesture_image_id(gesture: &TransformGesture) -> &str {
+    match gesture {
+        TransformGesture::Resize { image_id, .. } | TransformGesture::Rotate { image_id, .. } => {
+            image_id
+        }
+    }
+}
+
+fn rotate_vector(vector: Vec2, degrees: f32) -> Vec2 {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    Vec2::new(
+        cos * vector.x - sin * vector.y,
+        sin * vector.x + cos * vector.y,
+    )
+}
+
+fn oriented_corners(offset: Pos2, size: Vec2, degrees: f32) -> [Pos2; 4] {
+    let center = offset + size / 2.0;
+    [
+        Vec2::new(-size.x / 2.0, -size.y / 2.0),
+        Vec2::new(size.x / 2.0, -size.y / 2.0),
+        Vec2::new(size.x / 2.0, size.y / 2.0),
+        Vec2::new(-size.x / 2.0, size.y / 2.0),
+    ]
+    .map(|relative| center + rotate_vector(relative, degrees))
+}
+
+fn rotation_handle_position(offset: Pos2, size: Vec2, degrees: f32, distance: f32) -> Pos2 {
+    let center = offset + size / 2.0;
+    center + rotate_vector(Vec2::new(0.0, -size.y / 2.0 - distance), degrees)
+}
+
+fn normalize_degrees(degrees: f32) -> f32 {
+    (degrees + 180.0).rem_euclid(360.0) - 180.0
+}
+
+fn rotation_from_pointer(center: Pos2, pointer: Pos2, snap: bool) -> f32 {
+    let delta = pointer - center;
+    let degrees = normalize_degrees(delta.y.atan2(delta.x).to_degrees() + 90.0);
+    if snap {
+        normalize_degrees((degrees / 15.0).round() * 15.0)
+    } else {
+        degrees
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resize_from_corner(
+    offset: Pos2,
+    size: Vec2,
+    scale: Vec2,
+    natural_size: Vec2,
+    rotation_degrees: f32,
+    corner: usize,
+    pointer: Pos2,
+    aspect_locked: bool,
+) -> Option<(Pos2, Vec2)> {
+    if corner >= 4
+        || !size.x.is_finite()
+        || !size.y.is_finite()
+        || size.x <= 0.0
+        || size.y <= 0.0
+        || natural_size.x <= 0.0
+        || natural_size.y <= 0.0
+    {
+        return None;
+    }
+    let signs = [
+        Vec2::new(-1.0, -1.0),
+        Vec2::new(1.0, -1.0),
+        Vec2::new(1.0, 1.0),
+        Vec2::new(-1.0, 1.0),
+    ];
+    let sign = signs[corner];
+    let opposite = oriented_corners(offset, size, rotation_degrees)[(corner + 2) % 4];
+    let local_delta = rotate_vector(pointer - opposite, -rotation_degrees);
+
+    let (new_size, new_scale) = if aspect_locked {
+        let diagonal = Vec2::new(sign.x * size.x, sign.y * size.y);
+        let denominator = diagonal.length_sq();
+        if denominator <= f32::EPSILON {
+            return None;
+        }
+        let minimum = (MIN_IMAGE_SIZE / size.x)
+            .max(MIN_IMAGE_SIZE / size.y)
+            .max(f32::EPSILON);
+        let maximum = (MAX_IMAGE_SCALE / scale.x.abs().max(f32::EPSILON))
+            .min(MAX_IMAGE_SCALE / scale.y.abs().max(f32::EPSILON));
+        let requested_factor = local_delta.dot(diagonal) / denominator;
+        let factor = if minimum <= maximum {
+            requested_factor.clamp(minimum, maximum)
+        } else {
+            // A persisted non-uniform scale can make the minimum-size and
+            // maximum-scale constraints mutually exclusive. Prefer a finite,
+            // positive image over panicking while the user repairs the scale.
+            minimum
+        };
+        (size * factor, scale * factor)
+    } else {
+        let width =
+            (sign.x * local_delta.x).clamp(MIN_IMAGE_SIZE, natural_size.x * MAX_IMAGE_SCALE);
+        let height =
+            (sign.y * local_delta.y).clamp(MIN_IMAGE_SIZE, natural_size.y * MAX_IMAGE_SCALE);
+        (
+            Vec2::new(width, height),
+            Vec2::new(width / natural_size.x, height / natural_size.y),
+        )
+    };
+
+    if !new_size.is_finite() || !new_scale.is_finite() {
+        return None;
+    }
+    let center = opposite
+        + rotate_vector(
+            Vec2::new(sign.x * new_size.x / 2.0, sign.y * new_size.y / 2.0),
+            rotation_degrees,
+        );
+    Some((center - new_size / 2.0, new_scale))
+}
+
+fn interact_transform_handles(
+    ui: &mut Ui,
+    state: &mut SapodillaApp,
+    canvas_id: Id,
+    to_screen: &RectTransform,
+    scene_scale: f32,
+) -> bool {
+    let Some(&index) = state.selected_images.as_slice().first() else {
+        state.canvas_transform_gesture = None;
+        return false;
+    };
+    if state.selected_images.len() != 1 || state.edit_cutlines {
+        state.canvas_transform_gesture = None;
+        return false;
+    }
+    let Some(image) = state.loaded_images.get(index) else {
+        state.canvas_transform_gesture = None;
+        return false;
+    };
+    if !image.visible || image.locked {
+        state.canvas_transform_gesture = None;
+        return false;
+    }
+
+    let image_id = image.id.clone();
+    let offset = image.offset;
+    let size = image.size();
+    let scale = image.scale;
+    let natural_size = image.sized_texture.size;
+    let rotation_degrees = image.rotation_degrees;
+    let aspect_locked = image.scale_locked;
+    let corners = oriented_corners(offset, size, rotation_degrees);
+    let hit_size = TRANSFORM_HIT_SIZE / scene_scale;
+    let rotation_distance = ROTATION_HANDLE_OFFSET / scene_scale;
+    let rotate_handle = rotation_handle_position(offset, size, rotation_degrees, rotation_distance);
+    let mut gesture = state.canvas_transform_gesture.take();
+    let mut changed = false;
+    let mut pending_resize = None;
+    let mut pending_rotation = None;
+
+    for (corner, position) in corners.into_iter().enumerate() {
+        let position = to_screen.transform_pos(position);
+        let response = ui
+            .interact(
+                Rect::from_center_size(position, Vec2::splat(hit_size)),
+                canvas_id.with(("resize", image_id.as_str(), corner)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(if corner % 2 == 0 {
+                CursorIcon::ResizeNwSe
+            } else {
+                CursorIcon::ResizeNeSw
+            })
+            .on_hover_text("Drag to resize · Hold Shift to toggle aspect lock");
+        if response.drag_started() {
+            gesture = Some(TransformGesture::Resize {
+                image_id: image_id.clone(),
+                corner,
+                offset,
+                size,
+                scale,
+                natural_size,
+                rotation_degrees,
+                aspect_locked,
+            });
+        }
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+            && let Some(TransformGesture::Resize {
+                image_id: active_id,
+                corner,
+                offset,
+                size,
+                scale,
+                natural_size,
+                rotation_degrees,
+                aspect_locked,
+            }) = gesture.as_ref()
+            && active_id == &image_id
+        {
+            let pointer = to_screen.inverse().transform_pos(pointer);
+            let invert_lock = ui.input(|input| input.modifiers.shift);
+            pending_resize = resize_from_corner(
+                *offset,
+                *size,
+                *scale,
+                *natural_size,
+                *rotation_degrees,
+                *corner,
+                pointer,
+                *aspect_locked ^ invert_lock,
+            );
+        }
+    }
+
+    let rotate_response = ui
+        .interact(
+            Rect::from_center_size(
+                to_screen.transform_pos(rotate_handle),
+                Vec2::splat(hit_size),
+            ),
+            canvas_id.with(("rotate", image_id.as_str())),
+            Sense::drag(),
+        )
+        .on_hover_cursor(CursorIcon::Crosshair)
+        .on_hover_text("Drag to rotate · Hold Shift to snap to 15°");
+    if rotate_response.drag_started() {
+        gesture = Some(TransformGesture::Rotate {
+            image_id: image_id.clone(),
+            center: offset + size / 2.0,
+        });
+    }
+    if rotate_response.dragged()
+        && let Some(pointer) = rotate_response.interact_pointer_pos()
+        && let Some(TransformGesture::Rotate {
+            image_id: active_id,
+            center,
+        }) = gesture.as_ref()
+        && active_id == &image_id
+    {
+        let pointer = to_screen.inverse().transform_pos(pointer);
+        pending_rotation = Some(rotation_from_pointer(
+            *center,
+            pointer,
+            ui.input(|input| input.modifiers.shift),
+        ));
+    }
+
+    if let Some(image) = state.loaded_images.get_mut(index) {
+        if let Some((new_offset, new_scale)) = pending_resize {
+            changed = image.offset != new_offset || image.scale != new_scale;
+            image.offset = new_offset;
+            image.scale = new_scale;
+        }
+        if let Some(new_rotation) = pending_rotation {
+            changed |= image.rotation_degrees != new_rotation;
+            image.rotation_degrees = new_rotation;
+        }
+    }
+
+    if !ui.input(|input| input.pointer.primary_down()) {
+        gesture = None;
+    }
+    state.canvas_transform_gesture = gesture;
+    changed
+}
+
+fn paint_transform_controls(
+    painter: &Painter,
+    state: &SapodillaApp,
+    to_screen: &RectTransform,
+    scene_scale: f32,
+) {
+    let [index] = state.selected_images.as_slice() else {
+        return;
+    };
+    let Some(image) = state.loaded_images.get(*index) else {
+        return;
+    };
+    if !image.visible {
+        return;
+    }
+
+    let color = if image.locked {
+        Color32::from_rgb(130, 150, 165)
+    } else {
+        Color32::from_rgb(25, 145, 235)
+    };
+    let corners = oriented_corners(image.offset, image.size(), image.rotation_degrees)
+        .map(|position| to_screen.transform_pos(position));
+    let mut outline = corners.to_vec();
+    outline.push(corners[0]);
+    painter.add(Shape::line(outline, Stroke::new(1.5 / scene_scale, color)));
+    if image.locked || state.edit_cutlines {
+        return;
+    }
+
+    let visual_size = TRANSFORM_HANDLE_SIZE / scene_scale;
+    for position in corners {
+        painter.rect_filled(
+            Rect::from_center_size(position, Vec2::splat(visual_size)),
+            1.5 / scene_scale,
+            Color32::WHITE,
+        );
+        painter.rect_stroke(
+            Rect::from_center_size(position, Vec2::splat(visual_size)),
+            1.5 / scene_scale,
+            Stroke::new(1.5 / scene_scale, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let top_middle = corners[0].lerp(corners[1], 0.5);
+    let rotate_handle = to_screen.transform_pos(rotation_handle_position(
+        image.offset,
+        image.size(),
+        image.rotation_degrees,
+        ROTATION_HANDLE_OFFSET / scene_scale,
+    ));
+    painter.line_segment(
+        [top_middle, rotate_handle],
+        Stroke::new(1.5 / scene_scale, color),
+    );
+    painter.circle_filled(rotate_handle, visual_size / 2.0, Color32::WHITE);
+    painter.circle_stroke(
+        rotate_handle,
+        visual_size / 2.0,
+        Stroke::new(1.5 / scene_scale, color),
+    );
+}
+
+fn nice_step_ceiling(value: f32) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+    let magnitude = 10.0_f32.powf(value.log10().floor());
+    let normalized = value / magnitude;
+    let nice = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * magnitude
+}
+
+fn adaptive_grid_step_mm(
+    requested_mm: f32,
+    pixels_per_mm: f32,
+    scene_scale: f32,
+    extent_pixels: f32,
+) -> f32 {
+    let base = requested_mm.clamp(0.5, 100.0);
+    let screen_requirement = MIN_GRID_SCREEN_SPACING / (pixels_per_mm * scene_scale).max(0.001);
+    let count_requirement = extent_pixels / pixels_per_mm / MAX_GRID_LINES_PER_AXIS as f32;
+    let required = screen_requirement.max(count_requirement);
+    if required <= base {
+        base
+    } else {
+        base * nice_step_ceiling(required / base)
+    }
+}
+
+fn tick_positions(extent_pixels: f32, step_pixels: f32) -> Vec<f32> {
+    if !extent_pixels.is_finite()
+        || !step_pixels.is_finite()
+        || extent_pixels < 0.0
+        || step_pixels <= 0.0
+    {
+        return Vec::new();
+    }
+    let count = (extent_pixels / step_pixels).floor() as usize;
+    (0..=count)
+        .take(MAX_GRID_LINES_PER_AXIS)
+        .map(|index| index as f32 * step_pixels)
+        .collect()
+}
+
+fn paint_grid(
+    painter: &Painter,
+    canvas_rect: Rect,
+    canvas_size: Vec2,
+    dpi: f32,
+    requested_mm: f32,
+    scene_scale: f32,
+) {
+    let pixels_per_mm = dpi / 25.4;
+    let step_mm = adaptive_grid_step_mm(
+        requested_mm,
+        pixels_per_mm,
+        scene_scale,
+        canvas_size.x.max(canvas_size.y),
+    );
+    let step_pixels = step_mm * pixels_per_mm;
+    let minor = Stroke::new(
+        0.75 / scene_scale,
+        Color32::from_rgba_unmultiplied(80, 96, 112, 42),
+    );
+    let major = Stroke::new(
+        1.25 / scene_scale,
+        Color32::from_rgba_unmultiplied(60, 80, 100, 78),
+    );
+    let clipped = painter.with_clip_rect(canvas_rect);
+    for (index, x) in tick_positions(canvas_size.x, step_pixels)
+        .into_iter()
+        .enumerate()
+    {
+        let stroke = if index % 5 == 0 { major } else { minor };
+        let x = canvas_rect.left() + x;
+        clipped.line_segment(
+            [
+                Pos2::new(x, canvas_rect.top()),
+                Pos2::new(x, canvas_rect.bottom()),
+            ],
+            stroke,
+        );
+    }
+    for (index, y) in tick_positions(canvas_size.y, step_pixels)
+        .into_iter()
+        .enumerate()
+    {
+        let stroke = if index % 5 == 0 { major } else { minor };
+        let y = canvas_rect.top() + y;
+        clipped.line_segment(
+            [
+                Pos2::new(canvas_rect.left(), y),
+                Pos2::new(canvas_rect.right(), y),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn paint_rulers(
+    painter: &Painter,
+    canvas_rect: Rect,
+    viewport_rect: Rect,
+    canvas_size: Vec2,
+    dpi: f32,
+    requested_mm: f32,
+    scene_scale: f32,
+) {
+    let visible = canvas_rect.intersect(viewport_rect);
+    if !visible.is_positive() {
+        return;
+    }
+
+    let pixels_per_mm = dpi / 25.4;
+    let step_mm = adaptive_grid_step_mm(
+        requested_mm,
+        pixels_per_mm,
+        scene_scale,
+        canvas_size.x.max(canvas_size.y),
+    );
+    let step_pixels = step_mm * pixels_per_mm;
+    let band = RULER_SIZE / scene_scale;
+    let stroke_width = 1.0 / scene_scale;
+    let top_band = Rect::from_min_max(
+        visible.min,
+        Pos2::new(
+            visible.right(),
+            (visible.top() + band).min(visible.bottom()),
+        ),
+    );
+    let left_band = Rect::from_min_max(
+        visible.min,
+        Pos2::new(
+            (visible.left() + band).min(visible.right()),
+            visible.bottom(),
+        ),
+    );
+    let overlay = painter.with_clip_rect(visible);
+    let fill = Color32::from_rgba_unmultiplied(245, 248, 250, 232);
+    overlay.rect_filled(top_band, 0.0, fill);
+    overlay.rect_filled(left_band, 0.0, fill);
+    overlay.line_segment(
+        [top_band.left_bottom(), top_band.right_bottom()],
+        Stroke::new(stroke_width, Color32::from_gray(105)),
+    );
+    overlay.line_segment(
+        [left_band.right_top(), left_band.right_bottom()],
+        Stroke::new(stroke_width, Color32::from_gray(105)),
+    );
+
+    let font = FontId::monospace(9.0 / scene_scale);
+    let tick_color = Color32::from_gray(75);
+    let first_x = (((visible.left() - canvas_rect.left()) / step_pixels).floor() as isize).max(0);
+    let last_x = (((visible.right() - canvas_rect.left()) / step_pixels).ceil() as usize)
+        .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
+    for index in first_x as usize..=last_x {
+        let x = canvas_rect.left() + index as f32 * step_pixels;
+        if x > canvas_rect.right() {
+            break;
+        }
+        let major = index % 5 == 0;
+        let tick = if major { band * 0.5 } else { band * 0.25 };
+        overlay.line_segment(
+            [
+                Pos2::new(x, top_band.bottom()),
+                Pos2::new(x, top_band.bottom() - tick),
+            ],
+            Stroke::new(stroke_width, tick_color),
+        );
+        if major && x >= left_band.right() {
+            overlay.text(
+                Pos2::new(x + 2.0 / scene_scale, top_band.top() + 2.0 / scene_scale),
+                Align2::LEFT_TOP,
+                format_tick(index as f32 * step_mm),
+                font.clone(),
+                tick_color,
+            );
+        }
+    }
+
+    let first_y = (((visible.top() - canvas_rect.top()) / step_pixels).floor() as isize).max(0);
+    let last_y = (((visible.bottom() - canvas_rect.top()) / step_pixels).ceil() as usize)
+        .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
+    for index in first_y as usize..=last_y {
+        let y = canvas_rect.top() + index as f32 * step_pixels;
+        if y > canvas_rect.bottom() {
+            break;
+        }
+        let major = index % 5 == 0;
+        let tick = if major { band * 0.5 } else { band * 0.25 };
+        overlay.line_segment(
+            [
+                Pos2::new(left_band.right(), y),
+                Pos2::new(left_band.right() - tick, y),
+            ],
+            Stroke::new(stroke_width, tick_color),
+        );
+        if major && y >= top_band.bottom() {
+            overlay.text(
+                Pos2::new(left_band.left() + 2.0 / scene_scale, y + 2.0 / scene_scale),
+                Align2::LEFT_TOP,
+                format_tick(index as f32 * step_mm),
+                font.clone(),
+                tick_color,
+            );
+        }
+    }
+    overlay.rect_filled(top_band.intersect(left_band), 0.0, Color32::from_gray(225));
+    overlay.text(
+        top_band.intersect(left_band).center(),
+        Align2::CENTER_CENTER,
+        "mm",
+        font,
+        tick_color,
+    );
+}
+
+fn format_tick(value_mm: f32) -> String {
+    if value_mm.fract().abs() < 0.001 {
+        format!("{value_mm:.0}")
+    } else {
+        format!("{value_mm:.1}")
     }
 }
 
@@ -353,6 +997,216 @@ fn preview_cut_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_grid_spacing_uses_selected_device_dpi() {
+        let dpi = 254.0;
+        let step_mm = adaptive_grid_step_mm(10.0, dpi / 25.4, 1.0, 1_000.0);
+        assert_eq!(step_mm, 10.0);
+        assert!((step_mm * dpi / 25.4 - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn adaptive_grid_uses_nice_steps_and_caps_line_count() {
+        let pixels_per_mm = 10.0;
+        let step = adaptive_grid_step_mm(0.5, pixels_per_mm, 0.1, 1_000_000.0);
+        assert_eq!(step, 250.0);
+        let ticks = tick_positions(1_000_000.0, step * pixels_per_mm);
+        assert!(ticks.len() <= MAX_GRID_LINES_PER_AXIS);
+        assert!(ticks.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[test]
+    fn grid_preserves_requested_spacing_until_adaptation_is_needed() {
+        for requested in [6.0, 25.0, 75.0] {
+            assert_eq!(
+                adaptive_grid_step_mm(requested, 10.0, 1.0, 1_000.0),
+                requested
+            );
+        }
+        assert_eq!(adaptive_grid_step_mm(6.0, 10.0, 0.01, 1_000.0), 300.0);
+    }
+
+    #[test]
+    fn invalid_tick_inputs_do_not_iterate() {
+        assert!(tick_positions(100.0, 0.0).is_empty());
+        assert!(tick_positions(f32::NAN, 10.0).is_empty());
+        assert_eq!(nice_step_ceiling(f32::NAN), 1.0);
+    }
+
+    fn assert_pos_close(actual: Pos2, expected: Pos2) {
+        assert!(
+            actual.distance(expected) < 0.001,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn oriented_corners_rotate_around_image_center() {
+        let corners = oriented_corners(Pos2::new(10.0, 20.0), Vec2::new(40.0, 20.0), 90.0);
+        assert_pos_close(corners[0], Pos2::new(40.0, 10.0));
+        assert_pos_close(corners[1], Pos2::new(40.0, 50.0));
+        assert_pos_close(corners[2], Pos2::new(20.0, 50.0));
+        assert_pos_close(corners[3], Pos2::new(20.0, 10.0));
+    }
+
+    #[test]
+    fn resize_preserves_opposite_world_corner_at_multiple_angles() {
+        for rotation in [0.0, 37.0, 90.0, -135.0] {
+            let offset = Pos2::new(100.0, 80.0);
+            let size = Vec2::new(120.0, 60.0);
+            let opposite = oriented_corners(offset, size, rotation)[2];
+            let desired_size = Vec2::new(180.0, 90.0);
+            let pointer =
+                opposite + rotate_vector(Vec2::new(-desired_size.x, -desired_size.y), rotation);
+            let (new_offset, new_scale) = resize_from_corner(
+                offset,
+                size,
+                Vec2::new(1.2, 0.6),
+                Vec2::new(100.0, 100.0),
+                rotation,
+                0,
+                pointer,
+                false,
+            )
+            .unwrap();
+            assert!((new_scale.x - 1.8).abs() < 0.001);
+            assert!((new_scale.y - 0.9).abs() < 0.001);
+            assert_pos_close(
+                oriented_corners(new_offset, desired_size, rotation)[2],
+                opposite,
+            );
+        }
+    }
+
+    #[test]
+    fn aspect_locked_resize_keeps_ratio_and_clamps_positive() {
+        let offset = Pos2::new(0.0, 0.0);
+        let size = Vec2::new(100.0, 50.0);
+        let (new_offset, new_scale) = resize_from_corner(
+            offset,
+            size,
+            Vec2::splat(1.0),
+            size,
+            0.0,
+            0,
+            Pos2::new(-100.0, -25.0),
+            true,
+        )
+        .unwrap();
+        let new_size = size * new_scale;
+        assert!((new_size.x / new_size.y - 2.0).abs() < 0.001);
+        assert_pos_close(
+            oriented_corners(new_offset, new_size, 0.0)[2],
+            Pos2::new(100.0, 50.0),
+        );
+
+        let (_, clamped_scale) = resize_from_corner(
+            offset,
+            size,
+            Vec2::splat(1.0),
+            size,
+            0.0,
+            0,
+            Pos2::new(200.0, 100.0),
+            true,
+        )
+        .unwrap();
+        assert!(clamped_scale.x.is_finite());
+        assert!(clamped_scale.y.is_finite());
+        assert!(clamped_scale.x > 0.0 && clamped_scale.y > 0.0);
+    }
+
+    #[test]
+    fn aspect_locked_resize_handles_extreme_persisted_scales_without_panicking() {
+        let scale = Vec2::new(2_000.0, 0.0001);
+        let natural = Vec2::splat(100.0);
+        let size = natural * scale;
+        let result = resize_from_corner(
+            Pos2::ZERO,
+            size,
+            scale,
+            natural,
+            23.0,
+            0,
+            Pos2::new(-20.0, -20.0),
+            true,
+        )
+        .unwrap();
+        assert!(result.0.x.is_finite() && result.0.y.is_finite());
+        assert!(result.1.x.is_finite() && result.1.y.is_finite());
+        assert!(result.1.x > 0.0 && result.1.y > 0.0);
+    }
+
+    #[test]
+    fn rotation_is_normalized_and_shift_snaps_to_fifteen_degrees() {
+        let center = Pos2::new(50.0, 50.0);
+        assert!((rotation_from_pointer(center, Pos2::new(50.0, 0.0), false)).abs() < 0.001);
+        assert!(
+            (rotation_from_pointer(center, Pos2::new(100.0, 50.0), false) - 90.0).abs() < 0.001
+        );
+        assert!(
+            (rotation_from_pointer(center, Pos2::new(50.0, 100.0), false) + 180.0).abs() < 0.001
+        );
+        assert_eq!(
+            rotation_from_pointer(center, Pos2::new(100.0, 40.0), true),
+            75.0
+        );
+        for degrees in [-1080.0, -180.0, 180.0, 1080.0] {
+            let normalized = normalize_degrees(degrees);
+            assert!((-180.0..180.0).contains(&normalized));
+        }
+    }
+
+    #[test]
+    fn transform_handle_registered_after_artwork_wins_pointer_capture() {
+        fn run_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (bool, bool) {
+            let mut body_dragged = false;
+            let mut handle_dragged = false;
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let body = ui.interact(
+                        Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(110.0, 110.0)),
+                        Id::new("test-artwork"),
+                        Sense::drag(),
+                    );
+                    let handle = ui.interact(
+                        Rect::from_center_size(Pos2::new(50.0, 50.0), Vec2::splat(18.0)),
+                        Id::new("test-handle"),
+                        Sense::drag(),
+                    );
+                    body_dragged = body.dragged();
+                    handle_dragged = handle.dragged();
+                });
+            });
+            (body_dragged, handle_dragged)
+        }
+
+        let context = egui::Context::default();
+        run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(50.0, 50.0))],
+        );
+        run_frame(
+            &context,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(50.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let (body_dragged, handle_dragged) = run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(75.0, 75.0))],
+        );
+        assert!(!body_dragged);
+        assert!(handle_dragged);
+    }
 
     #[test]
     fn preview_omits_disabled_geometry_and_preserves_modes() {
