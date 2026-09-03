@@ -89,6 +89,7 @@ pub enum Action {
         error: anyhow::Error,
     },
     Cut {
+        generation_id: u64,
         source_geometry: CutGeometrySnapshot,
         action: CutAction,
     },
@@ -99,7 +100,18 @@ pub struct CutGeometrySnapshot {
     device: usize,
     mode: usize,
     canvas_size: usize,
+    tuning: CutTuningSnapshot,
     images: Vec<CutImageGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CutTuningSnapshot {
+    buffer: u32,
+    minimum_length: u32,
+    smoothing: usize,
+    simplify: u32,
+    internal: bool,
+    white_transparent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,8 +120,18 @@ struct CutImageGeometry {
     offset: [u32; 2],
     scale: [u32; 2],
     rotation_degrees: u32,
+    content_revision: u64,
     visible: bool,
     enable_cutting: bool,
+}
+
+fn should_accept_cut_action(
+    active_generation: Option<u64>,
+    generation_id: u64,
+    source: &CutGeometrySnapshot,
+    current: &CutGeometrySnapshot,
+) -> bool {
+    active_generation == Some(generation_id) && source == current
 }
 
 fn update_cut_geometry_snapshot(
@@ -163,6 +185,8 @@ pub struct SapodillaApp {
     pub cut_modes: Vec<CutMode>,
     pub auto_cut_count: usize,
     cut_geometry_snapshot: Option<CutGeometrySnapshot>,
+    next_cut_generation_id: u64,
+    active_cut_generation: Option<u64>,
     pub has_intersections: bool,
     pub off_canvas: bool,
     pub cut_progress: Option<(usize, usize)>,
@@ -279,6 +303,7 @@ pub struct LoadedImage {
     pub locked: bool,
     pub visible: bool,
     pub adjustments: ImageAdjustments,
+    pub content_revision: u64,
 
     // We need this handle so egui doesn't drop the texture.
     #[allow(dead_code)]
@@ -331,6 +356,7 @@ impl LoadedImage {
             locked: false,
             visible: true,
             adjustments: ImageAdjustments::default(),
+            content_revision: 0,
             handle,
         })
     }
@@ -376,6 +402,7 @@ impl LoadedImage {
 
     pub fn apply_adjustments(&mut self) {
         self.image = studio::adjust_image(&self.original_image, self.adjustments);
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 
@@ -383,18 +410,21 @@ impl LoadedImage {
         self.image = studio::remove_background(&self.image, tolerance, feather);
         self.original_image = self.image.clone();
         self.adjustments = ImageAdjustments::default();
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 
     pub fn flip_horizontal(&mut self) {
         image::imageops::flip_horizontal_in_place(&mut self.image);
         image::imageops::flip_horizontal_in_place(&mut self.original_image);
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 
     pub fn flip_vertical(&mut self) {
         image::imageops::flip_vertical_in_place(&mut self.image);
         image::imageops::flip_vertical_in_place(&mut self.original_image);
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 }
@@ -494,6 +524,8 @@ impl SapodillaApp {
             cut_modes: Vec::new(),
             auto_cut_count: 0,
             cut_geometry_snapshot: None,
+            next_cut_generation_id: 1,
+            active_cut_generation: None,
             has_intersections: false,
             off_canvas: false,
             cut_progress: None,
@@ -559,6 +591,14 @@ impl SapodillaApp {
             device: self.selected_device,
             mode: self.selected_mode,
             canvas_size: self.selected_canvas_size,
+            tuning: CutTuningSnapshot {
+                buffer: self.cut_tuning.buffer.to_bits(),
+                minimum_length: self.cut_tuning.minimum_length.to_bits(),
+                smoothing: self.cut_tuning.smoothing,
+                simplify: self.cut_tuning.simplify.to_bits(),
+                internal: self.cut_tuning.internal,
+                white_transparent: self.cut_tuning.white_transparent,
+            },
             images: self
                 .loaded_images
                 .iter()
@@ -567,6 +607,7 @@ impl SapodillaApp {
                     offset: [image.offset.x.to_bits(), image.offset.y.to_bits()],
                     scale: [image.scale.x.to_bits(), image.scale.y.to_bits()],
                     rotation_degrees: image.rotation_degrees.to_bits(),
+                    content_revision: image.content_revision,
                     visible: image.visible,
                     enable_cutting: image.enable_cutting,
                 })
@@ -580,6 +621,7 @@ impl SapodillaApp {
             return;
         }
         self.cut_progress = None;
+        self.active_cut_generation = None;
         self.invalidate_auto_cutlines();
     }
 
@@ -1720,6 +1762,7 @@ impl SapodillaApp {
                             .cloned();
                         let target_size = existing.rotated_size();
                         replacement.id = existing_id;
+                        replacement.content_revision = existing.content_revision.wrapping_add(1);
                         replacement.name.clone_from(&existing.name);
                         replacement.offset = existing.offset;
                         replacement.rotation_degrees = existing.rotation_degrees;
@@ -1756,6 +1799,7 @@ impl SapodillaApp {
                             loaded.image = image;
                             loaded.original_image = loaded.image.clone();
                             loaded.adjustments = ImageAdjustments::default();
+                            loaded.content_revision = loaded.content_revision.wrapping_add(1);
                             loaded.refresh_texture();
                         }
                         Err(error) => self.error = Some(error),
@@ -1965,13 +2009,16 @@ impl SapodillaApp {
                     self.error = Some(error);
                 }
                 Action::Cut {
+                    generation_id,
                     source_geometry,
                     action,
                 } => {
-                    if source_geometry != self.current_cut_geometry() {
-                        if matches!(action, CutAction::Done(_)) {
-                            self.cut_progress = None;
-                        }
+                    if !should_accept_cut_action(
+                        self.active_cut_generation,
+                        generation_id,
+                        &source_geometry,
+                        &self.current_cut_geometry(),
+                    ) {
                         continue;
                     }
                     match action {
@@ -1979,6 +2026,7 @@ impl SapodillaApp {
                             self.cut_progress = Some((completed, total));
                         }
                         CutAction::Done(result) => {
+                            self.active_cut_generation = None;
                             let manual_owners = (0..self.manual_cut_shapes.len())
                                 .map(|index| {
                                     self.cutline_owners
@@ -3369,7 +3417,7 @@ impl eframe::App for SapodillaApp {
 
                     if ui
                         .add_enabled(
-                            self.cut_progress.is_none(),
+                            self.cut_progress.is_none() && self.active_cut_generation.is_none(),
                             egui::Button::new("Generate Cut Lines"),
                         )
                         .clicked()
@@ -3377,10 +3425,13 @@ impl eframe::App for SapodillaApp {
                         self.synchronize_cut_geometry();
                         self.has_intersections = false;
                         self.off_canvas = false;
-                        self.cut_progress = None;
+                        self.cut_progress = Some((0, 1));
 
                         let tx = self.tx.clone();
                         let source_geometry = self.current_cut_geometry();
+                        let generation_id = self.next_cut_generation_id;
+                        self.next_cut_generation_id = self.next_cut_generation_id.wrapping_add(1);
+                        self.active_cut_generation = Some(generation_id);
                         let mut rx = CutGenerator::start(
                             self.loaded_images
                                 .iter()
@@ -3396,6 +3447,7 @@ impl eframe::App for SapodillaApp {
                                 debug!(?action, "got cut action");
 
                                 if let Err(err) = tx.send(Action::Cut {
+                                    generation_id,
                                     source_geometry: source_geometry.clone(),
                                     action,
                                 }) {
@@ -3920,11 +3972,20 @@ mod tests {
             device: 0,
             mode: 0,
             canvas_size: 0,
+            tuning: CutTuningSnapshot {
+                buffer: 1.0_f32.to_bits(),
+                minimum_length: 1.0_f32.to_bits(),
+                smoothing: 1,
+                simplify: 1.0_f32.to_bits(),
+                internal: false,
+                white_transparent: true,
+            },
             images: vec![CutImageGeometry {
                 id: "image-a".into(),
                 offset: [offset_x.to_bits(), 0.0_f32.to_bits()],
                 scale: [1.0_f32.to_bits(), 1.0_f32.to_bits()],
                 rotation_degrees: 0.0_f32.to_bits(),
+                content_revision: 0,
                 visible: true,
                 enable_cutting: true,
             }],
@@ -3949,8 +4010,36 @@ mod tests {
     fn asynchronous_cut_result_key_rejects_later_sidebar_transform() {
         let generation_source = cut_geometry(10.0);
         let after_sidebar_move = cut_geometry(11.0);
-        assert_ne!(generation_source, after_sidebar_move);
-        assert_eq!(generation_source, cut_geometry(10.0));
+        assert!(!should_accept_cut_action(
+            Some(7),
+            7,
+            &generation_source,
+            &after_sidebar_move
+        ));
+        assert!(!should_accept_cut_action(
+            Some(8),
+            7,
+            &generation_source,
+            &generation_source
+        ));
+        assert!(should_accept_cut_action(
+            Some(7),
+            7,
+            &generation_source,
+            &generation_source
+        ));
+    }
+
+    #[test]
+    fn raster_and_tuning_changes_invalidate_cut_inputs() {
+        let original = cut_geometry(10.0);
+        let mut raster_changed = original.clone();
+        raster_changed.images[0].content_revision += 1;
+        assert_ne!(original, raster_changed);
+
+        let mut tuning_changed = original.clone();
+        tuning_changed.tuning.simplify = 2.0_f32.to_bits();
+        assert_ne!(original, tuning_changed);
     }
 
     #[test]
