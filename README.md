@@ -11,7 +11,7 @@ the app.
 ## Usage
 
 Sapodilla runs as a native desktop application or in Chrome via WebAssembly.
-The hosted browser build is available [here](https://sapodilla.pages.dev).
+The hosted browser build is available at [gh.knnygrdn.com/sapodilla](https://gh.knnygrdn.com/sapodilla/).
 
 ### Features
 
