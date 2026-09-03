@@ -1,14 +1,13 @@
 <!DOCTYPE html>
-<html>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0, user-scalable=no"
-  />
-
+<html lang="en">
   <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Sapodilla</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff2daa'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='sans-serif' font-size='20' fill='%230b0b10'%3ES%3C/text%3E%3C/svg%3E"
+    />
 
     <link data-trunk rel="rust" data-wasm-opt="2" data-bindgen-target="web" />
     <link data-trunk rel="copy-file" href="static/_headers" />
@@ -95,7 +94,11 @@
   </head>
 
   <body>
-    <canvas id="sapodilla_canvas"></canvas>
+    <canvas
+      id="sapodilla_canvas"
+      tabindex="0"
+      aria-label="Sapodilla sticker sheet editor"
+    ></canvas>
 
     <div class="centered" id="loading_text">
       <p style="font-size: 16px">Loading</p>

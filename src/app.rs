@@ -7,7 +7,7 @@ use std::{
 
 use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
-use geo::{BoundingRect, Coord, LineString, Rect as GeoRect};
+use geo::{BoundingRect, Contains, Coord, Intersects, LineString, Rect as GeoRect};
 use image::{EncodableLayout, GenericImageView, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
@@ -28,6 +28,7 @@ use crate::{
         self, CutlineOwner, DocumentKind, DocumentSettings, ImageAdjustments, MaterialProfile,
         PackItem, PlaceholderFit, SavedImage, StudioDocument, TemplatePlaceholder,
     },
+    theme,
     toolpath::{CutMode, effective_cut_modes, plan_cut_phases},
     transports::*,
     views,
@@ -185,6 +186,7 @@ pub struct SapodillaApp {
     pub cut_modes: Vec<CutMode>,
     pub auto_cut_count: usize,
     cut_geometry_snapshot: Option<CutGeometrySnapshot>,
+    cut_validation_snapshot: Option<CutValidationSnapshot>,
     next_cut_generation_id: u64,
     active_cut_generation: Option<u64>,
     pub has_intersections: bool,
@@ -239,6 +241,10 @@ pub struct SapodillaApp {
     pub background_ml_running: bool,
 
     pub error: Option<anyhow::Error>,
+    confirm_new_sheet: bool,
+    show_library_panel: bool,
+    show_inspector_panel: bool,
+    compact_layout: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -524,6 +530,7 @@ impl SapodillaApp {
             cut_modes: Vec::new(),
             auto_cut_count: 0,
             cut_geometry_snapshot: None,
+            cut_validation_snapshot: None,
             next_cut_generation_id: 1,
             active_cut_generation: None,
             has_intersections: false,
@@ -583,6 +590,10 @@ impl SapodillaApp {
             background_ml_running: false,
 
             error: None,
+            confirm_new_sheet: false,
+            show_library_panel: true,
+            show_inspector_panel: true,
+            compact_layout: false,
         }
     }
 
@@ -2060,6 +2071,7 @@ impl SapodillaApp {
                             self.cutline_locked.extend(manual_locks);
                             self.cut_progress = None;
                             self.off_canvas = result.off_canvas;
+                            self.cut_validation_snapshot = None;
                         }
                     }
                 }
@@ -2209,6 +2221,31 @@ impl SapodillaApp {
         }
     }
 
+    fn start_new_sheet(&mut self) {
+        self.loaded_images.clear();
+        self.document_kind = DocumentKind::Sheet;
+        self.template_placeholders.clear();
+        self.cutline_owners.clear();
+        self.cutline_locked.clear();
+        self.cut_shapes.clear();
+        self.manual_cut_shapes.clear();
+        self.cut_modes.clear();
+        self.auto_cut_count = 0;
+        self.cut_validation_snapshot = None;
+        self.has_intersections = false;
+        self.off_canvas = false;
+        self.selected_images.clear();
+        self.confirm_new_sheet = false;
+    }
+
+    fn request_new_sheet(&mut self) {
+        if self.loaded_images.is_empty() && self.cut_shapes.is_empty() {
+            self.start_new_sheet();
+        } else {
+            self.confirm_new_sheet = true;
+        }
+    }
+
     fn menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::widgets::global_theme_preference_switch(ui);
 
@@ -2216,20 +2253,22 @@ impl SapodillaApp {
 
         let is_web = cfg!(target_arch = "wasm32");
         ui.menu_button("File", |ui| {
-            if ui.button("New Sheet").clicked() {
-                self.loaded_images.clear();
-                self.document_kind = DocumentKind::Sheet;
-                self.template_placeholders.clear();
-                self.cutline_owners.clear();
-                self.cutline_locked.clear();
-                self.cut_shapes.clear();
-                self.manual_cut_shapes.clear();
-                self.cut_modes.clear();
-                self.auto_cut_count = 0;
-                self.selected_images.clear();
+            let new_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N);
+            if ui
+                .add(
+                    egui::Button::new("New Sheet")
+                        .shortcut_text(ctx.format_shortcut(&new_shortcut)),
+                )
+                .clicked()
+            {
+                self.request_new_sheet();
                 ui.close();
             }
-            if ui.button("Open…").clicked() {
+            let open_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O);
+            if ui
+                .add(egui::Button::new("Open…").shortcut_text(ctx.format_shortcut(&open_shortcut)))
+                .clicked()
+            {
                 self.open_document(ctx);
                 ui.close();
             }
@@ -2689,7 +2728,31 @@ impl SapodillaApp {
             });
         }
 
-        if !self.printer_connections.is_empty() && ui.button("Print Canvas").clicked() {
+        let mode_has_cutting = DEVICES[self.selected_device].modes[self.selected_mode]
+            .mode_type
+            .has_cutting();
+        let has_visible_artwork = self.loaded_images.iter().any(|image| image.visible);
+        let has_enabled_cut_paths =
+            has_enabled_cut_path(&self.cut_shapes, &self.cut_modes, self.perf_cut);
+        let print_block_reason = print_block_reason(
+            !self.printer_connections.is_empty(),
+            has_visible_artwork,
+            mode_has_cutting,
+            self.cut_progress.is_some(),
+            has_enabled_cut_paths,
+            self.has_intersections,
+            self.off_canvas,
+        );
+        let can_print = print_block_reason.is_none();
+        let print_label = if mode_has_cutting {
+            "Print & cut"
+        } else {
+            "Print"
+        };
+        let print = theme::primary_button_enabled(ui, can_print, print_label);
+        if let Some(reason) = print_block_reason {
+            print.on_disabled_hover_text(reason);
+        } else if print.clicked() {
             self.print_canvas();
         }
         if let Some(send_progress) = self.send_progress {
@@ -2770,8 +2833,145 @@ impl SapodillaApp {
     }
 }
 
+fn print_block_reason(
+    has_printer: bool,
+    has_visible_artwork: bool,
+    mode_has_cutting: bool,
+    cut_generation_pending: bool,
+    has_enabled_cut_paths: bool,
+    has_intersections: bool,
+    off_canvas: bool,
+) -> Option<&'static str> {
+    if !has_printer {
+        Some("Connect a printer before starting production.")
+    } else if !has_visible_artwork {
+        Some("Add artwork before starting production.")
+    } else if mode_has_cutting && cut_generation_pending {
+        Some("Wait for cutline generation to finish.")
+    } else if mode_has_cutting && !has_enabled_cut_paths {
+        Some("Generate at least one enabled cutline before starting production.")
+    } else if mode_has_cutting && (has_intersections || off_canvas) {
+        Some("Resolve overlapping or out-of-bounds cutlines before starting production.")
+    } else {
+        None
+    }
+}
+
+fn has_enabled_cut_path(
+    cut_shapes: &[LineString<f32>],
+    cut_modes: &[CutMode],
+    all_perforation: bool,
+) -> bool {
+    cut_shapes
+        .iter()
+        .zip(effective_cut_modes(
+            cut_shapes.len(),
+            cut_modes,
+            all_perforation,
+        ))
+        .any(|(path, mode)| {
+            mode != CutMode::Disabled
+                && path.0.len() >= 2
+                && path
+                    .0
+                    .iter()
+                    .all(|point| point.x.is_finite() && point.y.is_finite())
+                && path.0.windows(2).any(|segment| segment[0] != segment[1])
+        })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CutPathValidation {
+    has_intersections: bool,
+    off_canvas: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CutValidationSnapshot {
+    paths: Vec<Vec<[u32; 2]>>,
+    modes: Vec<CutMode>,
+    all_perforation: bool,
+    canvas_size: [u32; 2],
+    safe_area: [u32; 2],
+}
+
+fn cut_validation_snapshot(
+    cut_shapes: &[LineString<f32>],
+    cut_modes: &[CutMode],
+    all_perforation: bool,
+    canvas_size: Vec2,
+    safe_area: Vec2,
+) -> CutValidationSnapshot {
+    CutValidationSnapshot {
+        paths: cut_shapes
+            .iter()
+            .map(|path| {
+                path.0
+                    .iter()
+                    .map(|point| [point.x.to_bits(), point.y.to_bits()])
+                    .collect()
+            })
+            .collect(),
+        modes: cut_modes.to_vec(),
+        all_perforation,
+        canvas_size: [canvas_size.x.to_bits(), canvas_size.y.to_bits()],
+        safe_area: [safe_area.x.to_bits(), safe_area.y.to_bits()],
+    }
+}
+
+fn validate_current_cut_paths(
+    cut_shapes: &[LineString<f32>],
+    cut_modes: &[CutMode],
+    all_perforation: bool,
+    canvas_size: Vec2,
+    safe_area: Vec2,
+) -> CutPathValidation {
+    let modes = effective_cut_modes(cut_shapes.len(), cut_modes, all_perforation);
+    let effective_paths = cut_shapes
+        .iter()
+        .zip(modes)
+        .filter_map(|(path, mode)| {
+            (mode != CutMode::Disabled
+                && path.0.len() >= 2
+                && path
+                    .0
+                    .iter()
+                    .all(|point| point.x.is_finite() && point.y.is_finite())
+                && path.0.windows(2).any(|segment| segment[0] != segment[1]))
+            .then_some(path)
+        })
+        .collect::<Vec<_>>();
+
+    let has_intersections = effective_paths.iter().enumerate().any(|(index, path)| {
+        effective_paths[index + 1..]
+            .iter()
+            .any(|other| path.intersects(*other))
+    });
+    let offset = (canvas_size - safe_area) / 2.0;
+    let safe_canvas = GeoRect::new(
+        Coord {
+            x: offset.x,
+            y: offset.y,
+        },
+        Coord {
+            x: canvas_size.x - offset.x,
+            y: canvas_size.y - offset.y,
+        },
+    )
+    .to_polygon();
+    let off_canvas = effective_paths
+        .iter()
+        .any(|path| !safe_canvas.contains(*path));
+
+    CutPathValidation {
+        has_intersections,
+        off_canvas,
+    }
+}
+
 impl eframe::App for SapodillaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        theme::apply(ctx);
         self.apply_actions();
         self.synchronize_cut_geometry();
         self.cut_modes.resize(self.cut_shapes.len(), CutMode::Kiss);
@@ -2780,54 +2980,198 @@ impl eframe::App for SapodillaApp {
         self.cutline_owners.truncate(self.cut_shapes.len());
         self.cutline_locked.resize(self.cut_shapes.len(), false);
         self.cutline_locked.truncate(self.cut_shapes.len());
+        let canvas = self.get_canvas();
+        let current_validation_snapshot = cut_validation_snapshot(
+            &self.cut_shapes,
+            &self.cut_modes,
+            self.perf_cut,
+            canvas.size,
+            canvas.safe_area,
+        );
+        if self.cut_validation_snapshot.as_ref() != Some(&current_validation_snapshot) {
+            let cut_validation = validate_current_cut_paths(
+                &self.cut_shapes,
+                &self.cut_modes,
+                self.perf_cut,
+                canvas.size,
+                canvas.safe_area,
+            );
+            self.has_intersections = cut_validation.has_intersections;
+            self.off_canvas = cut_validation.off_canvas;
+            self.cut_validation_snapshot = Some(current_validation_snapshot);
+        }
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                self.menu(ui, ctx);
-            });
-            ui.horizontal(|ui| {
-                ui.heading("Sapodilla Studio");
-                ui.separator();
-                if ui.button("＋ Artwork").clicked() {
-                    self.upload_image(ctx);
-                }
-                if ui.button("Auto-pack").clicked() {
-                    self.auto_pack();
-                }
-                if ui.button("Save Sheet").clicked() {
-                    self.save_document(DocumentKind::Sheet);
-                }
-                ui.separator();
-                ui.toggle_value(&mut self.snap_to_guides, "Snap");
-                ui.toggle_value(&mut self.show_grid, "Grid");
-                ui.toggle_value(&mut self.show_rulers, "Rulers");
-                ui.toggle_value(&mut self.show_cutlines, "Cut preview");
-                ui.toggle_value(&mut self.edit_cutlines, "Edit nodes");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let status = match self.printer_connections.len() {
-                        0 if self.transport_status == TransportStatus::Connecting => {
-                            "◌ Connecting".to_owned()
+        let save_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S);
+        if ctx.input_mut(|input| input.consume_shortcut(&save_shortcut)) {
+            self.save_document(self.document_kind);
+        }
+        let new_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N);
+        if ctx.input_mut(|input| input.consume_shortcut(&new_shortcut)) {
+            self.request_new_sheet();
+        }
+        let open_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O);
+        if ctx.input_mut(|input| input.consume_shortcut(&open_shortcut)) {
+            self.open_document(ctx);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && self.edit_cutlines {
+            self.edit_cutlines = false;
+            self.selected_cut_path = None;
+            self.selected_cut_node = None;
+        }
+
+        let compact_layout = ctx.content_rect().width() < 1160.0;
+        if compact_layout != self.compact_layout {
+            self.compact_layout = compact_layout;
+            self.show_library_panel = !compact_layout;
+            self.show_inspector_panel = !compact_layout;
+        }
+
+        egui::TopBottomPanel::top("top_panel")
+            .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
+            .show(ctx, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    self.menu(ui, ctx);
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    egui::Frame::new()
+                        .fill(theme::ACCENT)
+                        .corner_radius(egui::CornerRadius::same(7))
+                        .inner_margin(egui::Margin::symmetric(7, 4))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("S")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(theme::INK),
+                            );
+                        });
+                    if !compact_layout {
+                        ui.label(egui::RichText::new("Sapodilla").size(18.0).strong());
+                        ui.label(
+                            egui::RichText::new("STUDIO")
+                                .size(10.0)
+                                .color(theme::ACCENT),
+                        );
+                    }
+                    ui.separator();
+                    if theme::primary_button(
+                        ui,
+                        if compact_layout {
+                            "+ Add"
+                        } else {
+                            "+ Add artwork"
+                        },
+                    )
+                    .on_hover_text("Import artwork (Ctrl/Cmd+Shift+U)")
+                    .clicked()
+                    {
+                        self.upload_image(ctx);
+                    }
+                    if compact_layout {
+                        ui.menu_button("More", |ui| {
+                            if ui.button("Auto-pack sheet").clicked() {
+                                self.auto_pack();
+                                ui.close();
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new("Save")
+                                        .shortcut_text(ctx.format_shortcut(&save_shortcut)),
+                                )
+                                .clicked()
+                            {
+                                self.save_document(self.document_kind);
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.checkbox(&mut self.snap_to_guides, "Snap to guides");
+                            ui.checkbox(&mut self.show_grid, "Show grid");
+                            ui.checkbox(&mut self.show_rulers, "Show rulers");
+                            ui.checkbox(&mut self.show_cutlines, "Show cut preview");
+                            ui.checkbox(&mut self.edit_cutlines, "Edit cut nodes");
+                        });
+                    } else {
+                        if ui
+                            .button("Auto-pack")
+                            .on_hover_text("Arrange artwork to use the sheet efficiently")
+                            .clicked()
+                        {
+                            self.auto_pack();
                         }
-                        0 => "○ No printer".to_owned(),
-                        1 => "● 1 printer ready".to_owned(),
-                        count => format!("● {count} printers ready"),
-                    };
-                    ui.label(status);
+                        if ui
+                            .button("Save")
+                            .on_hover_text(format!(
+                                "Save this document ({})",
+                                ctx.format_shortcut(&save_shortcut)
+                            ))
+                            .clicked()
+                        {
+                            self.save_document(self.document_kind);
+                        }
+                        ui.separator();
+                        ui.toggle_value(&mut self.snap_to_guides, "Snap");
+                        ui.toggle_value(&mut self.show_grid, "Grid");
+                        ui.toggle_value(&mut self.show_rulers, "Rulers");
+                        ui.toggle_value(&mut self.show_cutlines, "Cut preview");
+                        ui.toggle_value(&mut self.edit_cutlines, "Edit nodes");
+                    }
+
+                    if ui
+                        .selectable_label(self.show_library_panel, "Library")
+                        .clicked()
+                    {
+                        self.show_library_panel = !self.show_library_panel;
+                        if compact_layout && self.show_library_panel {
+                            self.show_inspector_panel = false;
+                        }
+                    }
+                    if ui
+                        .selectable_label(self.show_inspector_panel, "Inspector")
+                        .clicked()
+                    {
+                        self.show_inspector_panel = !self.show_inspector_panel;
+                        if compact_layout && self.show_inspector_panel {
+                            self.show_library_panel = false;
+                        }
+                    }
+
+                    if !compact_layout {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (ready, status) = match self.printer_connections.len() {
+                                0 if self.transport_status == TransportStatus::Connecting => {
+                                    (false, "Connecting…".to_owned())
+                                }
+                                0 => (false, "No printer".to_owned()),
+                                1 => (true, "1 printer ready".to_owned()),
+                                count => (true, format!("{count} printers ready")),
+                            };
+                            theme::status_badge(ui, ready, &status)
+                                .response
+                                .on_hover_text(if ready {
+                                    "A printer is available for this job"
+                                } else {
+                                    "Open the Inspector to connect a printer"
+                                });
+                        });
+                    }
                 });
             });
-        });
 
         egui::SidePanel::left("library_panel")
             .resizable(true)
-            .default_width(220.0)
-            .width_range(170.0..=360.0)
-            .show(ctx, |ui| {
+            .default_width(if compact_layout { 260.0 } else { 240.0 })
+            .width_range(220.0..=360.0)
+            .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
+            .show_animated(ctx, self.show_library_panel, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Library");
-                    if ui.button("Import…").clicked() {
+                    theme::panel_title(ui, "Assets", "Library");
+                    if theme::primary_button(ui, "Import…").clicked() {
                         self.import_library_images(ctx);
                     }
                 });
+                theme::muted(ui, "Add artwork once, then reuse it across sheets.");
+                ui.add_space(6.0);
                 #[cfg(not(target_arch = "wasm32"))]
                 if ui.button("Import folder…").clicked() {
                     self.import_library_folder(ctx);
@@ -2865,68 +3209,91 @@ impl eframe::App for SapodillaApp {
                         );
                     }
                 }
-                ui.label("Folder locations are restored and rescanned on startup.");
+                #[cfg(not(target_arch = "wasm32"))]
+                if !self.library_folders.is_empty() {
+                    theme::muted(
+                        ui,
+                        "Folder locations are restored and rescanned on startup.",
+                    );
+                }
                 ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut add = None;
-                    let mut remove = None;
-                    for (index, asset) in self.library.iter().enumerate() {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                let image = egui::Image::new(asset.sized_texture)
-                                    .fit_to_exact_size(Vec2::splat(52.0));
-                                if ui
-                                    .add(egui::Button::image(image))
-                                    .on_hover_text("Add to sheet")
-                                    .clicked()
-                                {
-                                    add = Some(index);
-                                }
-                                ui.vertical(|ui| {
-                                    ui.label(&asset.name);
-                                    ui.small(format!(
-                                        "{} × {} px",
-                                        asset.image.width(),
-                                        asset.image.height()
-                                    ));
-                                    if ui.small_button("Remove").clicked() {
-                                        remove = Some(index);
+                #[cfg(not(target_arch = "wasm32"))]
+                let library_empty = self.library.is_empty() && self.library_disk_paths.is_empty();
+                #[cfg(target_arch = "wasm32")]
+                let library_empty = self.library.is_empty();
+                if library_empty {
+                    theme::card(ui.visuals().dark_mode).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Your artwork library is empty").strong());
+                        theme::muted(
+                            ui,
+                            "Import PNG or JPEG artwork, or drag files into the workspace.",
+                        );
+                    });
+                    ui.add_space(4.0);
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let mut add = None;
+                        let mut remove = None;
+                        for (index, asset) in self.library.iter().enumerate() {
+                            theme::card(ui.visuals().dark_mode).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let image = egui::Image::new(asset.sized_texture)
+                                        .fit_to_exact_size(Vec2::splat(52.0));
+                                    if ui
+                                        .add(egui::Button::image(image))
+                                        .on_hover_text("Add to sheet")
+                                        .clicked()
+                                    {
+                                        add = Some(index);
                                     }
+                                    ui.vertical(|ui| {
+                                        ui.label(&asset.name);
+                                        ui.small(format!(
+                                            "{} × {} px",
+                                            asset.image.width(),
+                                            asset.image.height()
+                                        ));
+                                        if ui.small_button("Remove").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    });
                                 });
                             });
-                        });
-                    }
-                    if let Some(index) = add {
-                        let mut image = self.library[index].clone();
-                        image.id = format!("image-{}", Uuid::new_v4());
-                        image.offset = ((self.get_canvas().size - image.size()) / 2.0).to_pos2();
-                        self.loaded_images.push(image);
-                    }
-                    if let Some(index) = remove {
-                        self.library.remove(index);
-                        self.reset_library_cycle();
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let mut open = None;
-                        for path in &self.library_disk_paths {
-                            let label = path
-                                .file_stem()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("Artwork");
-                            if ui
-                                .button(label)
-                                .on_hover_text(path.to_string_lossy())
-                                .clicked()
-                            {
-                                open = Some(path.clone());
+                        }
+                        if let Some(index) = add {
+                            let mut image = self.library[index].clone();
+                            image.id = format!("image-{}", Uuid::new_v4());
+                            image.offset =
+                                ((self.get_canvas().size - image.size()) / 2.0).to_pos2();
+                            self.loaded_images.push(image);
+                        }
+                        if let Some(index) = remove {
+                            self.library.remove(index);
+                            self.reset_library_cycle();
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let mut open = None;
+                            for path in &self.library_disk_paths {
+                                let label = path
+                                    .file_stem()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Artwork");
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(path.to_string_lossy())
+                                    .clicked()
+                                {
+                                    open = Some(path.clone());
+                                }
+                            }
+                            if let Some(path) = open {
+                                self.add_disk_library_image(ctx, path);
                             }
                         }
-                        if let Some(path) = open {
-                            self.add_disk_library_image(ctx, path);
-                        }
-                    }
-                });
+                    });
                 #[cfg(not(target_arch = "wasm32"))]
                 ui.horizontal(|ui| {
                     if ui
@@ -2966,555 +3333,672 @@ impl eframe::App for SapodillaApp {
 
         egui::SidePanel::right("control_panel")
             .resizable(true)
-            .default_width(350.0)
-            .width_range(150.0..=400.0)
-            .show(ctx, |ui| {
-                ui.heading("Connection");
+            .default_width(if compact_layout { 280.0 } else { 350.0 })
+            .width_range(260.0..=440.0)
+            .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
+            .show_animated(ctx, self.show_inspector_panel, |ui| {
+                theme::panel_title(ui, "Make", "Inspector");
+                theme::muted(ui, "Prepare the sheet, cut paths, and production job.");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Connection");
 
-                self.device_status(ui);
+                        self.device_status(ui);
 
-                ui.collapsing("Production queue", |ui| {
-                    let jobs = self.job_queue.jobs().cloned().collect::<Vec<_>>();
-                    let mut cancel = None;
-                    let mut retry = None;
-                    for job in jobs {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("#{} {}", job.id, job.spec.name));
-                                ui.label(format!("{:?}", job.status));
-                            });
-                            ui.add(
-                                egui::ProgressBar::new(f32::from(job.progress_percent) / 100.0)
-                                    .show_percentage(),
-                            );
-                            if let Some(error) = &job.error {
-                                ui.small(error);
+                        ui.collapsing("Production queue", |ui| {
+                            let jobs = self.job_queue.jobs().cloned().collect::<Vec<_>>();
+                            let mut cancel = None;
+                            let mut retry = None;
+                            for job in jobs {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("#{} {}", job.id, job.spec.name));
+                                        ui.label(format!("{:?}", job.status));
+                                    });
+                                    ui.add(
+                                        egui::ProgressBar::new(
+                                            f32::from(job.progress_percent) / 100.0,
+                                        )
+                                        .show_percentage(),
+                                    );
+                                    if let Some(error) = &job.error {
+                                        ui.small(error);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if job.status == QueueJobStatus::Queued
+                                            && ui.small_button("Cancel").clicked()
+                                        {
+                                            cancel = Some(job.id);
+                                        }
+                                        if matches!(
+                                            job.status,
+                                            QueueJobStatus::Error | QueueJobStatus::Cancelled
+                                        ) && self.pending_print_jobs.contains_key(&job.id)
+                                            && ui.small_button("Retry").clicked()
+                                        {
+                                            retry = Some(job.id);
+                                        }
+                                    });
+                                });
                             }
-                            ui.horizontal(|ui| {
-                                if job.status == QueueJobStatus::Queued
-                                    && ui.small_button("Cancel").clicked()
-                                {
-                                    cancel = Some(job.id);
-                                }
-                                if matches!(
-                                    job.status,
-                                    QueueJobStatus::Error | QueueJobStatus::Cancelled
-                                ) && self.pending_print_jobs.contains_key(&job.id)
-                                    && ui.small_button("Retry").clicked()
-                                {
-                                    retry = Some(job.id);
-                                }
-                            });
+                            if let Some(job_id) = cancel {
+                                let _ = self.job_queue.cancel(job_id);
+                            }
+                            if let Some(job_id) = retry {
+                                let _ = self.job_queue.retry(job_id);
+                            }
                         });
-                    }
-                    if let Some(job_id) = cancel {
-                        let _ = self.job_queue.cancel(job_id);
-                    }
-                    if let Some(job_id) = retry {
-                        let _ = self.job_queue.retry(job_id);
-                    }
-                });
 
-                ui.separator();
+                        ui.separator();
 
-                ui.heading("Settings");
+                        ui.heading("Settings");
 
-                let previous = self.selected_device;
-                egui::ComboBox::from_label("Device")
-                    .selected_text(&DEVICES[self.selected_device].name)
-                    .show_index(ui, &mut self.selected_device, DEVICES.len(), |i| {
-                        &DEVICES[i].name
-                    });
-                if self.selected_device != previous {
-                    self.selected_mode = 0;
-                    self.selected_canvas_size = 0;
-                }
-
-                let previous = self.selected_mode;
-                egui::ComboBox::from_label("Mode")
-                    .selected_text(
-                        DEVICES[self.selected_device].modes[self.selected_mode]
-                            .mode_type
-                            .name(),
-                    )
-                    .show_index(
-                        ui,
-                        &mut self.selected_mode,
-                        DEVICES[self.selected_device].modes.len(),
-                        |i| DEVICES[self.selected_device].modes[i].mode_type.name(),
-                    );
-                if self.selected_mode != previous {
-                    self.selected_canvas_size = 0;
-                }
-
-                egui::ComboBox::from_label("Canvas Size")
-                    .selected_text(
-                        &DEVICES[self.selected_device].modes[self.selected_mode].canvas_sizes
-                            [self.selected_canvas_size]
-                            .name,
-                    )
-                    .show_index(
-                        ui,
-                        &mut self.selected_canvas_size,
-                        DEVICES[self.selected_device].modes[self.selected_mode]
-                            .canvas_sizes
-                            .len(),
-                        |i| {
-                            &DEVICES[self.selected_device].modes[self.selected_mode].canvas_sizes[i]
-                                .name
-                        },
-                    );
-
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.copies).range(1..=10));
-                    ui.label("Copies");
-                });
-
-                ui.separator();
-                ui.heading("Material");
-                egui::ComboBox::from_id_salt("material_profile")
-                    .selected_text(&self.material_profiles[self.selected_material].name)
-                    .show_index(
-                        ui,
-                        &mut self.selected_material,
-                        self.material_profiles.len(),
-                        |index| &self.material_profiles[index].name,
-                    );
-                let material = &mut self.material_profiles[self.selected_material];
-                ui.text_edit_singleline(&mut material.name);
-                ui.add(
-                    egui::Slider::new(&mut material.blade_pressure, 0..=100).text("Blade pressure"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut material.perf_pressure, 0..=100).text("Perf pressure"),
-                );
-                ui.add(egui::Slider::new(&mut material.passes, 0..=4).text("Passes"));
-                ui.add(egui::Slider::new(&mut material.speed, 1..=10).text("Speed"));
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.material_profiles.len() < 128,
-                            egui::Button::new("New preset"),
-                        )
-                        .clicked()
-                    {
-                        let mut profile = self.material_profiles[self.selected_material].clone();
-                        profile.name = "Custom material".into();
-                        self.material_profiles.push(profile);
-                        self.selected_material = self.material_profiles.len() - 1;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.material_profiles.len() > 1,
-                            egui::Button::new("Delete preset"),
-                        )
-                        .clicked()
-                    {
-                        self.material_profiles.remove(self.selected_material);
-                        self.selected_material = self
-                            .selected_material
-                            .min(self.material_profiles.len().saturating_sub(1));
-                    }
-                });
-
-                if DEVICES[self.selected_device].modes[self.selected_mode]
-                    .mode_type
-                    .has_cutting()
-                {
-                    ui.separator();
-
-                    views::cut_controls(
-                        ui,
-                        DEVICES[self.selected_device].dpi,
-                        &mut self.cut_tuning,
-                        self.cut_progress,
-                        self.has_intersections,
-                        self.off_canvas,
-                    );
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .checkbox(&mut self.perf_cut, "All paths perforation")
-                            .changed()
-                        {
-                            self.cut_modes.fill(if self.perf_cut {
-                                CutMode::Perforation
-                            } else {
-                                CutMode::Kiss
+                        let previous = self.selected_device;
+                        egui::ComboBox::from_label("Device")
+                            .selected_text(&DEVICES[self.selected_device].name)
+                            .show_index(ui, &mut self.selected_device, DEVICES.len(), |i| {
+                                &DEVICES[i].name
                             });
+                        if self.selected_device != previous {
+                            self.selected_mode = 0;
+                            self.selected_canvas_size = 0;
                         }
-                        ui.checkbox(&mut self.peel_tabs, "Peel tabs");
-                    });
-                    if self.perf_cut {
-                        ui.add(
-                            egui::Slider::new(&mut self.perf_dash_mm, 0.25..=8.0)
-                                .suffix(" mm")
-                                .text("Dash"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.perf_gap_mm, 0.1..=4.0)
-                                .suffix(" mm")
-                                .text("Gap"),
-                        );
-                    }
-                    ui.collapsing("Overcut", |ui| {
-                        ui.checkbox(&mut self.overcut.enabled, "Lead-in/out at closed seams");
-                        if self.overcut.enabled {
-                            ui.add(
-                                egui::Slider::new(&mut self.overcut.steps, 1..=12).text("Steps"),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.overcut.maximum_angle_degrees,
-                                    0.0..=90.0,
-                                )
-                                .suffix("°")
-                                .text("Maximum angle"),
-                            );
-                            let dpi = DEVICES[self.selected_device].dpi;
-                            let mut reach_mm = self.overcut.reach_pixels * 25.4 / dpi;
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut reach_mm, 0.1..=5.0)
-                                        .suffix(" mm")
-                                        .text("Reach"),
-                                )
-                                .changed()
-                            {
-                                self.overcut.reach_pixels = reach_mm * dpi / 25.4;
-                            }
-                            ui.checkbox(&mut self.overcut.snap_to_pixels, "Snap ramp points");
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Import SVG").clicked() {
-                            self.import_svg();
-                        }
-                    });
-                    ui.collapsing("Shape designer", |ui| {
-                        egui::ComboBox::from_id_salt("procedural_shape")
+
+                        let previous = self.selected_mode;
+                        egui::ComboBox::from_label("Mode")
                             .selected_text(
-                                ProceduralShape::ALL[self.selected_procedural_shape].name(),
+                                DEVICES[self.selected_device].modes[self.selected_mode]
+                                    .mode_type
+                                    .name(),
                             )
-                            .show_ui(ui, |ui| {
-                                for (index, shape) in ProceduralShape::ALL.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_procedural_shape,
-                                        index,
-                                        shape.name(),
+                            .show_index(
+                                ui,
+                                &mut self.selected_mode,
+                                DEVICES[self.selected_device].modes.len(),
+                                |i| DEVICES[self.selected_device].modes[i].mode_type.name(),
+                            );
+                        if self.selected_mode != previous {
+                            self.selected_canvas_size = 0;
+                        }
+
+                        egui::ComboBox::from_label("Canvas Size")
+                            .selected_text(
+                                &DEVICES[self.selected_device].modes[self.selected_mode]
+                                    .canvas_sizes[self.selected_canvas_size]
+                                    .name,
+                            )
+                            .show_index(
+                                ui,
+                                &mut self.selected_canvas_size,
+                                DEVICES[self.selected_device].modes[self.selected_mode]
+                                    .canvas_sizes
+                                    .len(),
+                                |i| {
+                                    &DEVICES[self.selected_device].modes[self.selected_mode]
+                                        .canvas_sizes[i]
+                                        .name
+                                },
+                            );
+
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.copies).range(1..=10));
+                            ui.label("Copies");
+                        });
+
+                        ui.separator();
+                        ui.heading("Material");
+                        egui::ComboBox::from_id_salt("material_profile")
+                            .selected_text(&self.material_profiles[self.selected_material].name)
+                            .show_index(
+                                ui,
+                                &mut self.selected_material,
+                                self.material_profiles.len(),
+                                |index| &self.material_profiles[index].name,
+                            );
+                        let material = &mut self.material_profiles[self.selected_material];
+                        ui.text_edit_singleline(&mut material.name);
+                        ui.add(
+                            egui::Slider::new(&mut material.blade_pressure, 0..=100)
+                                .text("Blade pressure"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut material.perf_pressure, 0..=100)
+                                .text("Perf pressure"),
+                        );
+                        ui.add(egui::Slider::new(&mut material.passes, 0..=4).text("Passes"));
+                        ui.add(egui::Slider::new(&mut material.speed, 1..=10).text("Speed"));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.material_profiles.len() < 128,
+                                    egui::Button::new("New preset"),
+                                )
+                                .clicked()
+                            {
+                                let mut profile =
+                                    self.material_profiles[self.selected_material].clone();
+                                profile.name = "Custom material".into();
+                                self.material_profiles.push(profile);
+                                self.selected_material = self.material_profiles.len() - 1;
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.material_profiles.len() > 1,
+                                    egui::Button::new("Delete preset"),
+                                )
+                                .clicked()
+                            {
+                                self.material_profiles.remove(self.selected_material);
+                                self.selected_material = self
+                                    .selected_material
+                                    .min(self.material_profiles.len().saturating_sub(1));
+                            }
+                        });
+
+                        if DEVICES[self.selected_device].modes[self.selected_mode]
+                            .mode_type
+                            .has_cutting()
+                        {
+                            ui.separator();
+
+                            views::cut_controls(
+                                ui,
+                                DEVICES[self.selected_device].dpi,
+                                &mut self.cut_tuning,
+                                self.cut_progress,
+                                self.has_intersections,
+                                self.off_canvas,
+                            );
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .checkbox(&mut self.perf_cut, "All paths perforation")
+                                    .changed()
+                                {
+                                    self.cut_modes.fill(if self.perf_cut {
+                                        CutMode::Perforation
+                                    } else {
+                                        CutMode::Kiss
+                                    });
+                                }
+                                ui.checkbox(&mut self.peel_tabs, "Peel tabs");
+                            });
+                            if self.perf_cut {
+                                ui.add(
+                                    egui::Slider::new(&mut self.perf_dash_mm, 0.25..=8.0)
+                                        .suffix(" mm")
+                                        .text("Dash"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut self.perf_gap_mm, 0.1..=4.0)
+                                        .suffix(" mm")
+                                        .text("Gap"),
+                                );
+                            }
+                            ui.collapsing("Overcut", |ui| {
+                                ui.checkbox(
+                                    &mut self.overcut.enabled,
+                                    "Lead-in/out at closed seams",
+                                );
+                                if self.overcut.enabled {
+                                    ui.add(
+                                        egui::Slider::new(&mut self.overcut.steps, 1..=12)
+                                            .text("Steps"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.overcut.maximum_angle_degrees,
+                                            0.0..=90.0,
+                                        )
+                                        .suffix("°")
+                                        .text("Maximum angle"),
+                                    );
+                                    let dpi = DEVICES[self.selected_device].dpi;
+                                    let mut reach_mm = self.overcut.reach_pixels * 25.4 / dpi;
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut reach_mm, 0.1..=5.0)
+                                                .suffix(" mm")
+                                                .text("Reach"),
+                                        )
+                                        .changed()
+                                    {
+                                        self.overcut.reach_pixels = reach_mm * dpi / 25.4;
+                                    }
+                                    ui.checkbox(
+                                        &mut self.overcut.snap_to_pixels,
+                                        "Snap ramp points",
                                     );
                                 }
                             });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.shape_width_mm)
-                                    .range(1.0..=300.0)
-                                    .suffix(" mm")
-                                    .prefix("W "),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.shape_height_mm)
-                                    .range(1.0..=300.0)
-                                    .suffix(" mm")
-                                    .prefix("H "),
-                            );
-                        });
-                        if ui.button("Add shape cutline").clicked() {
-                            let canvas = self.get_canvas().size;
-                            let dpi = DEVICES[self.selected_device].dpi;
-                            let size = Vec2::new(
-                                self.shape_width_mm * dpi / 25.4,
-                                self.shape_height_mm * dpi / 25.4,
-                            );
-                            let offset = (canvas - size) / 2.0;
-                            let mut path = shapes::generate(
-                                ProceduralShape::ALL[self.selected_procedural_shape],
-                                size,
-                            );
-                            for point in &mut path.0 {
-                                point.x += offset.x;
-                                point.y += offset.y;
-                            }
-                            self.manual_cut_shapes.push(path.clone());
-                            self.cut_shapes.push(path);
-                            self.cut_modes.push(CutMode::Kiss);
-                            self.cutline_owners.push(None);
-                            self.cutline_locked.push(false);
-                        }
-                    });
-                    if !self.cut_shapes.is_empty() {
-                        let stats = toolpath_stats(&self.prepared_toolpaths());
-                        let mm_per_pixel = 25.4 / DEVICES[self.selected_device].dpi;
-                        ui.small(format!(
-                            "{} paths · {} nodes · {:.1} mm cutting · {:.1} mm travel",
-                            stats.paths,
-                            stats.nodes,
-                            stats.cut_length * mm_per_pixel,
-                            stats.travel_length * mm_per_pixel,
-                        ));
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    self.selected_cut_path.is_some_and(|index| {
-                                        !self.cutline_locked.get(index).copied().unwrap_or(false)
-                                    }),
-                                    egui::Button::new("Smooth selected"),
-                                )
-                                .clicked()
-                                && let Some(index) = self.selected_cut_path
-                            {
-                                self.cut_shapes[index] = smooth_path(&self.cut_shapes[index], 1);
-                                if index >= self.auto_cut_count {
-                                    self.manual_cut_shapes[index - self.auto_cut_count] =
-                                        self.cut_shapes[index].clone();
+                            ui.horizontal(|ui| {
+                                if ui.button("Import SVG").clicked() {
+                                    self.import_svg();
                                 }
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.cut_shapes.len() >= 2
-                                        && !self.cutline_locked.iter().any(|locked| *locked)
-                                        && self.cut_shapes.iter().all(|path| {
-                                            path.0.len() >= 4 && path.0.first() == path.0.last()
+                            });
+                            ui.collapsing("Shape designer", |ui| {
+                                egui::ComboBox::from_id_salt("procedural_shape")
+                                    .selected_text(
+                                        ProceduralShape::ALL[self.selected_procedural_shape].name(),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (index, shape) in
+                                            ProceduralShape::ALL.iter().enumerate()
+                                        {
+                                            ui.selectable_value(
+                                                &mut self.selected_procedural_shape,
+                                                index,
+                                                shape.name(),
+                                            );
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.shape_width_mm)
+                                            .range(1.0..=300.0)
+                                            .suffix(" mm")
+                                            .prefix("W "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.shape_height_mm)
+                                            .range(1.0..=300.0)
+                                            .suffix(" mm")
+                                            .prefix("H "),
+                                    );
+                                });
+                                if ui.button("Add shape cutline").clicked() {
+                                    let canvas = self.get_canvas().size;
+                                    let dpi = DEVICES[self.selected_device].dpi;
+                                    let size = Vec2::new(
+                                        self.shape_width_mm * dpi / 25.4,
+                                        self.shape_height_mm * dpi / 25.4,
+                                    );
+                                    let offset = (canvas - size) / 2.0;
+                                    let mut path = shapes::generate(
+                                        ProceduralShape::ALL[self.selected_procedural_shape],
+                                        size,
+                                    );
+                                    for point in &mut path.0 {
+                                        point.x += offset.x;
+                                        point.y += offset.y;
+                                    }
+                                    self.manual_cut_shapes.push(path.clone());
+                                    self.cut_shapes.push(path);
+                                    self.cut_modes.push(CutMode::Kiss);
+                                    self.cutline_owners.push(None);
+                                    self.cutline_locked.push(false);
+                                }
+                            });
+                            if !self.cut_shapes.is_empty() {
+                                let stats = toolpath_stats(&self.prepared_toolpaths());
+                                let mm_per_pixel = 25.4 / DEVICES[self.selected_device].dpi;
+                                ui.small(format!(
+                                    "{} paths · {} nodes · {:.1} mm cutting · {:.1} mm travel",
+                                    stats.paths,
+                                    stats.nodes,
+                                    stats.cut_length * mm_per_pixel,
+                                    stats.travel_length * mm_per_pixel,
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            self.selected_cut_path.is_some_and(|index| {
+                                                !self
+                                                    .cutline_locked
+                                                    .get(index)
+                                                    .copied()
+                                                    .unwrap_or(false)
+                                            }),
+                                            egui::Button::new("Smooth selected"),
+                                        )
+                                        .clicked()
+                                        && let Some(index) = self.selected_cut_path
+                                    {
+                                        self.cut_shapes[index] =
+                                            smooth_path(&self.cut_shapes[index], 1);
+                                        if index >= self.auto_cut_count {
+                                            self.manual_cut_shapes[index - self.auto_cut_count] =
+                                                self.cut_shapes[index].clone();
+                                        }
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.cut_shapes.len() >= 2
+                                                && !self
+                                                    .cutline_locked
+                                                    .iter()
+                                                    .any(|locked| *locked)
+                                                && self.cut_shapes.iter().all(|path| {
+                                                    path.0.len() >= 4
+                                                        && path.0.first() == path.0.last()
+                                                }),
+                                            egui::Button::new("Union all"),
+                                        )
+                                        .clicked()
+                                    {
+                                        let union = union_paths(&self.cut_shapes);
+                                        if !union.is_empty() {
+                                            self.cut_shapes = union;
+                                            self.manual_cut_shapes = self.cut_shapes.clone();
+                                            self.auto_cut_count = 0;
+                                            self.cut_modes =
+                                                vec![CutMode::Kiss; self.cut_shapes.len()];
+                                            self.cutline_owners = vec![None; self.cut_shapes.len()];
+                                            self.cutline_locked =
+                                                vec![false; self.cut_shapes.len()];
+                                            self.selected_cut_path = None;
+                                            self.selected_cut_node = None;
+                                        }
+                                    }
+                                });
+                                let mut delete_path = None;
+                                egui::ComboBox::from_label("Editable path")
+                                    .selected_text(
+                                        self.selected_cut_path.map_or("None".into(), |index| {
+                                            format!("Path {}", index + 1)
                                         }),
-                                    egui::Button::new("Union all"),
-                                )
-                                .clicked()
-                            {
-                                let union = union_paths(&self.cut_shapes);
-                                if !union.is_empty() {
-                                    self.cut_shapes = union;
-                                    self.manual_cut_shapes = self.cut_shapes.clone();
-                                    self.auto_cut_count = 0;
-                                    self.cut_modes = vec![CutMode::Kiss; self.cut_shapes.len()];
-                                    self.cutline_owners = vec![None; self.cut_shapes.len()];
-                                    self.cutline_locked = vec![false; self.cut_shapes.len()];
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_cut_path,
+                                            None,
+                                            "None",
+                                        );
+                                        for index in 0..self.cut_shapes.len() {
+                                            ui.selectable_value(
+                                                &mut self.selected_cut_path,
+                                                Some(index),
+                                                if self.cutline_locked[index] {
+                                                    format!("Path {} 🔒", index + 1)
+                                                } else {
+                                                    format!("Path {}", index + 1)
+                                                },
+                                            );
+                                        }
+                                    });
+                                let selected_artwork_bounds = (self.selected_images.len() == 1)
+                                    .then(|| {
+                                        let image = &self.loaded_images[self.selected_images[0]];
+                                        egui::Rect::from_min_size(
+                                            image.visual_offset(),
+                                            image.rotated_size(),
+                                        )
+                                    });
+                                if let Some(path_index) = self.selected_cut_path
+                                    && let Some(path) = self.cut_shapes.get_mut(path_index)
+                                {
+                                    let path_locked = self.cutline_locked[path_index];
+                                    if path_locked {
+                                        ui.label("This template cutline is locked.");
+                                    }
+                                    ui.add_enabled_ui(!path_locked, |ui| {
+                                        egui::ComboBox::from_label("Cut operation")
+                                            .selected_text(self.cut_modes[path_index].label())
+                                            .show_ui(ui, |ui| {
+                                                for mode in [
+                                                    CutMode::Kiss,
+                                                    CutMode::Perforation,
+                                                    CutMode::Disabled,
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut self.cut_modes[path_index],
+                                                        mode,
+                                                        mode.label(),
+                                                    );
+                                                }
+                                            });
+                                        if let Some(target) = selected_artwork_bounds {
+                                            ui.horizontal(|ui| {
+                                                if ui.button("Center on artwork").clicked() {
+                                                    center_path_in_rect(path, target, false);
+                                                }
+                                                if ui.button("Fit to artwork").clicked() {
+                                                    center_path_in_rect(path, target, true);
+                                                }
+                                            });
+                                        }
+                                        let node_index = self
+                                            .selected_cut_node
+                                            .unwrap_or(0)
+                                            .min(path.0.len().saturating_sub(1));
+                                        self.selected_cut_node = Some(node_index);
+                                        ui.label(format!("{} nodes", path.0.len()));
+                                        if let Some(node) = path.0.get_mut(node_index) {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("Node {}", node_index + 1));
+                                                ui.add(
+                                                    egui::DragValue::new(&mut node.x).prefix("X "),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(&mut node.y).prefix("Y "),
+                                                );
+                                            });
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Insert after").clicked()
+                                                && path.0.len() >= 2
+                                            {
+                                                let next = (node_index + 1).min(path.0.len() - 1);
+                                                let a = path.0[node_index];
+                                                let b = path.0[next];
+                                                path.0.insert(
+                                                    next,
+                                                    Coord {
+                                                        x: (a.x + b.x) / 2.0,
+                                                        y: (a.y + b.y) / 2.0,
+                                                    },
+                                                );
+                                                self.selected_cut_node = Some(next);
+                                            }
+                                            if ui.button("Delete node").clicked()
+                                                && path.0.len() > 3
+                                            {
+                                                path.0.remove(node_index);
+                                                self.selected_cut_node =
+                                                    Some(node_index.min(path.0.len() - 1));
+                                            }
+                                            if ui.button("Delete path").clicked() {
+                                                delete_path = Some(path_index);
+                                            }
+                                        });
+                                    });
+                                    if path_index >= self.auto_cut_count
+                                        && let Some(manual) = self
+                                            .manual_cut_shapes
+                                            .get_mut(path_index - self.auto_cut_count)
+                                    {
+                                        manual.clone_from(path);
+                                    }
+                                }
+                                if let Some(path_index) = delete_path {
+                                    self.cut_shapes.remove(path_index);
+                                    self.cut_modes.remove(path_index);
+                                    self.cutline_owners.remove(path_index);
+                                    self.cutline_locked.remove(path_index);
+                                    if path_index >= self.auto_cut_count {
+                                        let manual_index = path_index - self.auto_cut_count;
+                                        if manual_index < self.manual_cut_shapes.len() {
+                                            self.manual_cut_shapes.remove(manual_index);
+                                        }
+                                    } else {
+                                        self.auto_cut_count -= 1;
+                                    }
                                     self.selected_cut_path = None;
                                     self.selected_cut_node = None;
                                 }
                             }
-                        });
-                        let mut delete_path = None;
-                        egui::ComboBox::from_label("Editable path")
-                            .selected_text(
-                                self.selected_cut_path
-                                    .map_or("None".into(), |index| format!("Path {}", index + 1)),
-                            )
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.selected_cut_path, None, "None");
-                                for index in 0..self.cut_shapes.len() {
-                                    ui.selectable_value(
-                                        &mut self.selected_cut_path,
-                                        Some(index),
-                                        if self.cutline_locked[index] {
-                                            format!("Path {} 🔒", index + 1)
-                                        } else {
-                                            format!("Path {}", index + 1)
-                                        },
-                                    );
-                                }
-                            });
-                        let selected_artwork_bounds =
-                            (self.selected_images.len() == 1).then(|| {
-                                let image = &self.loaded_images[self.selected_images[0]];
-                                egui::Rect::from_min_size(
-                                    image.visual_offset(),
-                                    image.rotated_size(),
+
+                            if ui
+                                .add_enabled(
+                                    self.cut_progress.is_none()
+                                        && self.active_cut_generation.is_none(),
+                                    egui::Button::new("Generate Cut Lines"),
                                 )
-                            });
-                        if let Some(path_index) = self.selected_cut_path
-                            && let Some(path) = self.cut_shapes.get_mut(path_index)
-                        {
-                            let path_locked = self.cutline_locked[path_index];
-                            if path_locked {
-                                ui.label("This template cutline is locked.");
-                            }
-                            ui.add_enabled_ui(!path_locked, |ui| {
-                                egui::ComboBox::from_label("Cut operation")
-                                    .selected_text(self.cut_modes[path_index].label())
-                                    .show_ui(ui, |ui| {
-                                        for mode in
-                                            [CutMode::Kiss, CutMode::Perforation, CutMode::Disabled]
-                                        {
-                                            ui.selectable_value(
-                                                &mut self.cut_modes[path_index],
-                                                mode,
-                                                mode.label(),
-                                            );
+                                .clicked()
+                            {
+                                self.synchronize_cut_geometry();
+                                self.has_intersections = false;
+                                self.off_canvas = false;
+                                self.cut_progress = Some((0, 1));
+
+                                let tx = self.tx.clone();
+                                let source_geometry = self.current_cut_geometry();
+                                let generation_id = self.next_cut_generation_id;
+                                self.next_cut_generation_id =
+                                    self.next_cut_generation_id.wrapping_add(1);
+                                self.active_cut_generation = Some(generation_id);
+                                let mut rx = CutGenerator::start(
+                                    self.loaded_images
+                                        .iter()
+                                        .filter(|image| image.enable_cutting && image.visible)
+                                        .cloned()
+                                        .collect(),
+                                    self.cut_tuning.clone(),
+                                    self.get_canvas(),
+                                );
+
+                                spawn(async move {
+                                    while let Some(action) = rx.next().await {
+                                        debug!(?action, "got cut action");
+
+                                        if let Err(err) = tx.send(Action::Cut {
+                                            generation_id,
+                                            source_geometry: source_geometry.clone(),
+                                            action,
+                                        }) {
+                                            error!("could not send cut action: {err}");
                                         }
-                                    });
-                                if let Some(target) = selected_artwork_bounds {
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Center on artwork").clicked() {
-                                            center_path_in_rect(path, target, false);
-                                        }
-                                        if ui.button("Fit to artwork").clicked() {
-                                            center_path_in_rect(path, target, true);
-                                        }
-                                    });
-                                }
-                                let node_index = self
-                                    .selected_cut_node
-                                    .unwrap_or(0)
-                                    .min(path.0.len().saturating_sub(1));
-                                self.selected_cut_node = Some(node_index);
-                                ui.label(format!("{} nodes", path.0.len()));
-                                if let Some(node) = path.0.get_mut(node_index) {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("Node {}", node_index + 1));
-                                        ui.add(egui::DragValue::new(&mut node.x).prefix("X "));
-                                        ui.add(egui::DragValue::new(&mut node.y).prefix("Y "));
-                                    });
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("Insert after").clicked() && path.0.len() >= 2 {
-                                        let next = (node_index + 1).min(path.0.len() - 1);
-                                        let a = path.0[node_index];
-                                        let b = path.0[next];
-                                        path.0.insert(
-                                            next,
-                                            Coord {
-                                                x: (a.x + b.x) / 2.0,
-                                                y: (a.y + b.y) / 2.0,
-                                            },
-                                        );
-                                        self.selected_cut_node = Some(next);
-                                    }
-                                    if ui.button("Delete node").clicked() && path.0.len() > 3 {
-                                        path.0.remove(node_index);
-                                        self.selected_cut_node =
-                                            Some(node_index.min(path.0.len() - 1));
-                                    }
-                                    if ui.button("Delete path").clicked() {
-                                        delete_path = Some(path_index);
                                     }
                                 });
-                            });
-                            if path_index >= self.auto_cut_count
-                                && let Some(manual) = self
-                                    .manual_cut_shapes
-                                    .get_mut(path_index - self.auto_cut_count)
-                            {
-                                manual.clone_from(path);
                             }
                         }
-                        if let Some(path_index) = delete_path {
-                            self.cut_shapes.remove(path_index);
-                            self.cut_modes.remove(path_index);
-                            self.cutline_owners.remove(path_index);
-                            self.cutline_locked.remove(path_index);
-                            if path_index >= self.auto_cut_count {
-                                let manual_index = path_index - self.auto_cut_count;
-                                if manual_index < self.manual_cut_shapes.len() {
-                                    self.manual_cut_shapes.remove(manual_index);
-                                }
-                            } else {
-                                self.auto_cut_count -= 1;
-                            }
-                            self.selected_cut_path = None;
-                            self.selected_cut_node = None;
-                        }
-                    }
 
-                    if ui
-                        .add_enabled(
-                            self.cut_progress.is_none() && self.active_cut_generation.is_none(),
-                            egui::Button::new("Generate Cut Lines"),
-                        )
-                        .clicked()
-                    {
-                        self.synchronize_cut_geometry();
-                        self.has_intersections = false;
-                        self.off_canvas = false;
-                        self.cut_progress = Some((0, 1));
+                        ui.separator();
+                        ui.heading("Canvas");
 
-                        let tx = self.tx.clone();
-                        let source_geometry = self.current_cut_geometry();
-                        let generation_id = self.next_cut_generation_id;
-                        self.next_cut_generation_id = self.next_cut_generation_id.wrapping_add(1);
-                        self.active_cut_generation = Some(generation_id);
-                        let mut rx = CutGenerator::start(
-                            self.loaded_images
-                                .iter()
-                                .filter(|image| image.enable_cutting && image.visible)
-                                .cloned()
-                                .collect(),
-                            self.cut_tuning.clone(),
-                            self.get_canvas(),
-                        );
-
-                        spawn(async move {
-                            while let Some(action) = rx.next().await {
-                                debug!(?action, "got cut action");
-
-                                if let Err(err) = tx.send(Action::Cut {
-                                    generation_id,
-                                    source_geometry: source_geometry.clone(),
-                                    action,
-                                }) {
-                                    error!("could not send cut action: {err}");
-                                }
-                            }
+                        ui.horizontal(|ui| {
+                            ui.label("Background Color");
+                            ui.color_edit_button_srgb(&mut self.background_color);
                         });
-                    }
-                }
 
-                ui.separator();
-                ui.heading("Canvas");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.show_safe_area, "Safe area");
+                            ui.checkbox(&mut self.snap_to_guides, "Smart snapping");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.show_grid, "Grid");
+                            ui.checkbox(&mut self.show_rulers, "Rulers");
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut self.grid_spacing_mm, 0.5..=100.0)
+                                .logarithmic(true)
+                                .suffix(" mm")
+                                .text("Grid spacing"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.pack_gap_mm, 0.0..=10.0)
+                                .suffix(" mm")
+                                .text("Pack gap"),
+                        );
+                        ui.checkbox(&mut self.pack_allow_rotation, "Rotate while packing");
+                        if ui.button("Auto-pack placements").clicked() {
+                            self.auto_pack();
+                        }
+                        if self.pack_overflow > 0 {
+                            ui.colored_label(
+                                Color32::YELLOW,
+                                format!("{} placement(s) did not fit", self.pack_overflow),
+                            );
+                        }
 
-                ui.horizontal(|ui| {
-                    ui.label("Background Color");
-                    ui.color_edit_button_srgb(&mut self.background_color);
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.show_safe_area, "Safe area");
-                    ui.checkbox(&mut self.snap_to_guides, "Smart snapping");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.show_grid, "Grid");
-                    ui.checkbox(&mut self.show_rulers, "Rulers");
-                });
-                ui.add(
-                    egui::Slider::new(&mut self.grid_spacing_mm, 0.5..=100.0)
-                        .logarithmic(true)
-                        .suffix(" mm")
-                        .text("Grid spacing"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.pack_gap_mm, 0.0..=10.0)
-                        .suffix(" mm")
-                        .text("Pack gap"),
-                );
-                ui.checkbox(&mut self.pack_allow_rotation, "Rotate while packing");
-                if ui.button("Auto-pack placements").clicked() {
-                    self.auto_pack();
-                }
-                if self.pack_overflow > 0 {
-                    ui.colored_label(
-                        Color32::YELLOW,
-                        format!("{} placement(s) did not fit", self.pack_overflow),
-                    );
-                }
-
-                if !self.loaded_images.is_empty() {
-                    ui.separator();
-                    let layers_changed = views::loaded_images(
-                        ui,
-                        DEVICES[self.selected_device].dpi,
-                        self.get_canvas().size,
-                        &mut self.loaded_images,
-                        DEVICES[self.selected_device].modes[self.selected_mode].mode_type,
-                    );
-                    if layers_changed {
-                        self.selected_images.clear();
-                    }
-                    self.selection_inspector(ui);
-                }
+                        if !self.loaded_images.is_empty() {
+                            ui.separator();
+                            let layers_changed = views::loaded_images(
+                                ui,
+                                DEVICES[self.selected_device].dpi,
+                                self.get_canvas().size,
+                                &mut self.loaded_images,
+                                DEVICES[self.selected_device].modes[self.selected_mode].mode_type,
+                            );
+                            if layers_changed {
+                                self.selected_images.clear();
+                            }
+                            self.selection_inspector(ui);
+                        }
+                    });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("workspace_status")
+            .exact_height(36.0)
+            .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
+            .show(ctx, |ui| {
+                let show_shortcut_hint = ui.available_width() >= 900.0;
+                ui.horizontal(|ui| {
+                    let canvas = self.get_canvas().size;
+                    let dpi = DEVICES[self.selected_device].dpi;
+                    theme::muted(
+                        ui,
+                        format!(
+                            "{:.1} × {:.1} mm  ·  {} artwork  ·  {} cut paths",
+                            canvas.x / dpi * 25.4,
+                            canvas.y / dpi * 25.4,
+                            self.loaded_images.len(),
+                            self.cut_shapes.len()
+                        ),
+                    );
+                    if self.edit_cutlines {
+                        let accent_text =
+                            theme::Palette::for_dark_mode(ui.visuals().dark_mode).accent_text;
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("EDITING CUT NODES · Esc to finish")
+                                .size(11.0)
+                                .strong()
+                                .color(accent_text),
+                        );
+                    } else if self.show_cutlines && !self.cut_shapes.is_empty() {
+                        ui.separator();
+                        ui.colored_label(Color32::from_rgb(45, 125, 100), "— Kiss cut");
+                        ui.colored_label(Color32::from_rgb(190, 45, 55), "-- Perforation");
+                    }
+                    if show_shortcut_hint {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            theme::muted(ui, "Double-click canvas to fit · Scroll to zoom");
+                        });
+                    }
+                });
+            });
+
+        let workspace_fill = theme::Palette::for_dark_mode(ctx.style().visuals.dark_mode).app;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(workspace_fill).inner_margin(16.0))
+            .show(ctx, |ui| {
             views::canvas_editor(ui, self);
             self.synchronize_cut_geometry();
+
+            if self.loaded_images.is_empty() {
+                let hint_size = Vec2::new(300.0, 142.0);
+                let hint_position = ui.max_rect().center() - hint_size / 2.0;
+                egui::Area::new(Id::new("empty_workspace_hint"))
+                    .order(egui::Order::Foreground)
+                    .movable(false)
+                    .fixed_pos(hint_position)
+                    .show(ctx, |ui| {
+                        ui.set_width(hint_size.x);
+                        theme::card(ui.visuals().dark_mode).show(ui, |ui| {
+                            ui.label(egui::RichText::new("Start with your artwork").size(18.0).strong());
+                            theme::muted(ui, "Drop PNG or JPEG files here, or import them from your computer.");
+                            ui.add_space(4.0);
+                            if theme::primary_button(ui, "+ Add artwork").clicked() {
+                                self.upload_image(ctx);
+                            }
+                            theme::muted(ui, "Then arrange · prepare cutlines · print & cut.");
+                        });
+                    });
+            }
 
             ctx.input(|i| {
                 if i.raw.dropped_files.is_empty() {
@@ -3553,6 +4037,37 @@ impl eframe::App for SapodillaApp {
                     }
                 })
             });
+
+            if self.confirm_new_sheet {
+                let modal = Modal::new(Id::new("confirm_new_sheet_modal")).show(ui.ctx(), |ui| {
+                    ui.set_width(390.0);
+                    ui.heading("Start a new sheet?");
+                    ui.label("Starting a new sheet clears the current artwork and cutlines.");
+                    theme::muted(ui, "Save this sheet first if you want to keep the current layout.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_new_sheet = false;
+                            ui.close();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Start new sheet").color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(185, 28, 28)),
+                            )
+                            .clicked()
+                        {
+                            self.start_new_sheet();
+                            ui.close();
+                        }
+                    });
+                });
+                if modal.should_close() {
+                    self.confirm_new_sheet = false;
+                }
+            }
 
             if let Some(err) = &self.error {
                 let modal = Modal::new(Id::new("error_modal")).show(ui.ctx(), |ui| {
@@ -4040,6 +4555,142 @@ mod tests {
         let mut tuning_changed = original.clone();
         tuning_changed.tuning.simplify = 2.0_f32.to_bits();
         assert_ne!(original, tuning_changed);
+    }
+
+    #[test]
+    fn production_preflight_blocks_missing_inputs_and_invalid_cut_geometry() {
+        assert_eq!(
+            print_block_reason(false, true, false, false, false, false, false),
+            Some("Connect a printer before starting production.")
+        );
+        assert_eq!(
+            print_block_reason(true, false, false, false, false, false, false),
+            Some("Add artwork before starting production.")
+        );
+        assert_eq!(
+            print_block_reason(true, true, true, true, true, false, false),
+            Some("Wait for cutline generation to finish.")
+        );
+        assert_eq!(
+            print_block_reason(true, true, true, false, false, false, false),
+            Some("Generate at least one enabled cutline before starting production.")
+        );
+        assert!(print_block_reason(true, true, true, false, true, true, false).is_some());
+        assert!(print_block_reason(true, true, true, false, true, false, true).is_some());
+        assert_eq!(
+            print_block_reason(true, true, false, true, false, true, true),
+            None,
+            "cut warnings do not block a print-only job"
+        );
+        assert_eq!(
+            print_block_reason(true, true, true, false, true, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn production_preflight_requires_a_current_effective_cut_path() {
+        let valid = LineString::from(vec![(0.0, 0.0), (10.0, 0.0)]);
+        let degenerate = LineString::from(vec![(1.0, 1.0), (1.0, 1.0)]);
+
+        assert!(!has_enabled_cut_path(&[], &[], false), "empty paths");
+        assert!(
+            !has_enabled_cut_path(std::slice::from_ref(&valid), &[CutMode::Disabled], false,),
+            "all-disabled paths"
+        );
+        assert!(
+            !has_enabled_cut_path(&[degenerate], &[CutMode::Kiss], false),
+            "degenerate geometry"
+        );
+        assert!(
+            has_enabled_cut_path(std::slice::from_ref(&valid), &[], false),
+            "missing legacy modes default to kiss cut"
+        );
+
+        let mut transform_invalidated_paths = vec![valid];
+        transform_invalidated_paths.clear();
+        assert!(
+            !has_enabled_cut_path(&transform_invalidated_paths, &[], false),
+            "a transform that invalidates auto paths must block until regeneration"
+        );
+    }
+
+    #[test]
+    fn current_cut_validation_tracks_manual_geometry_and_ignores_disabled_paths() {
+        let canvas_size = Vec2::new(100.0, 100.0);
+        let safe_area = Vec2::new(80.0, 80.0);
+        let horizontal = LineString::from(vec![(20.0, 50.0), (80.0, 50.0)]);
+        let vertical = LineString::from(vec![(50.0, 20.0), (50.0, 80.0)]);
+        let outside = LineString::from(vec![(5.0, 20.0), (20.0, 20.0)]);
+
+        assert_eq!(
+            validate_current_cut_paths(
+                std::slice::from_ref(&horizontal),
+                &[CutMode::Kiss],
+                false,
+                canvas_size,
+                safe_area,
+            ),
+            CutPathValidation::default()
+        );
+
+        let crossed = validate_current_cut_paths(
+            &[horizontal.clone(), vertical],
+            &[CutMode::Kiss, CutMode::Perforation],
+            false,
+            canvas_size,
+            safe_area,
+        );
+        assert!(crossed.has_intersections);
+        assert!(!crossed.off_canvas);
+
+        let moved_outside = validate_current_cut_paths(
+            &[horizontal.clone(), outside.clone()],
+            &[CutMode::Kiss, CutMode::Kiss],
+            false,
+            canvas_size,
+            safe_area,
+        );
+        assert!(moved_outside.off_canvas);
+
+        let disabled_problem_paths = validate_current_cut_paths(
+            &[horizontal, outside],
+            &[CutMode::Disabled, CutMode::Disabled],
+            false,
+            canvas_size,
+            safe_area,
+        );
+        assert_eq!(disabled_problem_paths, CutPathValidation::default());
+    }
+
+    #[test]
+    fn cut_validation_snapshot_changes_only_with_preflight_inputs() {
+        let mut path = LineString::from(vec![(20.0, 50.0), (80.0, 50.0)]);
+        let before = cut_validation_snapshot(
+            std::slice::from_ref(&path),
+            &[CutMode::Kiss],
+            false,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(80.0, 80.0),
+        );
+        let identical = cut_validation_snapshot(
+            std::slice::from_ref(&path),
+            &[CutMode::Kiss],
+            false,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(80.0, 80.0),
+        );
+        assert_eq!(before, identical);
+
+        path.0[0].x = 5.0;
+        let after_manual_edit = cut_validation_snapshot(
+            &[path],
+            &[CutMode::Kiss],
+            false,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(80.0, 80.0),
+        );
+        assert_ne!(before, after_manual_edit);
     }
 
     #[test]
