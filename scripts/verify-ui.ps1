@@ -61,8 +61,20 @@ try {
                 Join-Path $output "empty-$($viewport.Width)x$($viewport.Height).png"
             )
         }
+        # Verify that Appearance is keyboard-reachable and remains usable at the
+        # minimum supported height. A taller capture documents the full palette.
+        Invoke-PlaywrightCli press 'Control+,'
+        Invoke-PlaywrightCli screenshot --filename (
+            Join-Path $output 'appearance-1280x720.png'
+        )
+        Invoke-PlaywrightCli resize 1280 900
         Invoke-PlaywrightCli run-code `
-            "async (page) => { await page.emulateMedia({ colorScheme: 'dark' }); await page.reload(); }"
+            "async (page) => { await page.mouse.move(640, 520); await page.mouse.wheel(0, 900); await page.waitForTimeout(150); }"
+        Invoke-PlaywrightCli screenshot --filename (
+            Join-Path $output 'appearance-1280x900.png'
+        )
+        Invoke-PlaywrightCli run-code `
+            "async (page) => { await page.emulateMedia({ colorScheme: 'dark' }); await page.reload(); await page.setViewportSize({ width: 1280, height: 720 }); }"
         Invoke-PlaywrightCli screenshot --filename (
             Join-Path $output 'dark-1280x720.png'
         )

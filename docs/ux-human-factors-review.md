@@ -174,26 +174,62 @@ workflow references, not assets to reproduce. [StixCut sheet layout and Auto-Pac
 ### Original Sapodilla token direction
 
 - Near-black app, panel, and raised surfaces provide quiet production chrome.
-- Magenta is reserved for the primary action and selected state.
+- The chosen accent is reserved for the primary action and concise selection indicators.
 - Cyan identifies focus/active interaction; lime identifies readiness.
 - Body text remains at least 14 px; 10–11 px uppercase labels are limited to eyebrow metadata.
 - Cards use 10–12 px radii, 1 px borders, and 12–16 px padding.
 - Color always accompanies a label, line form, or state text.
 
-Theme tests calculate WCAG relative luminance for the production token pairs: body, muted, and
-accent text on panels at ≥4.5:1; focus outlines on surfaces and selected fills at ≥3:1; and dark
-button labels on magenta/lime at ≥4.5:1. [WCAG contrast minimum](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html),
-[WCAG non-text contrast](https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html).
+This pass pushes the studio character further without reproducing StixCut assets. The top chrome
+now uses an original three-part spectrum rule; Library and Inspector headings combine an accent
+stem, neutral rule, and cyan seed marker. Persistent toolbar modes use a soft surface and a thin
+accent underline instead of looking like primary actions. Import, Auto-pack, Save, and printer
+connection use neutral secondary treatment, while each region keeps at most one saturated action.
+Destructive actions remain red and production-ready state remains lime, regardless of the chosen
+accent.
+
+### Pickable accent and appearance behavior
+
+**Decision.** Pink is the Sapodilla default, not a hard-coded requirement. **Settings →
+Appearance…** (Command/Ctrl+,) provides six labeled presets—Pink, Cyan, Lime, Tangerine, Violet,
+and Cobalt Blue—plus an opaque sRGB picker and numeric RGB values. A non-color `[x]` marker names
+the selected choice. Theme mode and accent are stored together in a versioned, app-only appearance
+record; documents and production geometry are unchanged.
+
+**Reasoning.** An appearance preference belongs in a predictable Settings location and needs a
+visible current value, reset path, and immediate preview. Microsoft likewise treats theme/color as
+app settings and recommends that accent use remain selective rather than becoming background noise.
+[Microsoft app settings](https://learn.microsoft.com/en-us/windows/apps/design/signature-experiences/settings),
+[Microsoft color guidance](https://learn.microsoft.com/en-us/windows/apps/design/style/color).
+Apple's color guidance recommends testing color across appearances and avoiding color as the only
+distinction. [Apple color](https://developer.apple.com/design/human-interface-guidelines/color).
+The labeled swatch grid follows radio-group behavior: one selected value, visible selection, and a
+stable group label. [WAI-ARIA radio-group pattern](https://www.w3.org/WAI/ARIA/apg/patterns/radio/).
+
+The user supplies only a seed color. The UI derives separate fill, hover, pressed, on-accent text,
+soft selection, border, and text-link roles for both light and dark appearance. Focus stays cyan,
+danger stays red, and readiness stays lime, preserving their meaning. Unit tests cover all presets
+and boundary custom seeds (black, white, gray, RGB extremes, and near-background values), requiring
+text roles to reach 4.5:1 and non-text boundaries/focus to reach 3:1. [WCAG contrast minimum](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html),
+[WCAG non-text contrast](https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html),
+[WCAG use of color](https://www.w3.org/WAI/WCAG22/Understanding/use-of-color.html).
+
+![Appearance palette, custom color controls, and live preview](review-evidence/09-appearance-1280x900.png)
+
+Theme tests calculate WCAG relative luminance rather than assuming any preset is safe.
 
 ## Repeatable verification
 
 1. `cargo test --no-default-features` — model behavior plus palette/preflight tests.
 2. `cargo check --target wasm32-unknown-unknown` — web compilation boundary.
 3. `scripts/verify-ui.ps1` rebuilds the hosted app and captures the empty-workspace responsive
-   matrix at 600×720, 900×720, 1024×768, 1100×720, and 1280×720. The checked-in 600, 1024,
-   1280, and [dark 1280](review-evidence/08-polished-dark-1280x720.png) results make the completed
-   pass reviewable without rerunning it. The script pins Playwright CLI 0.1.19 and produces
-   review evidence rather than asserting subjective visual quality.
+   matrix at 600×720, 900×720, 1024×768, 1100×720, and 1280×720. It also opens Appearance with
+   its documented keyboard shortcut and captures the scroll-constrained 1280×720 and full
+   1280×900 states before checking dark appearance. The checked-in 600, 1024, 1280,
+   [Appearance](review-evidence/09-appearance-1280x900.png), and
+   [dark 1280](review-evidence/08-polished-dark-1280x720.png) results make the completed pass
+   reviewable without rerunning it. The script pins Playwright CLI 0.1.19 and produces review
+   evidence rather than asserting subjective visual quality.
 4. Remaining visual matrix before release: selected artwork, disabled/ready Print, cut warning,
    and confirmation modal in light and dark at 600×720, 1024×768, 1280×720, and 1440×900.
 5. Browser AX snapshot and keyboard-only golden path; then NVDA/Chrome and VoiceOver/Safari.

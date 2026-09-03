@@ -39,6 +39,8 @@ const LIBRARY_FOLDERS_STORAGE_KEY: &str = "sapodilla.library-folders.v1";
 const LIBRARY_CYCLE_STORAGE_KEY: &str = "sapodilla.library-cycle.v1";
 const LIBRARY_CONSUMED_STORAGE_KEY: &str = "sapodilla.library-consumed-ahead.v1";
 const CANVAS_VIEW_STORAGE_KEY: &str = "sapodilla.canvas-view.v1";
+const APPEARANCE_STORAGE_KEY: &str = "sapodilla.appearance.v1";
+const APPEARANCE_VERSION: u8 = 1;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const LIBRARY_PAGE_SIZE: usize = 100;
 const MAX_LIBRARY_FILL_ATTEMPTS: usize = 512;
@@ -242,9 +244,38 @@ pub struct SapodillaApp {
 
     pub error: Option<anyhow::Error>,
     confirm_new_sheet: bool,
+    show_settings: bool,
     show_library_panel: bool,
     show_inspector_panel: bool,
     compact_layout: bool,
+    appearance: AppearancePreferences,
+    custom_accent_rgb: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AppearancePreferences {
+    version: u8,
+    accent: theme::AccentChoice,
+    #[serde(default)]
+    theme: egui::ThemePreference,
+}
+
+impl Default for AppearancePreferences {
+    fn default() -> Self {
+        Self {
+            version: APPEARANCE_VERSION,
+            accent: theme::AccentChoice::default(),
+            theme: egui::ThemePreference::System,
+        }
+    }
+}
+
+fn sanitize_appearance(preferences: AppearancePreferences) -> AppearancePreferences {
+    if preferences.version == APPEARANCE_VERSION {
+        preferences
+    } else {
+        AppearancePreferences::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -478,6 +509,15 @@ impl SapodillaApp {
                 view
             })
             .unwrap_or_default();
+        let appearance = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<AppearancePreferences>(storage, APPEARANCE_STORAGE_KEY)
+            })
+            .map(sanitize_appearance)
+            .unwrap_or_default();
+        let custom_accent_rgb = appearance.accent.rgb();
+        cc.egui_ctx.set_theme(appearance.theme);
         let library = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
         let (library_disk_paths, library_has_more) =
@@ -591,9 +631,12 @@ impl SapodillaApp {
 
             error: None,
             confirm_new_sheet: false,
+            show_settings: false,
             show_library_panel: true,
             show_inspector_panel: true,
             compact_layout: false,
+            appearance,
+            custom_accent_rgb,
         }
     }
 
@@ -2246,8 +2289,144 @@ impl SapodillaApp {
         }
     }
 
+    fn accent_color(&self) -> Color32 {
+        self.appearance.accent.color()
+    }
+
+    fn appearance_settings(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let modal = Modal::new(Id::new("appearance_settings_modal")).show(ctx, |ui| {
+            ui.set_width(390.0);
+            theme::panel_title(ui, self.accent_color(), "Settings", "Appearance");
+            theme::muted(
+                ui,
+                "Personalize the studio chrome without changing cut semantics.",
+            );
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .id_salt("appearance_settings_scroll")
+                .auto_shrink([true, false])
+                .max_height((ctx.content_rect().height() - 230.0).max(260.0))
+                .show(ui, |ui| {
+                    ui.strong("Appearance mode");
+                    let mut preference = self.appearance.theme;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut preference,
+                            egui::ThemePreference::System,
+                            "System",
+                        );
+                        ui.selectable_value(&mut preference, egui::ThemePreference::Light, "Light");
+                        ui.selectable_value(&mut preference, egui::ThemePreference::Dark, "Dark");
+                    });
+                    if preference != ctx.options(|options| options.theme_preference) {
+                        ctx.set_theme(preference);
+                    }
+                    self.appearance.theme = preference;
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.strong("Accent color");
+                    let current_rgb = self.appearance.accent.rgb();
+                    ui.label(format!(
+                        "{} · #{:02X}{:02X}{:02X}",
+                        self.appearance.accent.name(),
+                        current_rgb[0],
+                        current_rgb[1],
+                        current_rgb[2]
+                    ));
+                    ui.add_space(4.0);
+
+                    egui::Grid::new("accent_preset_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 8.0])
+                        .show(ui, |ui| {
+                            for (index, preset) in theme::AccentPreset::ALL.into_iter().enumerate()
+                            {
+                                if theme::accent_choice_button(ui, self.appearance.accent, preset)
+                                    .clicked()
+                                {
+                                    self.appearance.accent = theme::AccentChoice::Preset(preset);
+                                    self.custom_accent_rgb = preset.rgb();
+                                }
+                                if index % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+
+                    ui.add_space(6.0);
+                    theme::card(ui.visuals().dark_mode).show(ui, |ui| {
+                        ui.strong("Custom sRGB");
+                        let mut custom_changed = ui
+                            .color_edit_button_srgb(&mut self.custom_accent_rgb)
+                            .on_hover_text("Choose an opaque custom accent color")
+                            .changed();
+                        ui.horizontal(|ui| {
+                            for (label, channel) in
+                                ["R", "G", "B"].into_iter().zip(&mut self.custom_accent_rgb)
+                            {
+                                ui.label(label);
+                                custom_changed |= ui
+                                    .add(egui::DragValue::new(channel).range(0..=255))
+                                    .changed();
+                            }
+                        });
+                        ui.monospace(format!(
+                            "#{:02X}{:02X}{:02X}",
+                            self.custom_accent_rgb[0],
+                            self.custom_accent_rgb[1],
+                            self.custom_accent_rgb[2]
+                        ));
+                        if custom_changed {
+                            self.appearance.accent =
+                                theme::AccentChoice::Custom(self.custom_accent_rgb);
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.strong("Live preview");
+                    theme::card(ui.visuals().dark_mode).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let accent = self.accent_color();
+                            let _ = theme::primary_button(ui, accent, "Primary");
+                            let _ = theme::secondary_button(ui, accent, "Secondary");
+                            let mut selected = true;
+                            let _ = theme::toolbar_toggle(ui, accent, &mut selected, "Selected");
+                        });
+                        theme::spectrum_rule(ui, self.accent_color());
+                    });
+                });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, self.accent_color(), "Reset to Sapodilla Pink")
+                    .clicked()
+                {
+                    self.appearance.accent = theme::AccentChoice::default();
+                    self.custom_accent_rgb = theme::DEFAULT_ACCENT_RGB;
+                }
+                if ui.button("Close").clicked() {
+                    self.show_settings = false;
+                    ui.close();
+                }
+            });
+        });
+        if modal.should_close() {
+            self.show_settings = false;
+        }
+    }
+
     fn menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let previous_theme = ctx.options(|options| options.theme_preference);
         egui::widgets::global_theme_preference_switch(ui);
+        let current_theme = ctx.options(|options| options.theme_preference);
+        if current_theme != previous_theme {
+            self.appearance.theme = current_theme;
+        }
 
         ui.separator();
 
@@ -2313,6 +2492,21 @@ impl SapodillaApp {
                 if ui.button("Quit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            }
+        });
+
+        let settings_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Comma);
+        ui.menu_button("Settings", |ui| {
+            if ui
+                .add(
+                    egui::Button::new("Appearance…")
+                        .shortcut_text(ctx.format_shortcut(&settings_shortcut)),
+                )
+                .clicked()
+            {
+                self.custom_accent_rgb = self.appearance.accent.rgb();
+                self.show_settings = true;
+                ui.close();
             }
         });
 
@@ -2749,7 +2943,7 @@ impl SapodillaApp {
         } else {
             "Print"
         };
-        let print = theme::primary_button_enabled(ui, can_print, print_label);
+        let print = theme::primary_button_enabled(ui, self.accent_color(), can_print, print_label);
         if let Some(reason) = print_block_reason {
             print.on_disabled_hover_text(reason);
         } else if print.clicked() {
@@ -2824,8 +3018,8 @@ impl SapodillaApp {
         }
         let can_connect = self.transport_status != TransportStatus::Connecting
             && (!requires_selection || self.selected_transport_device.is_some());
-        if ui
-            .add_enabled(can_connect, egui::Button::new("Connect printer"))
+        if theme::secondary_button_enabled(ui, self.accent_color(), can_connect, "Connect printer")
+            .on_disabled_hover_text("Choose an available device first")
             .clicked()
         {
             self.connect_transport();
@@ -2971,7 +3165,8 @@ fn validate_current_cut_paths(
 
 impl eframe::App for SapodillaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        theme::apply(ctx);
+        let accent = self.accent_color();
+        theme::apply(ctx, accent);
         self.apply_actions();
         self.synchronize_cut_geometry();
         self.cut_modes.resize(self.cut_shapes.len(), CutMode::Kiss);
@@ -3013,6 +3208,11 @@ impl eframe::App for SapodillaApp {
         if ctx.input_mut(|input| input.consume_shortcut(&open_shortcut)) {
             self.open_document(ctx);
         }
+        let settings_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Comma);
+        if ctx.input_mut(|input| input.consume_shortcut(&settings_shortcut)) {
+            self.custom_accent_rgb = self.appearance.accent.rgb();
+            self.show_settings = true;
+        }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && self.edit_cutlines {
             self.edit_cutlines = false;
             self.selected_cut_path = None;
@@ -3035,28 +3235,27 @@ impl eframe::App for SapodillaApp {
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     egui::Frame::new()
-                        .fill(theme::ACCENT)
+                        .fill(accent)
                         .corner_radius(egui::CornerRadius::same(7))
                         .inner_margin(egui::Margin::symmetric(7, 4))
                         .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new("S")
-                                    .size(15.0)
-                                    .strong()
-                                    .color(theme::INK),
+                                egui::RichText::new("S").size(15.0).strong().color(
+                                    theme::Palette::for_accent(ui.visuals().dark_mode, accent)
+                                        .on_accent,
+                                ),
                             );
                         });
                     if !compact_layout {
                         ui.label(egui::RichText::new("Sapodilla").size(18.0).strong());
-                        ui.label(
-                            egui::RichText::new("STUDIO")
-                                .size(10.0)
-                                .color(theme::ACCENT),
-                        );
+                        ui.label(egui::RichText::new("STUDIO").size(10.0).color(
+                            theme::Palette::for_accent(ui.visuals().dark_mode, accent).accent_text,
+                        ));
                     }
                     ui.separator();
                     if theme::primary_button(
                         ui,
+                        accent,
                         if compact_layout {
                             "+ Add"
                         } else {
@@ -3092,15 +3291,13 @@ impl eframe::App for SapodillaApp {
                             ui.checkbox(&mut self.edit_cutlines, "Edit cut nodes");
                         });
                     } else {
-                        if ui
-                            .button("Auto-pack")
+                        if theme::secondary_button(ui, accent, "Auto-pack")
                             .on_hover_text("Arrange artwork to use the sheet efficiently")
                             .clicked()
                         {
                             self.auto_pack();
                         }
-                        if ui
-                            .button("Save")
+                        if theme::secondary_button(ui, accent, "Save")
                             .on_hover_text(format!(
                                 "Save this document ({})",
                                 ctx.format_shortcut(&save_shortcut)
@@ -3110,27 +3307,28 @@ impl eframe::App for SapodillaApp {
                             self.save_document(self.document_kind);
                         }
                         ui.separator();
-                        ui.toggle_value(&mut self.snap_to_guides, "Snap");
-                        ui.toggle_value(&mut self.show_grid, "Grid");
-                        ui.toggle_value(&mut self.show_rulers, "Rulers");
-                        ui.toggle_value(&mut self.show_cutlines, "Cut preview");
-                        ui.toggle_value(&mut self.edit_cutlines, "Edit nodes");
+                        theme::toolbar_toggle(ui, accent, &mut self.snap_to_guides, "Snap");
+                        theme::toolbar_toggle(ui, accent, &mut self.show_grid, "Grid");
+                        theme::toolbar_toggle(ui, accent, &mut self.show_rulers, "Rulers");
+                        theme::toolbar_toggle(ui, accent, &mut self.show_cutlines, "Cut preview");
+                        theme::toolbar_toggle(ui, accent, &mut self.edit_cutlines, "Edit nodes");
                     }
 
-                    if ui
-                        .selectable_label(self.show_library_panel, "Library")
+                    if theme::toolbar_toggle(ui, accent, &mut self.show_library_panel, "Library")
                         .clicked()
                     {
-                        self.show_library_panel = !self.show_library_panel;
                         if compact_layout && self.show_library_panel {
                             self.show_inspector_panel = false;
                         }
                     }
-                    if ui
-                        .selectable_label(self.show_inspector_panel, "Inspector")
-                        .clicked()
+                    if theme::toolbar_toggle(
+                        ui,
+                        accent,
+                        &mut self.show_inspector_panel,
+                        "Inspector",
+                    )
+                    .clicked()
                     {
-                        self.show_inspector_panel = !self.show_inspector_panel;
                         if compact_layout && self.show_inspector_panel {
                             self.show_library_panel = false;
                         }
@@ -3156,6 +3354,8 @@ impl eframe::App for SapodillaApp {
                         });
                     }
                 });
+                ui.add_space(5.0);
+                theme::spectrum_rule(ui, accent);
             });
 
         egui::SidePanel::left("library_panel")
@@ -3164,12 +3364,10 @@ impl eframe::App for SapodillaApp {
             .width_range(220.0..=360.0)
             .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
             .show_animated(ctx, self.show_library_panel, |ui| {
-                ui.horizontal(|ui| {
-                    theme::panel_title(ui, "Assets", "Library");
-                    if theme::primary_button(ui, "Import…").clicked() {
-                        self.import_library_images(ctx);
-                    }
-                });
+                theme::panel_title(ui, accent, "Assets", "Library");
+                if theme::secondary_button(ui, accent, "Import artwork…").clicked() {
+                    self.import_library_images(ctx);
+                }
                 theme::muted(ui, "Add artwork once, then reuse it across sheets.");
                 ui.add_space(6.0);
                 #[cfg(not(target_arch = "wasm32"))]
@@ -3337,7 +3535,7 @@ impl eframe::App for SapodillaApp {
             .width_range(260.0..=440.0)
             .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
             .show_animated(ctx, self.show_inspector_panel, |ui| {
-                theme::panel_title(ui, "Make", "Inspector");
+                theme::panel_title(ui, accent, "Make", "Inspector");
                 theme::muted(ui, "Prepare the sheet, cut paths, and production job.");
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -3932,7 +4130,7 @@ impl eframe::App for SapodillaApp {
             });
 
         egui::TopBottomPanel::bottom("workspace_status")
-            .exact_height(36.0)
+            .exact_height(44.0)
             .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
             .show(ctx, |ui| {
                 let show_shortcut_hint = ui.available_width() >= 900.0;
@@ -3951,7 +4149,7 @@ impl eframe::App for SapodillaApp {
                     );
                     if self.edit_cutlines {
                         let accent_text =
-                            theme::Palette::for_dark_mode(ui.visuals().dark_mode).accent_text;
+                            theme::Palette::for_accent(ui.visuals().dark_mode, accent).accent_text;
                         ui.separator();
                         ui.label(
                             egui::RichText::new("EDITING CUT NODES · Esc to finish")
@@ -3960,9 +4158,10 @@ impl eframe::App for SapodillaApp {
                                 .color(accent_text),
                         );
                     } else if self.show_cutlines && !self.cut_shapes.is_empty() {
+                        let palette = theme::Palette::for_accent(ui.visuals().dark_mode, accent);
                         ui.separator();
-                        ui.colored_label(Color32::from_rgb(45, 125, 100), "— Kiss cut");
-                        ui.colored_label(Color32::from_rgb(190, 45, 55), "-- Perforation");
+                        ui.colored_label(palette.kiss_text, "— Kiss cut");
+                        ui.colored_label(palette.perforation_text, "-- Perforation");
                     }
                     if show_shortcut_hint {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3992,7 +4191,7 @@ impl eframe::App for SapodillaApp {
                             ui.label(egui::RichText::new("Start with your artwork").size(18.0).strong());
                             theme::muted(ui, "Drop PNG or JPEG files here, or import them from your computer.");
                             ui.add_space(4.0);
-                            if theme::primary_button(ui, "+ Add artwork").clicked() {
+                            if theme::primary_button(ui, accent, "+ Add artwork").clicked() {
                                 self.upload_image(ctx);
                             }
                             theme::muted(ui, "Then arrange · prepare cutlines · print & cut.");
@@ -4050,15 +4249,7 @@ impl eframe::App for SapodillaApp {
                             self.confirm_new_sheet = false;
                             ui.close();
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Start new sheet").color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(185, 28, 28)),
-                            )
-                            .clicked()
-                        {
+                        if theme::danger_button(ui, "Start new sheet").clicked() {
                             self.start_new_sheet();
                             ui.close();
                         }
@@ -4068,6 +4259,8 @@ impl eframe::App for SapodillaApp {
                     self.confirm_new_sheet = false;
                 }
             }
+
+            self.appearance_settings(ctx);
 
             if let Some(err) = &self.error {
                 let modal = Modal::new(Id::new("error_modal")).show(ui.ctx(), |ui| {
@@ -4124,6 +4317,7 @@ impl eframe::App for SapodillaApp {
                 grid_spacing_mm: self.grid_spacing_mm.clamp(0.5, 100.0),
             },
         );
+        eframe::set_value(storage, APPEARANCE_STORAGE_KEY, &self.appearance);
     }
 }
 
@@ -4481,6 +4675,33 @@ fn current_timestamp_millis() -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_preferences_round_trip_and_reject_unknown_versions() {
+        let preferences = AppearancePreferences {
+            version: APPEARANCE_VERSION,
+            accent: theme::AccentChoice::Custom([12, 96, 211]),
+            theme: egui::ThemePreference::Dark,
+        };
+        let encoded = serde_json::to_string(&preferences).unwrap();
+        let decoded: AppearancePreferences = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, preferences);
+        assert_eq!(sanitize_appearance(decoded), preferences);
+
+        let legacy: AppearancePreferences =
+            serde_json::from_str(r#"{"version":1,"accent":{"custom":[12,96,211]}}"#).unwrap();
+        assert_eq!(legacy.accent, preferences.accent);
+        assert_eq!(legacy.theme, egui::ThemePreference::System);
+
+        assert_eq!(
+            sanitize_appearance(AppearancePreferences {
+                version: APPEARANCE_VERSION + 1,
+                accent: theme::AccentChoice::Preset(theme::AccentPreset::SignalLime),
+                theme: egui::ThemePreference::Light,
+            }),
+            AppearancePreferences::default()
+        );
+    }
 
     fn cut_geometry(offset_x: f32) -> CutGeometrySnapshot {
         CutGeometrySnapshot {
