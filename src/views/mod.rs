@@ -18,6 +18,7 @@ use crate::{
 pub use canvas::canvas_editor;
 
 mod canvas;
+pub(crate) use canvas::TransformGesture;
 
 pub fn pretty_hex(id: impl std::hash::Hash, ui: &mut Ui, data: &[u8]) {
     const SECTIONS_PER_LINE: usize = 4;
