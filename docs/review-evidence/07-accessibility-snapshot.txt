@@ -1,0 +1,10 @@
+### Page
+- Page URL: http://127.0.0.1:8921/
+- Page Title: Sapodilla
+- Console: 0 errors, 1 warnings
+### Snapshot
+```yaml
+- generic [ref=f1e1]:
+  - generic "Sapodilla sticker sheet editor" [active] [ref=f1e2]
+  - textbox [ref=f1e3]
+```

@@ -8,6 +8,7 @@ mod protocol;
 pub mod raw_usb;
 pub mod shapes;
 mod studio;
+mod theme;
 pub mod toolpath;
 mod transports;
 mod views;
