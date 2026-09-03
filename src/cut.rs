@@ -40,6 +40,126 @@ pub struct CutTuning {
     pub white_transparent: bool,
 }
 
+/// Lead-in/lead-out geometry around a closed contour seam.
+///
+/// The PixCut host generator approaches and leaves the seam on short ramps so
+/// the blade does not leave a connected tab where the contour closes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OvercutSettings {
+    pub enabled: bool,
+    pub steps: usize,
+    pub maximum_angle_degrees: f32,
+    pub reach_pixels: f32,
+    pub snap_to_pixels: bool,
+}
+
+impl Default for OvercutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            steps: 3,
+            maximum_angle_degrees: 45.0,
+            reach_pixels: 15.0,
+            snap_to_pixels: true,
+        }
+    }
+}
+
+/// Close a contour and add mirrored approach/departure ramps at its seam.
+pub fn apply_overcut(path: &LineString<f32>, settings: OvercutSettings) -> LineString<f32> {
+    let mut contour = path.0.clone();
+    if contour.len() >= 2 && contour.first() == contour.last() {
+        contour.pop();
+    }
+    if contour.len() < 2 {
+        return LineString::new(contour);
+    }
+
+    let seam = contour[0];
+    let previous = *contour.last().expect("contour has at least two points");
+    let next = contour[1];
+    let closing = normalize(Coord {
+        x: seam.x - previous.x,
+        y: seam.y - previous.y,
+    });
+    let reverse_outgoing = normalize(Coord {
+        x: seam.x - next.x,
+        y: seam.y - next.y,
+    });
+
+    let mut closed = contour;
+    closed.push(seam);
+    if !settings.enabled
+        || settings.steps == 0
+        || settings.reach_pixels <= 0.0
+        || closing == (Coord { x: 0.0, y: 0.0 })
+    {
+        return LineString::new(closed);
+    }
+
+    let approach_direction = Coord {
+        x: -closing.x,
+        y: -closing.y,
+    };
+    let mut approach = overcut_ramp(seam, approach_direction, reverse_outgoing, settings);
+    approach.reverse();
+    let departure = overcut_ramp(seam, closing, reverse_outgoing, settings);
+
+    approach.extend(closed);
+    approach.extend(departure);
+    LineString::new(approach)
+}
+
+fn normalize(vector: Coord<f32>) -> Coord<f32> {
+    let length = vector.x.hypot(vector.y);
+    if length <= f32::EPSILON {
+        Coord { x: 0.0, y: 0.0 }
+    } else {
+        Coord {
+            x: vector.x / length,
+            y: vector.y / length,
+        }
+    }
+}
+
+fn overcut_ramp(
+    seam: Coord<f32>,
+    along: Coord<f32>,
+    toward: Coord<f32>,
+    settings: OvercutSettings,
+) -> Vec<Coord<f32>> {
+    let projection = along.x * toward.x + along.y * toward.y;
+    let rejected = Coord {
+        x: toward.x - along.x * projection,
+        y: toward.y - along.y * projection,
+    };
+    let perpendicular = if rejected.x.hypot(rejected.y) < 1e-6 {
+        Coord {
+            x: -along.y,
+            y: along.x,
+        }
+    } else {
+        normalize(rejected)
+    };
+
+    (1..=settings.steps)
+        .map(|step| {
+            let fraction = step as f32 / settings.steps as f32;
+            let angle = (settings.maximum_angle_degrees * fraction).to_radians();
+            let radius = settings.reach_pixels * fraction;
+            let mut point = Coord {
+                x: seam.x + radius * (along.x * angle.cos() + perpendicular.x * angle.sin()),
+                y: seam.y + radius * (along.y * angle.cos() + perpendicular.y * angle.sin()),
+            };
+            if settings.snap_to_pixels {
+                point.x = point.x.floor();
+                point.y = point.y.floor();
+            }
+            point
+        })
+        .collect()
+}
+
 impl Default for CutTuning {
     fn default() -> Self {
         Self {
@@ -172,6 +292,20 @@ impl CutGenerator {
 
         let contours = imageproc::contours::find_contours::<u32>(&threshold);
 
+        let center = image.offset + size / 2.0;
+        let radians = image.rotation_degrees.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        let transform = |point: imageproc::point::Point<u32>| {
+            let x = point.x as f32 + image.offset.x;
+            let y = point.y as f32 + image.offset.y;
+            let dx = x - center.x;
+            let dy = y - center.y;
+            (
+                center.x + cos * dx - sin * dy,
+                center.y + sin * dx + cos * dy,
+            )
+        };
+
         // Keep track of the outer parts of contours separately from holes, so
         // we can construct a MultiPolygon with an exterior and interiors.
         let mut outers = HashMap::new();
@@ -182,12 +316,7 @@ impl CutGenerator {
             // Create the line from the points in the contour, offset by the
             // position of the image in the canvas. We need to have these
             // offsets here to check if anything overlaps.
-            let mut line_string = LineString::from_iter(contour.points.into_iter().map(|point| {
-                (
-                    point.x as f32 + image.offset.x,
-                    point.y as f32 + image.offset.y,
-                )
-            }));
+            let mut line_string = LineString::from_iter(contour.points.into_iter().map(&transform));
 
             line_string.close();
 
@@ -223,7 +352,12 @@ impl CutGenerator {
             ];
 
             let offset = coord! { x: image.offset.x, y: image.offset.y };
-            LineString::new(coords.into_iter().map(|coord| coord + offset).collect())
+            let unrotated = coords.into_iter().map(|coord| coord + offset);
+            LineString::new(unrotated.map(|point| {
+                let dx = point.x - center.x;
+                let dy = point.y - center.y;
+                coord! { x: center.x + cos * dx - sin * dy, y: center.y + sin * dx + cos * dy }
+            }).collect())
         };
 
         // If the outers is empty try to get the frame index, otherwise insert
@@ -303,5 +437,60 @@ impl CutGenerator {
         line_strings
             .into_iter()
             .map(move |line_string| line_string.scale_around_point(1.0, -1.0, point))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square() -> LineString<f32> {
+        LineString::from(vec![
+            (300.0, 1500.0),
+            (300.0, 600.0),
+            (900.0, 600.0),
+            (900.0, 1500.0),
+        ])
+    }
+
+    #[test]
+    fn overcut_closes_contour_and_adds_ramps() {
+        let result = apply_overcut(&square(), OvercutSettings::default());
+        assert_eq!(result.0.len(), 3 + 4 + 1 + 3);
+        assert_eq!(result.0[3], square().0[0]);
+        assert_eq!(result.0[7], square().0[0]);
+    }
+
+    #[test]
+    fn disabled_overcut_only_closes_the_contour() {
+        let result = apply_overcut(
+            &square(),
+            OvercutSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.0.len(), 5);
+        assert_eq!(result.0.first(), result.0.last());
+    }
+
+    #[test]
+    fn overcut_uses_requested_reach_and_mirrors_ramps() {
+        let result = apply_overcut(
+            &square(),
+            OvercutSettings {
+                steps: 2,
+                reach_pixels: 100.0,
+                snap_to_pixels: false,
+                ..Default::default()
+            },
+        );
+        let seam = square().0[0];
+        let approach = [result.0[1], result.0[0]];
+        let departure = &result.0[result.0.len() - 2..];
+        for (incoming, outgoing) in approach.iter().zip(departure) {
+            assert!(((incoming.x - seam.x) + (outgoing.x - seam.x)).abs() < 1e-3);
+            assert!((incoming.y - outgoing.y).abs() < 1e-3);
+        }
     }
 }

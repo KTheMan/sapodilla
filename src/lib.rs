@@ -1,6 +1,14 @@
 mod app;
+pub mod background_ml;
 mod cut;
+pub mod export;
+pub mod jobs;
+pub mod path_edit;
 mod protocol;
+pub mod raw_usb;
+pub mod shapes;
+mod studio;
+pub mod toolpath;
 mod transports;
 mod views;
 

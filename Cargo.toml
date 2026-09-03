@@ -6,17 +6,23 @@ publish = false
 authors = ["Syfaro <syfaro@huefox.com>"]
 
 [features]
+default = ["native-usb", "native-ble", "background-ml"]
 web-workers = ["wasm_thread"]
+background-ml = ["dep:ort", "dep:reqwest"]
+native-usb = ["dep:nusb"]
+native-ble = ["dep:btleplug"]
 
 [dependencies]
 anyhow = "1.0.99"
 async-trait = "0.1.89"
+base64 = "0.22.1"
 byteorder = "1.5.0"
 derive_more = { version = "2.0.1", features = ["debug"] }
 eframe = { version = "0.33.3", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
+    "persistence",
 ] }
 egui = "0.33.3"
 egui_dnd = "0.14.0"
@@ -33,11 +39,13 @@ lazy_static = "1.5.0"
 oneshot = { version = "0.2.1", features = ["async"] }
 packed_struct = "0.10"
 rfd = "0.17.2"
+roxmltree = "0.21.1"
 serde = { version = "1.0.222", features = ["derive"] }
 serde_json = "1.0.145"
 serde_plain = "1.0.2"
 sha1 = "0.10.6"
 strum = { version = "0.28.0", features = ["derive"] }
+svgtypes = "0.15.3"
 thiserror = "2.0.18"
 tracing = "0.1"
 web-sys = { version = "0.3", features = [
@@ -54,6 +62,17 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+btleplug = { version = "0.13.0", optional = true }
+nusb = { version = "0.2.7", optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "std",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-native",
+    "api-27",
+] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
+serialport = { version = "4.10.0", default-features = false }
 tokio = { version = "1.47.1", default-features = false, features = [
     "rt",
     "rt-multi-thread",
