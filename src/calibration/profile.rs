@@ -382,9 +382,41 @@ impl CalibrationRun {
         for candidate in &mut self.fit_candidates {
             candidate.sanitize();
         }
+        let manifest_is_valid = self.manifest.sanitize();
+        let passed_state_invalid = if self.state == CalibrationRunState::Passed {
+            let Some(validation) = self.validation.as_ref() else {
+                return Err(CalibrationDataError::InvalidRun);
+            };
+            let Some(selected_model) = self.selected_model else {
+                return Err(CalibrationDataError::InvalidRun);
+            };
+            let primary = self
+                .payload_hashes
+                .iter()
+                .find(|payload| payload.slot == "primary");
+            let validation_payload = self
+                .payload_hashes
+                .iter()
+                .find(|payload| payload.slot == "validation");
+            !validation.activation_passed(self.method)
+                || !self
+                    .fit_candidates
+                    .iter()
+                    .any(|candidate| candidate.model == selected_model)
+                || self.queue_job_ids.len() < 2
+                || self.device_job_ids.len() < 2
+                || primary.is_none()
+                || validation_payload.is_none()
+                || primary.is_some_and(|payload| {
+                    self.manifest.jpeg_sha1.as_deref() != Some(payload.jpeg_sha1.as_str())
+                        || self.manifest.plt_sha1.as_deref() != Some(payload.plt_sha1.as_str())
+                })
+        } else {
+            false
+        };
         if self.run_id.is_empty()
             || !self.key.sanitize()
-            || !self.manifest.sanitize()
+            || !manifest_is_valid
             || self.baseline_profile_version == 0
             || self.updated_at < self.created_at
             || self
@@ -417,6 +449,7 @@ impl CalibrationRun {
                             .any(|value| !(-1_000_000..=1_000_000).contains(&value))
                     })
             })
+            || passed_state_invalid
         {
             return Err(CalibrationDataError::InvalidRun);
         }
@@ -470,9 +503,11 @@ impl CalibrationStore {
         {
             return Err(CalibrationDataError::DuplicateProfile);
         }
-        for run in &mut self.runs {
-            run.validate_and_sanitize()?;
-        }
+        // Reports are audit artifacts, not prerequisites for using a valid
+        // active profile. Drop legacy or corrupt reports individually rather
+        // than allowing one old report to erase the entire calibration store.
+        self.runs
+            .retain_mut(|run| run.validate_and_sanitize().is_ok());
         self.profiles
             .sort_by_key(|profile| std::cmp::Reverse(profile.created_at));
         self.profiles.truncate(MAX_CALIBRATION_PROFILES);
@@ -946,5 +981,21 @@ mod tests {
             run.observations[0].sheet_id.len(),
             super::super::MAX_CALIBRATION_TEXT_BYTES
         );
+
+        let mut unsupported_passed_run = run;
+        unsupported_passed_run.state = CalibrationRunState::Passed;
+        assert_eq!(
+            unsupported_passed_run.validate_and_sanitize(),
+            Err(CalibrationDataError::InvalidRun)
+        );
+
+        let active = profile("still-active", 3);
+        let active_key = active.key.clone();
+        let mut store = CalibrationStore::default();
+        store.add_and_activate(active).unwrap();
+        store.runs.push(unsupported_passed_run);
+        let store = store.sanitize().unwrap();
+        assert!(store.active_profile(&active_key).is_some());
+        assert!(store.runs.is_empty());
     }
 }

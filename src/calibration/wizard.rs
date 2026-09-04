@@ -622,11 +622,71 @@ impl CalibrationWizard {
     }
 
     pub fn accept_scan_review(&mut self, slot: ScanSlot, now: u64) {
+        if self.scan_review_coverage_issue(slot).is_some() {
+            return;
+        }
         match slot {
             ScanSlot::Training => self.training_scan_reviewed = true,
             ScanSlot::Validation => self.validation_scan_reviewed = true,
         }
         self.touch(now);
+    }
+
+    pub fn set_scan_target_included(
+        &mut self,
+        slot: ScanSlot,
+        target_id: &str,
+        included: bool,
+        now: u64,
+    ) -> Result<(), WizardError> {
+        self.ensure_active()?;
+        let observations = match slot {
+            ScanSlot::Training => &mut self.scan_training_observations,
+            ScanSlot::Validation => &mut self.validation_observations,
+        };
+        let observation = observations
+            .iter_mut()
+            .find(|observation| observation.target_id == target_id)
+            .ok_or_else(|| WizardError::UnknownTarget(target_id.into()))?;
+        if observation.included != included {
+            observation.included = included;
+            match slot {
+                ScanSlot::Training => {
+                    self.training_scan_reviewed = false;
+                    self.invalidate_candidate();
+                }
+                ScanSlot::Validation => {
+                    self.validation_scan_reviewed = false;
+                    self.validation = ValidationStatus::Collecting;
+                }
+            }
+            self.touch(now);
+        }
+        Ok(())
+    }
+
+    pub fn scan_review_coverage_issue(&self, slot: ScanSlot) -> Option<&'static str> {
+        let (observations, minimum) = match slot {
+            ScanSlot::Training => (&self.scan_training_observations, 8),
+            ScanSlot::Validation => (&self.validation_observations, 6),
+        };
+        let included = observations
+            .iter()
+            .filter(|observation| observation.included)
+            .collect::<Vec<_>>();
+        if included.len() < minimum {
+            return Some(match slot {
+                ScanSlot::Training => "include at least eight reliable aperture detections",
+                ScanSlot::Validation => "include all six reliable validation detections",
+            });
+        }
+        let mut quadrants = 0u8;
+        for observation in included {
+            let right = observation.nominal_print_mm[0] >= 101.6 / 2.0;
+            let bottom = observation.nominal_print_mm[1] >= 177.8 / 2.0;
+            quadrants |= 1 << (usize::from(bottom) * 2 + usize::from(right));
+        }
+        (quadrants != 0b1111).then_some("include reliable detections in all four sheet quadrants")
     }
 
     pub fn mark_print_area_reviewed(
@@ -1333,11 +1393,17 @@ mod tests {
     }
 
     fn observation(id: usize, sheet: &str) -> CalibrationObservation {
+        let [x, y] = match id % 4 {
+            0 => [15.0, 20.0],
+            1 => [85.0, 20.0],
+            2 => [15.0, 155.0],
+            _ => [85.0, 155.0],
+        };
         CalibrationObservation {
             target_id: format!("A{id:02}"),
             sheet_id: sheet.into(),
-            nominal_print_mm: [10.0 + id as f64, 20.0 + id as f64],
-            observed_cut_mm: [10.1 + id as f64, 19.9 + id as f64],
+            nominal_print_mm: [x, y],
+            observed_cut_mm: [x + 0.1, y - 0.1],
             uncertainty_mm: [0.05, 0.05],
             confidence: 0.95,
             included: true,
@@ -1722,6 +1788,36 @@ mod tests {
             (observations[0].observed_cut_mm[1] - observations[0].nominal_print_mm[1] + 0.1).abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn excluding_scan_targets_rechecks_coverage_before_review_acceptance() {
+        let mut wizard = CalibrationWizard::new("scan-exclusion", 0).unwrap();
+        wizard
+            .select_method(CalibrationMethod::FlatbedScanner, 1)
+            .unwrap();
+        wizard.complete_scan_import(
+            ScanSlot::Training,
+            "scan.png",
+            true,
+            (1..=8).map(|id| observation(id, "sheet-1")).collect(),
+            2,
+        );
+        assert_eq!(wizard.scan_review_coverage_issue(ScanSlot::Training), None);
+        wizard
+            .set_scan_target_included(ScanSlot::Training, "A01", false, 3)
+            .unwrap();
+        assert_eq!(
+            wizard.scan_review_coverage_issue(ScanSlot::Training),
+            Some("include at least eight reliable aperture detections")
+        );
+        wizard.accept_scan_review(ScanSlot::Training, 4);
+        assert!(!wizard.training_scan_reviewed);
+        wizard
+            .set_scan_target_included(ScanSlot::Training, "A01", true, 5)
+            .unwrap();
+        wizard.accept_scan_review(ScanSlot::Training, 6);
+        assert!(wizard.training_scan_reviewed);
     }
 
     #[test]

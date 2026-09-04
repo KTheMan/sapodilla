@@ -393,6 +393,7 @@ fn locate_fiducials(
     let canvas = [manifest.canvas.width_mm, manifest.canvas.height_mm];
     let coarse = DarkIntegral::new(image);
     let mut best: Option<(f64, LocatedFiducials)> = None;
+    let mut seeds = Vec::new();
     // Scanner-bed aspect ratio does not reveal sheet orientation when the scan
     // is intentionally uncropped, so every right-angle orientation is viable.
     for orientation in [
@@ -401,83 +402,107 @@ fn locate_fiducials(
         ScanOrientation::Degrees180,
         ScanOrientation::Degrees270,
     ] {
-        let mut initial_candidates =
-            global_page_mapping_candidates(image, manifest, canvas, orientation, &coarse)
-                .into_iter()
-                .map(|mapping| {
-                    let score = manifest
-                        .fiducials
-                        .iter()
-                        .map(|fiducial| {
-                            let center =
-                                mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
-                            fiducial_template_score(
-                                image, &reference, manifest, fiducial, mapping, center,
-                            )
-                        })
-                        .sum::<f64>();
-                    (score, mapping)
-                })
-                .collect::<Vec<_>>();
+        let initial_candidates =
+            global_page_mapping_candidates(image, manifest, canvas, orientation, &coarse);
         // The inexpensive integral-image pass may return adjacent scale/offset
         // hypotheses. Rank them with the asymmetric templates before doing the
         // substantially more expensive pixel-level neighborhood searches.
-        initial_candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
-        for (_, initial) in initial_candidates.into_iter().take(1) {
-            let mut centers = Vec::with_capacity(4);
-            let mut total_score = 0.0;
-            for fiducial in &manifest.fiducials {
-                let approximate = initial.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
-                let Some((center, score)) =
-                    template_search(image, &reference, manifest, fiducial, initial, approximate)
-                else {
+        let mut scored = initial_candidates
+            .into_iter()
+            .map(|mapping| {
+                let score = manifest
+                    .fiducials
+                    .iter()
+                    .map(|fiducial| {
+                        let center = mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+                        fiducial_template_score(
+                            image, &reference, manifest, fiducial, mapping, center,
+                        )
+                    })
+                    .sum::<f64>();
+                (score, orientation, mapping)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+        seeds.extend(scored.into_iter().take(2));
+        // Always preserve the precise seed for already cropped scans. Skew can
+        // lower its score before refinement even though its scale estimate is
+        // better than every global seed.
+        let mapping = full_image_page_mapping(image, canvas, orientation);
+        let score = manifest
+            .fiducials
+            .iter()
+            .map(|fiducial| {
+                let center = mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+                fiducial_template_score(image, &reference, manifest, fiducial, mapping, center)
+            })
+            .sum::<f64>();
+        seeds.push((score, orientation, mapping));
+    }
+    // Usually the correctly oriented global seed is obvious before local
+    // refinement. Processing seeds across orientations in score order avoids
+    // four full template searches on every ordinary scan.
+    seeds.sort_by(|left, right| right.0.total_cmp(&left.0));
+    for (seed_score, orientation, initial) in seeds {
+        if best
+            .as_ref()
+            .is_some_and(|(best_score, _)| *best_score >= 3.2 && seed_score + 0.4 < *best_score)
+        {
+            break;
+        }
+        let mut centers = Vec::with_capacity(4);
+        let mut total_score = 0.0;
+        for fiducial in &manifest.fiducials {
+            let approximate = initial.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+            let Some((center, score)) =
+                template_search(image, &reference, manifest, fiducial, initial, approximate)
+            else {
+                centers.clear();
+                break;
+            };
+            centers.push(center);
+            total_score += score;
+        }
+        if centers.len() == 4 {
+            let expected: Vec<_> = manifest
+                .fiducials
+                .iter()
+                .map(|fiducial| [fiducial.center_mm.x, fiducial.center_mm.y])
+                .collect();
+            for _ in 0..2 {
+                let Some(refined_mapping) = fit_affine(&expected, &centers) else {
                     centers.clear();
                     break;
                 };
-                centers.push(center);
-                total_score += score;
-            }
-            if centers.len() == 4 {
-                let expected: Vec<_> = manifest
-                    .fiducials
-                    .iter()
-                    .map(|fiducial| [fiducial.center_mm.x, fiducial.center_mm.y])
-                    .collect();
-                for _ in 0..2 {
-                    let Some(refined_mapping) = fit_affine(&expected, &centers) else {
-                        centers.clear();
-                        break;
-                    };
-                    total_score = 0.0;
-                    for (center, fiducial) in centers.iter_mut().zip(&manifest.fiducials) {
-                        let approximate =
-                            refined_mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
-                        let (refined, score) = template_refine(
-                            image,
-                            &reference,
-                            manifest,
-                            fiducial,
-                            refined_mapping,
-                            approximate,
-                        );
-                        *center = refined;
-                        total_score += score;
-                    }
+                total_score = 0.0;
+                for (center, fiducial) in centers.iter_mut().zip(&manifest.fiducials) {
+                    let approximate =
+                        refined_mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+                    let (refined, score) = template_refine(
+                        image,
+                        &reference,
+                        manifest,
+                        fiducial,
+                        refined_mapping,
+                        approximate,
+                    );
+                    *center = refined;
+                    total_score += score;
                 }
             }
-            if centers.len() == 4
-                && best
-                    .as_ref()
-                    .is_none_or(|(best_score, _)| total_score > *best_score)
-            {
-                best = Some((
-                    total_score,
-                    LocatedFiducials {
-                        orientation,
-                        centers,
-                    },
-                ));
-            }
+        }
+        if centers.len() == 4
+            && best
+                .as_ref()
+                .is_none_or(|(best_score, _)| total_score > *best_score)
+        {
+            best = Some((
+                total_score,
+                LocatedFiducials {
+                    orientation,
+                    centers,
+                },
+            ));
         }
     }
     let Some((score, located)) = best else {
@@ -574,8 +599,8 @@ fn global_page_mapping_candidates(
     }
 
     const SCALE_STEPS: usize = 34;
-    const CANDIDATES_PER_SCALE: usize = 1;
-    let mut candidates = Vec::with_capacity(SCALE_STEPS * CANDIDATES_PER_SCALE);
+    const CANDIDATE_COUNT: usize = 8;
+    let mut candidates: Vec<(f64, Affine2d)> = Vec::with_capacity(CANDIDATE_COUNT);
     for scale_index in 0..SCALE_STEPS {
         let fraction = scale_index as f64 / (SCALE_STEPS - 1) as f64;
         let scale = minimum_scale + (maximum_scale - minimum_scale) * fraction;
@@ -586,7 +611,6 @@ fn global_page_mapping_candidates(
         let step = (scale * 1.25).max(f64::from(coarse.divisor) * 2.0);
         let x_steps = (maximum_x / step).ceil() as usize;
         let y_steps = (maximum_y / step).ceil() as usize;
-        let mut scale_candidates: Vec<(f64, Affine2d)> = Vec::with_capacity(CANDIDATES_PER_SCALE);
         for yi in 0..=y_steps {
             let top = (yi as f64 * step).min(maximum_y);
             for xi in 0..=x_steps {
@@ -605,19 +629,15 @@ fn global_page_mapping_candidates(
                     sum += fraction;
                 }
                 let score = minimum * 2.0 + sum;
-                if scale_candidates.len() < CANDIDATES_PER_SCALE
-                    || score
-                        > scale_candidates
-                            .last()
-                            .map_or(f64::NEG_INFINITY, |item| item.0)
+                if candidates.len() < CANDIDATE_COUNT
+                    || score > candidates.last().map_or(f64::NEG_INFINITY, |item| item.0)
                 {
-                    scale_candidates.push((score, mapping));
-                    scale_candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
-                    scale_candidates.truncate(CANDIDATES_PER_SCALE);
+                    candidates.push((score, mapping));
+                    candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
+                    candidates.truncate(CANDIDATE_COUNT);
                 }
             }
         }
-        candidates.extend(scale_candidates);
     }
     candidates.into_iter().map(|(_, mapping)| mapping).collect()
 }
@@ -647,6 +667,33 @@ fn page_mapping_at(
         ScanOrientation::Degrees270 => Affine2d {
             matrix: [[0.0, scale], [-scale, 0.0]],
             translation: [top_left[0], top_left[1] + canvas[0] * scale],
+        },
+    }
+}
+
+fn full_image_page_mapping(
+    image: &RgbImage,
+    canvas: [f64; 2],
+    orientation: ScanOrientation,
+) -> Affine2d {
+    let width = f64::from(image.width() - 1);
+    let height = f64::from(image.height() - 1);
+    match orientation {
+        ScanOrientation::Degrees0 => Affine2d {
+            matrix: [[width / canvas[0], 0.0], [0.0, height / canvas[1]]],
+            translation: [0.0, 0.0],
+        },
+        ScanOrientation::Degrees90 => Affine2d {
+            matrix: [[0.0, -width / canvas[1]], [height / canvas[0], 0.0]],
+            translation: [width, 0.0],
+        },
+        ScanOrientation::Degrees180 => Affine2d {
+            matrix: [[-width / canvas[0], 0.0], [0.0, -height / canvas[1]]],
+            translation: [width, height],
+        },
+        ScanOrientation::Degrees270 => Affine2d {
+            matrix: [[0.0, width / canvas[1]], [-height / canvas[0], 0.0]],
+            translation: [0.0, height],
         },
     }
 }
@@ -690,25 +737,17 @@ fn template_search(
     let px_per_mm = mapping.matrix[0][0]
         .hypot(mapping.matrix[1][0])
         .max(mapping.matrix[0][1].hypot(mapping.matrix[1][1]));
-    // The coarse page seed intentionally models only scale, offset, and a
-    // right-angle orientation. Leave enough room here for ordinary scanner
-    // skew and small desk rotation before the four located centers are used
-    // to fit the full affine rectification.
-    let search_radius = (px_per_mm * 20.0).clamp(24.0, 480.0) as i32;
+    let search_radius = (px_per_mm * 8.0).clamp(16.0, 240.0) as i32;
     let mut best: ([f64; 2], f64) = ([0.0, 0.0], f64::NEG_INFINITY);
-    for (step, local_radius) in [(8_i32, search_radius), (2, 10), (1, 3)] {
-        let (cx, cy, radius) = if step == 8 {
+    for step in [4_i32, 1_i32] {
+        let (cx, cy, radius) = if step == 4 {
             (
                 approximate[0].round() as i32,
                 approximate[1].round() as i32,
-                local_radius,
+                search_radius,
             )
         } else {
-            (
-                best.0[0].round() as i32,
-                best.0[1].round() as i32,
-                local_radius,
-            )
+            (best.0[0].round() as i32, best.0[1].round() as i32, 5)
         };
         let mut local_best = best;
         for y in (cy - radius..=cy + radius).step_by(step as usize) {
