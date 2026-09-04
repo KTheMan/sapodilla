@@ -37,6 +37,17 @@ fn import_fixture(harness: &mut Harness<'_, SapodillaApp>, name: &str) {
     harness.run();
 }
 
+fn fixture_image(harness: &Harness<'_, SapodillaApp>, name: &str, offset: Pos2) -> LoadedImage {
+    let mut image = LoadedImage::new(
+        &harness.ctx,
+        include_bytes!("../../docs/review-evidence/transform-fixture.png"),
+        Some(offset),
+    )
+    .unwrap();
+    image.name = name.to_owned();
+    image
+}
+
 #[test]
 fn fresh_workspace_exposes_primary_and_contextual_entry_points() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
@@ -155,6 +166,242 @@ fn artwork_can_be_selected_through_accesskit() {
         .click_accesskit();
     harness.run();
     assert_eq!(harness.state().selected_images, [0]);
+}
+
+#[test]
+fn canvas_context_menu_targets_artwork_and_duplicates_then_removes_it() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+    harness.state_mut().show_inspector_panel = false;
+    harness.run();
+    let original_id = harness.state().loaded_images[0].id.clone();
+    let original_offset = harness.state().loaded_images[0].offset;
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Image, "Artwork: Untitled sticker")
+        .click_secondary();
+    harness.run();
+    harness.run();
+    for label in [
+        "Duplicate",
+        "Hide artwork",
+        "Lock artwork",
+        "Remove from sheet",
+    ] {
+        harness.get_by_label(label);
+    }
+    harness.get_by_label_contains("Arrange");
+    harness.get_by_label_contains("Transform");
+    harness.get_by_label("Duplicate").click_accesskit();
+    harness.run();
+
+    assert_eq!(harness.state().loaded_images.len(), 2);
+    assert_eq!(harness.state().selected_images, [1]);
+    let duplicate = &harness.state().loaded_images[1];
+    assert_ne!(duplicate.id, original_id);
+    assert_eq!(duplicate.offset, original_offset + Vec2::splat(20.0));
+
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Image,
+            "Artwork: Untitled sticker copy",
+        )
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Remove from sheet").click_accesskit();
+    harness.run();
+    assert_eq!(harness.state().loaded_images.len(), 1);
+    assert_eq!(harness.state().loaded_images[0].id, original_id);
+}
+
+#[test]
+fn right_clicking_unselected_canvas_artwork_activates_that_artwork() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let first = fixture_image(&harness, "First", Pos2::new(80.0, 80.0));
+    let second = fixture_image(&harness, "Second", Pos2::new(700.0, 900.0));
+    harness.state_mut().loaded_images = vec![first, second];
+    harness.state_mut().selected_images = vec![0];
+    harness.state_mut().show_inspector_panel = false;
+    harness.run();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Image, "Artwork: Second")
+        .click_secondary();
+    harness.run();
+    harness.run();
+    assert_eq!(harness.state().selected_images, [1]);
+    harness.get_by_label("Duplicate");
+}
+
+#[test]
+fn locked_artwork_context_disables_transform_arrange_and_removal() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+    harness.state_mut().loaded_images[0].locked = true;
+    harness.state_mut().show_inspector_panel = false;
+    harness.run();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Image, "Artwork: Untitled sticker")
+        .click_secondary();
+    harness.run();
+    harness.run();
+    for node in [
+        harness.get_by_label_contains("Arrange"),
+        harness.get_by_label_contains("Transform"),
+        harness.get_by_label("Remove from sheet"),
+    ] {
+        assert!(node.accesskit_node().is_disabled());
+    }
+    assert!(
+        !harness
+            .get_by_label("Unlock artwork")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn active_layer_actions_are_keyboard_accessible_and_can_restore_hidden_artwork() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+
+    harness
+        .get_by_label("Actions for layer Untitled sticker")
+        .scroll_to_me();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Actions for layer Untitled sticker",
+        )
+        .click_accesskit();
+    harness.run();
+    harness.get_by_label("Hide artwork").click_accesskit();
+    harness.run();
+    assert!(!harness.state().loaded_images[0].visible);
+    assert_eq!(
+        harness
+            .query_all_by_label("Artwork: Untitled sticker")
+            .count(),
+        0
+    );
+
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Actions for layer Untitled sticker",
+        )
+        .click_accesskit();
+    harness.run();
+    harness.get_by_label("Show artwork").click_accesskit();
+    harness.run();
+    assert!(harness.state().loaded_images[0].visible);
+}
+
+#[test]
+fn layer_preview_right_click_exposes_the_shared_artwork_menu() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+
+    harness
+        .get_by_label("Layer preview: Untitled sticker")
+        .scroll_to_me();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Image,
+            "Layer preview: Untitled sticker",
+        )
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Hide artwork");
+    harness.get_by_label("Remove from sheet");
+}
+
+#[test]
+fn artwork_commands_preserve_block_order_selection_and_lock_protection() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let images = ["A", "B", "C", "D"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| fixture_image(&harness, name, Pos2::new(index as f32 * 50.0, 0.0)))
+        .collect::<Vec<_>>();
+    let selected_ids = vec![images[1].id.clone(), images[2].id.clone()];
+    harness.state_mut().loaded_images = images;
+    harness.state_mut().selected_images = vec![1, 2];
+
+    harness
+        .state_mut()
+        .apply_artwork_menu_action(views::ArtworkMenuAction {
+            image_ids: selected_ids.clone(),
+            command: views::ArtworkMenuCommand::BringToFront,
+        });
+    assert_eq!(
+        harness
+            .state()
+            .loaded_images
+            .iter()
+            .map(|image| image.name.as_str())
+            .collect::<Vec<_>>(),
+        ["A", "D", "B", "C"]
+    );
+    assert_eq!(harness.state().selected_images, [2, 3]);
+
+    harness.state_mut().loaded_images[2].locked = true;
+    harness
+        .state_mut()
+        .apply_artwork_menu_action(views::ArtworkMenuAction {
+            image_ids: selected_ids,
+            command: views::ArtworkMenuCommand::Remove,
+        });
+    assert_eq!(harness.state().loaded_images.len(), 4);
+}
+
+#[test]
+fn removing_artwork_clears_template_and_cutline_relationships() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let image = fixture_image(&harness, "Assigned", Pos2::ZERO);
+    let image_id = image.id.clone();
+    harness.state_mut().loaded_images = vec![image];
+    harness.state_mut().selected_images = vec![0];
+    harness
+        .state_mut()
+        .template_placeholders
+        .push(TemplatePlaceholder {
+            id: "slot".into(),
+            name: "Slot".into(),
+            bounds: [0.0, 0.0, 100.0, 100.0],
+            rotation_degrees: 0.0,
+            fit: PlaceholderFit::Contain,
+            assigned_image_id: Some(image_id.clone()),
+        });
+    let owned_path = LineString::from(vec![(0.0, 0.0), (10.0, 10.0)]);
+    harness.state_mut().cut_shapes.push(owned_path.clone());
+    harness.state_mut().manual_cut_shapes.push(owned_path);
+    harness.state_mut().cut_modes.push(CutMode::Kiss);
+    harness
+        .state_mut()
+        .cutline_owners
+        .push(Some(CutlineOwner::Image(image_id.clone())));
+    harness.state_mut().cutline_locked.push(false);
+
+    harness
+        .state_mut()
+        .apply_artwork_menu_action(views::ArtworkMenuAction {
+            image_ids: vec![image_id],
+            command: views::ArtworkMenuCommand::Remove,
+        });
+
+    assert!(harness.state().loaded_images.is_empty());
+    assert!(harness.state().selected_images.is_empty());
+    assert_eq!(
+        harness.state().template_placeholders[0].assigned_image_id,
+        None
+    );
+    assert!(harness.state().cut_shapes.is_empty());
+    assert!(harness.state().manual_cut_shapes.is_empty());
+    assert!(harness.state().cutline_owners.is_empty());
 }
 
 #[test]
