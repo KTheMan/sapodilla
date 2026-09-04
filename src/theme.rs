@@ -457,6 +457,219 @@ pub fn secondary_icon_text_button(
     .inner
 }
 
+/// A prominent top-bar action with a leading icon and a clean accessible name.
+pub fn primary_toolbar_action(
+    ui: &mut Ui,
+    accent: Color32,
+    icon: &str,
+    label: impl Into<String>,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let palette = Palette::for_accent(ui.visuals().dark_mode, accent);
+    let label = label.into();
+    let accessible_label = accessible_label.into();
+    let tooltip = tooltip.into();
+    let response = ui
+        .scope(|ui| {
+            let visuals = &mut ui.style_mut().visuals;
+            visuals.widgets.inactive.bg_fill = palette.accent_fill;
+            visuals.widgets.inactive.weak_bg_fill = palette.accent_fill;
+            visuals.widgets.inactive.bg_stroke = stroke(1.5, palette.accent_border);
+            visuals.widgets.hovered.bg_fill = palette.accent_hover;
+            visuals.widgets.hovered.weak_bg_fill = palette.accent_hover;
+            visuals.widgets.hovered.bg_stroke = stroke(2.0, palette.focus);
+            visuals.widgets.active.bg_fill = palette.accent_pressed;
+            visuals.widgets.active.weak_bg_fill = palette.accent_pressed;
+            visuals.widgets.active.bg_stroke = stroke(2.0, palette.focus);
+            ui.add(
+                egui::Button::new(
+                    RichText::new(format!("{icon}  {label}"))
+                        .color(palette.on_accent)
+                        .strong(),
+                )
+                .corner_radius(CornerRadius::same(9))
+                .min_size(egui::vec2(0.0, 36.0)),
+            )
+        })
+        .inner;
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip)
+}
+
+/// A secondary top-bar action that pairs an icon with a domain-specific label.
+pub fn secondary_toolbar_action(
+    ui: &mut Ui,
+    accent: Color32,
+    icon: &str,
+    label: impl Into<String>,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let palette = Palette::for_accent(ui.visuals().dark_mode, accent);
+    let label = label.into();
+    let accessible_label = accessible_label.into();
+    let tooltip = tooltip.into();
+    let response = ui
+        .scope(|ui| {
+            let visuals = &mut ui.style_mut().visuals;
+            visuals.widgets.inactive.bg_fill = palette.surface;
+            visuals.widgets.inactive.bg_stroke = stroke(1.0, palette.border);
+            visuals.widgets.hovered.bg_fill = palette.accent_soft;
+            visuals.widgets.hovered.bg_stroke = stroke(1.5, palette.focus);
+            visuals.widgets.active.bg_fill = palette.accent_soft;
+            visuals.widgets.active.bg_stroke = stroke(2.0, palette.focus);
+            ui.add(
+                egui::Button::new(RichText::new(format!("{icon}  {label}")).color(palette.text))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(egui::vec2(0.0, 34.0)),
+            )
+        })
+        .inner;
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip)
+}
+
+fn style_toolbar_control(ui: &mut Ui, accent: Color32, selected: bool) -> Palette {
+    let palette = Palette::for_accent(ui.visuals().dark_mode, accent);
+    let visuals = &mut ui.style_mut().visuals;
+    visuals.widgets.inactive.bg_fill = if selected {
+        palette.accent_soft
+    } else {
+        palette.surface
+    };
+    visuals.widgets.inactive.bg_stroke = stroke(1.0, palette.border);
+    visuals.widgets.hovered.bg_fill = if selected {
+        mix(palette.accent_soft, palette.surface_hover, 0.35)
+    } else {
+        palette.surface_hover
+    };
+    visuals.widgets.hovered.bg_stroke = stroke(1.5, palette.focus);
+    visuals.widgets.active.bg_fill = palette.accent_soft;
+    visuals.widgets.active.bg_stroke = stroke(2.0, palette.focus);
+    palette
+}
+
+/// An icon-only top-bar action with a 34-point target and semantic name.
+pub fn toolbar_icon_button(
+    ui: &mut Ui,
+    accent: Color32,
+    icon: &str,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let accessible_label = accessible_label.into();
+    let tooltip = tooltip.into();
+    let response = ui
+        .scope(|ui| {
+            let palette = style_toolbar_control(ui, accent, false);
+            ui.add(
+                egui::Button::new(RichText::new(icon).size(17.0).color(palette.text))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(egui::vec2(34.0, 34.0)),
+            )
+        })
+        .inner;
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip)
+}
+
+/// An icon-only top-bar toggle that exposes its state independently of color.
+pub fn toolbar_icon_toggle(
+    ui: &mut Ui,
+    accent: Color32,
+    selected: &mut bool,
+    icon: &str,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let accessible_label = accessible_label.into();
+    let tooltip = tooltip.into();
+    let is_selected = *selected;
+    let (response, palette) = ui
+        .scope(|ui| {
+            let palette = style_toolbar_control(ui, accent, is_selected);
+            let response = ui.add(
+                egui::Button::new(RichText::new(icon).size(17.0).color(palette.text))
+                    .selected(is_selected)
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(egui::vec2(34.0, 34.0)),
+            );
+            (response, palette)
+        })
+        .inner;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            is_selected,
+            accessible_label.clone(),
+        )
+    });
+    if is_selected {
+        let indicator = egui::Rect::from_min_max(
+            egui::pos2(response.rect.left() + 7.0, response.rect.bottom() - 3.0),
+            egui::pos2(response.rect.right() - 7.0, response.rect.bottom() - 1.0),
+        );
+        ui.painter()
+            .rect_filled(indicator, 1.0, palette.accent_border);
+    }
+    if response.clicked() {
+        *selected = !*selected;
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// An icon-only top-bar menu button with a semantic name and 34-point target.
+pub fn toolbar_icon_menu<R>(
+    ui: &mut Ui,
+    accent: Color32,
+    icon: &str,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::Response {
+    let accessible_label = accessible_label.into();
+    let tooltip = tooltip.into();
+    let response = ui
+        .scope(|ui| {
+            let palette = style_toolbar_control(ui, accent, false);
+            ui.style_mut().spacing.interact_size = egui::vec2(34.0, 34.0);
+            ui.menu_button(
+                RichText::new(icon).size(17.0).color(palette.text),
+                add_contents,
+            )
+            .response
+        })
+        .inner;
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip)
+}
+
 /// A conventional icon-only action with a full semantic name and tooltip.
 pub fn icon_button(
     ui: &mut Ui,
@@ -524,53 +737,6 @@ pub fn danger_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
         )
     })
     .inner
-}
-
-pub fn toolbar_toggle(
-    ui: &mut Ui,
-    accent: Color32,
-    selected: &mut bool,
-    text: &str,
-) -> egui::Response {
-    let palette = Palette::for_accent(ui.visuals().dark_mode, accent);
-    let is_selected = *selected;
-    let response = ui
-        .scope(|ui| {
-            let visuals = &mut ui.style_mut().visuals;
-            visuals.widgets.inactive.bg_fill = if is_selected {
-                palette.accent_soft
-            } else {
-                palette.surface
-            };
-            visuals.widgets.inactive.bg_stroke = stroke(1.0, palette.border);
-            visuals.widgets.hovered.bg_fill = if is_selected {
-                mix(palette.accent_soft, palette.surface_hover, 0.35)
-            } else {
-                palette.surface_hover
-            };
-            visuals.widgets.hovered.bg_stroke = stroke(1.5, palette.focus);
-            visuals.widgets.active.bg_fill = palette.accent_soft;
-            visuals.widgets.active.bg_stroke = stroke(2.0, palette.focus);
-            ui.add(
-                egui::Button::new(RichText::new(text).color(palette.text))
-                    .selected(is_selected)
-                    .corner_radius(CornerRadius::same(8))
-                    .min_size(egui::vec2(0.0, 32.0)),
-            )
-        })
-        .inner;
-    if is_selected {
-        let indicator = egui::Rect::from_min_max(
-            egui::pos2(response.rect.left() + 7.0, response.rect.bottom() - 3.0),
-            egui::pos2(response.rect.right() - 7.0, response.rect.bottom() - 1.0),
-        );
-        ui.painter()
-            .rect_filled(indicator, 1.0, palette.accent_border);
-    }
-    if response.clicked() {
-        *selected = !*selected;
-    }
-    response
 }
 
 pub fn accent_choice_button(

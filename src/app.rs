@@ -2776,7 +2776,14 @@ impl SapodillaApp {
                             let _ = theme::primary_button(ui, accent, "Primary");
                             let _ = theme::secondary_button(ui, accent, "Secondary");
                             let mut selected = true;
-                            let _ = theme::toolbar_toggle(ui, accent, &mut selected, "Selected");
+                            let _ = theme::toolbar_icon_toggle(
+                                ui,
+                                accent,
+                                &mut selected,
+                                crate::icons::GRID,
+                                "Selected control preview",
+                                "Selected toolbar control",
+                            );
                         });
                         theme::spectrum_rule(ui, self.accent_color());
                     });
@@ -3967,85 +3974,152 @@ impl eframe::App for SapodillaApp {
                         ));
                     }
                     ui.separator();
-                    if theme::primary_button(
+                    if theme::primary_toolbar_action(
                         ui,
                         accent,
-                        if compact_layout {
-                            "+ Add"
-                        } else {
-                            "+ Add artwork"
-                        },
+                        crate::icons::ADD_ARTWORK,
+                        if compact_layout { "Add" } else { "Add artwork" },
+                        "Add artwork",
+                        "Import artwork (Ctrl/Cmd+Shift+U)",
                     )
-                    .on_hover_text("Import artwork (Ctrl/Cmd+Shift+U)")
                     .clicked()
                     {
                         self.upload_image(ctx);
                     }
                     if compact_layout {
-                        ui.menu_button("More", |ui| {
-                            if ui.button("Auto-pack sheet").clicked() {
-                                self.auto_pack();
-                                ui.close();
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new("Save")
-                                        .shortcut_text(ctx.format_shortcut(&save_shortcut)),
-                                )
-                                .clicked()
-                            {
-                                self.save_document(self.document_kind);
-                                ui.close();
-                            }
-                            ui.separator();
-                            ui.checkbox(&mut self.snap_to_guides, "Snap to guides");
-                            ui.checkbox(&mut self.show_grid, "Show grid");
-                            ui.checkbox(&mut self.show_rulers, "Show rulers");
-                            ui.checkbox(&mut self.show_cutlines, "Show cut preview");
-                            ui.checkbox(&mut self.edit_cutlines, "Edit cut nodes");
-                        });
+                        if theme::toolbar_icon_button(
+                            ui,
+                            accent,
+                            crate::icons::SAVE,
+                            "Save document",
+                            format!(
+                                "Save this document ({})",
+                                ctx.format_shortcut(&save_shortcut)
+                            ),
+                        )
+                        .clicked()
+                        {
+                            self.save_document(self.document_kind);
+                        }
                     } else {
-                        if theme::secondary_button(ui, accent, "Auto-pack")
-                            .on_hover_text("Arrange artwork to use the sheet efficiently")
-                            .clicked()
+                        if theme::secondary_toolbar_action(
+                            ui,
+                            accent,
+                            crate::icons::AUTO_PACK,
+                            "Auto-pack",
+                            "Auto-pack sheet",
+                            "Arrange artwork to use the sheet efficiently",
+                        )
+                        .clicked()
                         {
                             self.auto_pack();
                         }
-                        if theme::secondary_button(ui, accent, "Save")
-                            .on_hover_text(format!(
+                        if theme::toolbar_icon_button(
+                            ui,
+                            accent,
+                            crate::icons::SAVE,
+                            "Save document",
+                            format!(
                                 "Save this document ({})",
                                 ctx.format_shortcut(&save_shortcut)
-                            ))
-                            .clicked()
+                            ),
+                        )
+                        .clicked()
                         {
                             self.save_document(self.document_kind);
                         }
                         ui.separator();
-                        theme::toolbar_toggle(ui, accent, &mut self.snap_to_guides, "Snap");
-                        theme::toolbar_toggle(ui, accent, &mut self.show_grid, "Grid");
-                        theme::toolbar_toggle(ui, accent, &mut self.show_rulers, "Rulers");
-                        theme::toolbar_toggle(ui, accent, &mut self.show_cutlines, "Cut preview");
-                        theme::toolbar_toggle(ui, accent, &mut self.edit_cutlines, "Edit nodes");
+                        theme::toolbar_icon_toggle(
+                            ui,
+                            accent,
+                            &mut self.snap_to_guides,
+                            crate::icons::SNAP,
+                            "Snap artwork to guides",
+                            "Snap artwork to guides",
+                        );
+                        theme::toolbar_icon_toggle(
+                            ui,
+                            accent,
+                            &mut self.show_grid,
+                            crate::icons::GRID,
+                            "Layout grid",
+                            "Show or hide the layout grid",
+                        );
+                        theme::toolbar_icon_toggle(
+                            ui,
+                            accent,
+                            &mut self.show_rulers,
+                            crate::icons::RULERS,
+                            "Canvas rulers",
+                            "Show or hide canvas rulers",
+                        );
+                        theme::toolbar_icon_toggle(
+                            ui,
+                            accent,
+                            &mut self.show_cutlines,
+                            crate::icons::CUT_PREVIEW,
+                            "Cut preview",
+                            "Show or hide the cut preview",
+                        );
+                        theme::toolbar_icon_toggle(
+                            ui,
+                            accent,
+                            &mut self.edit_cutlines,
+                            crate::icons::EDIT_NODES,
+                            "Edit cut nodes",
+                            "Edit cut-path nodes",
+                        );
                     }
 
-                    if theme::toolbar_toggle(ui, accent, &mut self.show_library_panel, "Library")
-                        .clicked()
+                    if theme::toolbar_icon_toggle(
+                        ui,
+                        accent,
+                        &mut self.show_library_panel,
+                        crate::icons::LIBRARY,
+                        "Library panel",
+                        "Show or hide the artwork library",
+                    )
+                    .clicked()
                         && compact_layout
                         && self.show_library_panel
                     {
                         self.show_inspector_panel = false;
                     }
-                    if theme::toolbar_toggle(
+                    if theme::toolbar_icon_toggle(
                         ui,
                         accent,
                         &mut self.show_inspector_panel,
-                        "Inspector",
+                        crate::icons::INSPECTOR,
+                        "Inspector panel",
+                        "Show or hide the inspector",
                     )
                     .clicked()
                         && compact_layout
                         && self.show_inspector_panel
                     {
                         self.show_library_panel = false;
+                    }
+
+                    if compact_layout {
+                        theme::toolbar_icon_menu(
+                            ui,
+                            accent,
+                            crate::icons::DOTS_THREE,
+                            "More toolbar actions",
+                            "More toolbar actions",
+                            |ui| {
+                                if ui.button("Auto-pack sheet").clicked() {
+                                    self.auto_pack();
+                                    ui.close();
+                                }
+                                ui.separator();
+                                ui.checkbox(&mut self.snap_to_guides, "Snap to guides");
+                                ui.checkbox(&mut self.show_grid, "Show grid");
+                                ui.checkbox(&mut self.show_rulers, "Show rulers");
+                                ui.checkbox(&mut self.show_cutlines, "Show cut preview");
+                                ui.checkbox(&mut self.edit_cutlines, "Edit cut nodes");
+                            },
+                        );
                     }
 
                     if !compact_layout {

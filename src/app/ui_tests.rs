@@ -52,11 +52,11 @@ fn fixture_image(harness: &Harness<'_, SapodillaApp>, name: &str, offset: Pos2) 
 fn fresh_workspace_exposes_primary_and_contextual_entry_points() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
 
-    assert_eq!(harness.query_all_by_label("+ Add artwork").count(), 2);
-    harness.get_by_label("Auto-pack");
-    harness.get_by_label("Save");
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Library");
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Inspector");
+    assert_eq!(harness.query_all_by_label("Add artwork").count(), 1);
+    harness.get_by_label("Auto-pack sheet");
+    harness.get_by_label("Save document");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Library panel");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Inspector panel");
     harness.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Transport");
     harness.get_by_label("Production queue (0)");
 
@@ -77,7 +77,14 @@ fn fresh_workspace_exposes_primary_and_contextual_entry_points() {
 fn primary_workspace_controls_are_named_actionable_and_easy_to_target() {
     let harness = app_harness(Vec2::new(1280.0, 800.0));
 
-    for label in ["Auto-pack", "Save", "Library", "Inspector", "Fit sheet"] {
+    for label in [
+        "Add artwork",
+        "Auto-pack sheet",
+        "Save document",
+        "Library panel",
+        "Inspector panel",
+        "Fit sheet",
+    ] {
         let node = harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
         let accessible = node.accesskit_node();
         assert!(!accessible.is_disabled(), "{label} should be enabled");
@@ -105,11 +112,127 @@ fn primary_workspace_controls_are_named_actionable_and_easy_to_target() {
 fn compact_workspace_keeps_panels_and_cut_discovery_reachable() {
     let mut harness = app_harness(Vec2::new(700.0, 720.0));
 
-    harness.get_by_label("More");
-    harness.get_by_label("Library");
-    harness.get_by_label("Inspector").click();
+    for label in [
+        "Add artwork",
+        "Save document",
+        "Library panel",
+        "Inspector panel",
+        "More toolbar actions",
+    ] {
+        let node = harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
+        let rect = node.rect();
+        assert!(
+            rect.width() >= 32.0 && rect.height() >= 32.0,
+            "{label} target should be at least 32×32 points, got {rect:?}"
+        );
+        assert!(
+            rect.right() <= 700.0 && rect.left() >= 0.0,
+            "{label} should remain inside the compact viewport, got {rect:?}"
+        );
+    }
+    harness.get_by_label("More toolbar actions").click();
+    harness.run();
+    harness.get_by_label("Auto-pack sheet");
+    harness.get_by_label("Snap to guides");
+    harness.get_by_label("Show grid");
+    harness.get_by_label("Show rulers");
+    harness.get_by_label("Show cut preview");
+    harness.get_by_label("Edit cut nodes");
+    harness.get_by_label("Inspector panel").click();
     harness.run();
     harness.get_by_label("Switch to Print & Cut");
+}
+
+#[test]
+fn topbar_icon_toggles_have_clear_names_states_and_targets() {
+    let mut harness = app_harness(Vec2::new(1440.0, 800.0));
+
+    for label in [
+        "Snap artwork to guides",
+        "Layout grid",
+        "Canvas rulers",
+        "Cut preview",
+        "Edit cut nodes",
+        "Library panel",
+        "Inspector panel",
+    ] {
+        let node = harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
+        let accessible = node.accesskit_node();
+        assert!(
+            accessible
+                .data()
+                .supports_action(egui::accesskit::Action::Focus),
+            "{label} should support accessibility focus"
+        );
+        assert!(
+            accessible
+                .data()
+                .supports_action(egui::accesskit::Action::Click),
+            "{label} should support accessibility click"
+        );
+        assert!(
+            accessible.data().toggled().is_some(),
+            "{label} should expose its toggle state"
+        );
+        let rect = node.rect();
+        assert!(
+            rect.width() >= 32.0 && rect.height() >= 32.0,
+            "{label} target should be at least 32×32 points, got {rect:?}"
+        );
+    }
+
+    assert!(harness.state().show_grid);
+    harness.get_by_label("Layout grid").click_accesskit();
+    harness.run();
+    assert!(!harness.state().show_grid);
+    assert_eq!(
+        harness
+            .get_by_label("Layout grid")
+            .accesskit_node()
+            .data()
+            .toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+}
+
+#[test]
+fn topbar_breakpoint_keeps_visible_actions_inside_the_viewport() {
+    let compact = app_harness(Vec2::new(1159.0, 760.0));
+    compact.get_by_label("More toolbar actions");
+    for label in [
+        "Add artwork",
+        "Save document",
+        "Library panel",
+        "Inspector panel",
+        "More toolbar actions",
+    ] {
+        let rect = compact.get_by_label(label).rect();
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 1159.0,
+            "{label} should fit immediately below the compact breakpoint, got {rect:?}"
+        );
+    }
+
+    let wide = app_harness(Vec2::new(1160.0, 760.0));
+    for label in [
+        "Add artwork",
+        "Auto-pack sheet",
+        "Save document",
+        "Snap artwork to guides",
+        "Layout grid",
+        "Canvas rulers",
+        "Cut preview",
+        "Edit cut nodes",
+        "Library panel",
+        "Inspector panel",
+    ] {
+        let rect = wide.get_by_label(label).rect();
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 1160.0,
+            "{label} should fit at the wide-layout breakpoint, got {rect:?}"
+        );
+    }
+    assert_eq!(wide.query_all_by_label("More toolbar actions").count(), 0);
 }
 
 #[test]
@@ -549,7 +672,7 @@ fn sidebar_icon_controls_have_clear_names_states_and_targets() {
 fn compact_layer_row_keeps_every_icon_action_inside_the_viewport() {
     let mut harness = app_harness(Vec2::new(700.0, 720.0));
     add_selected_fixture(&mut harness);
-    harness.get_by_label("Inspector").click();
+    harness.get_by_label("Inspector panel").click();
     harness.run();
 
     harness
