@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, io::Cursor, ops::RangeInclusive};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    io::Cursor,
+    ops::RangeInclusive,
+};
 
 use egui::{Id, Modal, Pos2, ProgressBar, Ui, Vec2};
 use egui_dnd::{DragDropItem, Handle, dnd};
@@ -261,25 +265,257 @@ fn packet_details(ui: &mut Ui, has_exactly_one: bool, index: usize, packet: &Avo
 struct EnumeratedItem<T> {
     item: T,
     index: usize,
+    id: Id,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtworkMenuCommand {
+    Duplicate,
+    BringToFront,
+    BringForward,
+    SendBackward,
+    SendToBack,
+    RotateClockwise,
+    RotateCounterclockwise,
+    FlipHorizontal,
+    FlipVertical,
+    SetVisible(bool),
+    SetLocked(bool),
+    SetCutting(bool),
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtworkMenuAction {
+    pub image_ids: Vec<String>,
+    pub command: ArtworkMenuCommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ArtworkMenuContext {
+    image_ids: Vec<String>,
+    count: usize,
+    any_locked: bool,
+    all_locked: bool,
+    all_visible: bool,
+    all_cutting: bool,
+    can_move_forward: bool,
+    can_move_backward: bool,
+    can_cut: bool,
+}
+
+impl ArtworkMenuContext {
+    pub(crate) fn new(
+        images: &[LoadedImage],
+        selected_images: &[usize],
+        mode_type: ModeType,
+    ) -> Option<Self> {
+        let selected = selected_images
+            .iter()
+            .copied()
+            .filter(|index| *index < images.len())
+            .collect::<BTreeSet<_>>();
+        if selected.is_empty() {
+            return None;
+        }
+        let chosen = selected
+            .iter()
+            .map(|index| &images[*index])
+            .collect::<Vec<_>>();
+        let first = *selected.first().expect("selection is non-empty");
+        let last = *selected.last().expect("selection is non-empty");
+
+        Some(Self {
+            image_ids: chosen.iter().map(|image| image.id.clone()).collect(),
+            count: chosen.len(),
+            any_locked: chosen.iter().any(|image| image.locked),
+            all_locked: chosen.iter().all(|image| image.locked),
+            all_visible: chosen.iter().all(|image| image.visible),
+            all_cutting: chosen.iter().all(|image| image.enable_cutting),
+            can_move_forward: images
+                .iter()
+                .enumerate()
+                .skip(last + 1)
+                .any(|(index, _)| !selected.contains(&index)),
+            can_move_backward: images
+                .iter()
+                .enumerate()
+                .take(first)
+                .any(|(index, _)| !selected.contains(&index)),
+            can_cut: mode_type.has_cutting(),
+        })
+    }
+
+    fn single(image: &LoadedImage, index: usize, image_count: usize, mode_type: ModeType) -> Self {
+        Self {
+            image_ids: vec![image.id.clone()],
+            count: 1,
+            any_locked: image.locked,
+            all_locked: image.locked,
+            all_visible: image.visible,
+            all_cutting: image.enable_cutting,
+            can_move_forward: index + 1 < image_count,
+            can_move_backward: index > 0,
+            can_cut: mode_type.has_cutting(),
+        }
+    }
+
+    fn action(&self, command: ArtworkMenuCommand) -> ArtworkMenuAction {
+        ArtworkMenuAction {
+            image_ids: self.image_ids.clone(),
+            command,
+        }
+    }
+}
+
+pub(crate) fn artwork_context_menu(
+    ui: &mut Ui,
+    context: &ArtworkMenuContext,
+) -> Option<ArtworkMenuAction> {
+    let mut action = None;
+    let multiple = context.count > 1;
+    let duplicate_label = if multiple {
+        format!("Duplicate {} selected", context.count)
+    } else {
+        "Duplicate".to_owned()
+    };
+    if ui.button(duplicate_label).clicked() {
+        action = Some(context.action(ArtworkMenuCommand::Duplicate));
+    }
+
+    ui.separator();
+    ui.add_enabled_ui(!context.any_locked, |ui| {
+        ui.menu_button("Arrange", |ui| {
+            if ui
+                .add_enabled(
+                    context.can_move_forward,
+                    egui::Button::new("Bring to front"),
+                )
+                .clicked()
+            {
+                action = Some(context.action(ArtworkMenuCommand::BringToFront));
+            }
+            if ui
+                .add_enabled(context.can_move_forward, egui::Button::new("Bring forward"))
+                .clicked()
+            {
+                action = Some(context.action(ArtworkMenuCommand::BringForward));
+            }
+            if ui
+                .add_enabled(
+                    context.can_move_backward,
+                    egui::Button::new("Send backward"),
+                )
+                .clicked()
+            {
+                action = Some(context.action(ArtworkMenuCommand::SendBackward));
+            }
+            if ui
+                .add_enabled(context.can_move_backward, egui::Button::new("Send to back"))
+                .clicked()
+            {
+                action = Some(context.action(ArtworkMenuCommand::SendToBack));
+            }
+        });
+        ui.menu_button("Transform", |ui| {
+            if ui.button("Rotate 90° clockwise").clicked() {
+                action = Some(context.action(ArtworkMenuCommand::RotateClockwise));
+            }
+            if ui.button("Rotate 90° counterclockwise").clicked() {
+                action = Some(context.action(ArtworkMenuCommand::RotateCounterclockwise));
+            }
+            ui.separator();
+            if ui.button("Flip horizontal").clicked() {
+                action = Some(context.action(ArtworkMenuCommand::FlipHorizontal));
+            }
+            if ui.button("Flip vertical").clicked() {
+                action = Some(context.action(ArtworkMenuCommand::FlipVertical));
+            }
+        });
+    });
+
+    ui.separator();
+    let visibility_label = match (multiple, context.all_visible) {
+        (true, true) => "Hide selected",
+        (true, false) => "Show selected",
+        (false, true) => "Hide artwork",
+        (false, false) => "Show artwork",
+    };
+    if ui.button(visibility_label).clicked() {
+        action = Some(context.action(ArtworkMenuCommand::SetVisible(!context.all_visible)));
+    }
+    let lock_label = match (multiple, context.all_locked) {
+        (true, true) => "Unlock selected",
+        (true, false) => "Lock selected",
+        (false, true) => "Unlock artwork",
+        (false, false) => "Lock artwork",
+    };
+    if ui.button(lock_label).clicked() {
+        action = Some(context.action(ArtworkMenuCommand::SetLocked(!context.all_locked)));
+    }
+    if context.can_cut {
+        let cut_label = match (multiple, context.all_cutting) {
+            (true, true) => "Exclude selected from cutlines",
+            (true, false) => "Include selected in cutlines",
+            (false, true) => "Exclude from cutlines",
+            (false, false) => "Include in cutlines",
+        };
+        if ui.button(cut_label).clicked() {
+            action = Some(context.action(ArtworkMenuCommand::SetCutting(!context.all_cutting)));
+        }
+    }
+
+    ui.separator();
+    let remove_label = if multiple {
+        format!("Remove {} from sheet", context.count)
+    } else {
+        "Remove from sheet".to_owned()
+    };
+    let remove = ui.add_enabled(
+        !context.any_locked,
+        egui::Button::new(egui::RichText::new(remove_label).color(ui.visuals().error_fg_color)),
+    );
+    if remove.clicked() {
+        action = Some(context.action(ArtworkMenuCommand::Remove));
+    }
+    remove.on_disabled_hover_text("Unlock selected artwork to remove it");
+
+    if action.is_some() {
+        ui.close();
+    }
+    action
 }
 
 impl<T> DragDropItem for EnumeratedItem<T> {
     fn id(&self) -> Id {
-        Id::new(self.index)
+        self.id
     }
 }
 
+#[allow(
+    clippy::ptr_arg,
+    reason = "egui_dnd reordering updates the backing Vec"
+)]
 pub fn loaded_images(
     ui: &mut Ui,
     dpi: f32,
     canvas_size: Vec2,
     loaded_images: &mut Vec<LoadedImage>,
+    selected_images: &mut Vec<usize>,
     mode_type: ModeType,
-) -> bool {
+) -> (bool, Option<ArtworkMenuAction>) {
     ui.heading("Images");
 
-    let mut remove = None;
     let mut changed = false;
+    let mut select = None;
+    let mut menu_action = None;
+    let selected_ids = selected_images
+        .iter()
+        .filter_map(|index| loaded_images.get(*index))
+        .map(|image| image.id.clone())
+        .collect::<BTreeSet<_>>();
+    let menu_context = ArtworkMenuContext::new(loaded_images, selected_images, mode_type);
+    let image_count = loaded_images.len();
 
     ui.spacing_mut().scroll.floating = false;
 
@@ -290,48 +526,89 @@ pub fn loaded_images(
                 loaded_images
                     .iter_mut()
                     .enumerate()
-                    .map(|(index, item)| EnumeratedItem { item, index }),
-                |ui, EnumeratedItem { item, index }, handle, _dragging| {
-                    image_controls(
+                    .map(|(index, item)| EnumeratedItem {
+                        id: Id::new(("layer", item.id.clone())),
+                        item,
+                        index,
+                    }),
+                |ui, EnumeratedItem { item, index, .. }, handle, _dragging| {
+                    let interaction = image_controls(
                         ui,
                         dpi,
                         canvas_size,
                         item,
-                        index,
-                        &mut remove,
                         handle,
                         mode_type,
+                        selected_ids.contains(&item.id),
+                        menu_context.as_ref(),
+                        index,
+                        image_count,
                     );
+                    if interaction.select {
+                        select = Some(index);
+                    }
+                    if interaction.remove {
+                        menu_action = Some(ArtworkMenuAction {
+                            image_ids: vec![item.id.clone()],
+                            command: ArtworkMenuCommand::Remove,
+                        });
+                    }
+                    if interaction.menu_action.is_some() {
+                        menu_action = interaction.menu_action;
+                    }
                     ui.add_space(16.0);
                 },
             );
 
             if response.is_drag_finished() {
                 response.update_vec(loaded_images);
+                *selected_images = loaded_images
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, image)| selected_ids.contains(&image.id).then_some(index))
+                    .collect();
                 changed = true;
             }
         });
 
-    if let Some(remove) = remove {
-        loaded_images.remove(remove);
-        changed = true;
+    if let Some(index) = select {
+        *selected_images = vec![index];
     }
-    changed
+    (changed, menu_action)
+}
+
+struct ImageControlsInteraction {
+    select: bool,
+    remove: bool,
+    menu_action: Option<ArtworkMenuAction>,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn image_controls(
+fn image_controls(
     ui: &mut Ui,
     dpi: f32,
     canvas_size: Vec2,
     image: &mut LoadedImage,
-    index: usize,
-    remove_index: &mut Option<usize>,
     handle: Handle<'_>,
     mode_type: ModeType,
-) {
+    active: bool,
+    menu_context: Option<&ArtworkMenuContext>,
+    index: usize,
+    image_count: usize,
+) -> ImageControlsInteraction {
+    let mut interaction = ImageControlsInteraction {
+        select: false,
+        remove: false,
+        menu_action: None,
+    };
+    let own_context = ArtworkMenuContext::single(image, index, image_count, mode_type);
+    let context = if active {
+        menu_context.unwrap_or(&own_context)
+    } else {
+        &own_context
+    };
     ui.horizontal(|ui| {
-        handle.ui(ui, |ui| {
+        let preview = handle.sense(egui::Sense::click_and_drag()).ui(ui, |ui| {
             let (response, painter) = ui.allocate_painter(Vec2::splat(50.0), egui::Sense::empty());
 
             painter.image(
@@ -341,12 +618,42 @@ pub fn image_controls(
                 egui::Color32::WHITE,
             );
         });
+        let preview_label = format!("Layer preview: {}", image.name);
+        preview.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Image, true, preview_label.clone())
+        });
+        let preview_secondary_clicked = ui.input(|input| {
+            input.pointer.secondary_clicked()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|pointer| preview.rect.contains(pointer))
+        });
+        if (preview.clicked() || preview_secondary_clicked) && !active {
+            interaction.select = true;
+        }
+        let mut popup = egui::Popup::context_menu(&preview);
+        if preview_secondary_clicked {
+            popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+        }
+        popup.show(|ui| {
+            if let Some(action) = artwork_context_menu(ui, context) {
+                interaction.menu_action = Some(action);
+            }
+        });
 
         ui.vertical(|ui| {
             ui.spacing_mut().interact_size.x = 72.0;
             ui.spacing_mut().item_spacing.y = 8.0;
 
             ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(active, if active { "Active" } else { "Select" })
+                    .on_hover_text("Make this the active artwork")
+                    .clicked()
+                {
+                    interaction.select = true;
+                }
                 let label = ui.label("Layer name");
                 ui.text_edit_singleline(&mut image.name)
                     .labelled_by(label.id);
@@ -419,8 +726,33 @@ pub fn image_controls(
                 }
             });
 
-            if ui.small_button("Remove").clicked() {
-                *remove_index = Some(index);
+            ui.horizontal(|ui| {
+                if active {
+                    let menu = ui.menu_button("Actions", |ui| {
+                        if let Some(action) = artwork_context_menu(ui, context) {
+                            interaction.menu_action = Some(action);
+                        }
+                    });
+                    let actions_label = format!("Actions for layer {}", image.name);
+                    menu.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            actions_label.clone(),
+                        )
+                    });
+                }
+                if ui
+                    .add_enabled(!image.locked, egui::Button::new("Remove"))
+                    .on_disabled_hover_text("Unlock this artwork to remove it")
+                    .clicked()
+                {
+                    interaction.remove = true;
+                }
+            });
+
+            if interaction.remove {
+                ui.ctx().request_repaint();
             }
 
             let rotation_label = ui.label("Layer rotation");
@@ -438,6 +770,7 @@ pub fn image_controls(
             }
         });
     });
+    interaction
 }
 
 pub fn px_slider<'a>(

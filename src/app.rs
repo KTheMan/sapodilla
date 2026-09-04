@@ -1562,6 +1562,192 @@ impl SapodillaApp {
         }
     }
 
+    fn apply_artwork_menu_action(&mut self, action: views::ArtworkMenuAction) {
+        let target_ids = action.image_ids.into_iter().collect::<BTreeSet<_>>();
+        if target_ids.is_empty() {
+            return;
+        }
+        let any_locked = self
+            .loaded_images
+            .iter()
+            .any(|image| target_ids.contains(&image.id) && image.locked);
+
+        match action.command {
+            views::ArtworkMenuCommand::Duplicate => {
+                let originals = self
+                    .loaded_images
+                    .iter()
+                    .filter(|image| target_ids.contains(&image.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut duplicate_ids = BTreeSet::new();
+                for mut duplicate in originals {
+                    duplicate.id = format!("image-{}", Uuid::new_v4());
+                    duplicate.name = format!("{} copy", duplicate.name);
+                    duplicate.offset += Vec2::splat(20.0);
+                    duplicate_ids.insert(duplicate.id.clone());
+                    self.loaded_images.push(duplicate);
+                }
+                self.selected_images = self
+                    .loaded_images
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, image)| duplicate_ids.contains(&image.id).then_some(index))
+                    .collect();
+            }
+            views::ArtworkMenuCommand::BringToFront if !any_locked => {
+                let (selected, mut remaining): (Vec<_>, Vec<_>) = self
+                    .loaded_images
+                    .drain(..)
+                    .partition(|image| target_ids.contains(&image.id));
+                remaining.extend(selected);
+                self.loaded_images = remaining;
+            }
+            views::ArtworkMenuCommand::SendToBack if !any_locked => {
+                let (mut selected, remaining): (Vec<_>, Vec<_>) = self
+                    .loaded_images
+                    .drain(..)
+                    .partition(|image| target_ids.contains(&image.id));
+                selected.extend(remaining);
+                self.loaded_images = selected;
+            }
+            views::ArtworkMenuCommand::BringForward if !any_locked => {
+                for index in (0..self.loaded_images.len().saturating_sub(1)).rev() {
+                    let current = target_ids.contains(&self.loaded_images[index].id);
+                    let next = target_ids.contains(&self.loaded_images[index + 1].id);
+                    if current && !next {
+                        self.loaded_images.swap(index, index + 1);
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::SendBackward if !any_locked => {
+                for index in 1..self.loaded_images.len() {
+                    let current = target_ids.contains(&self.loaded_images[index].id);
+                    let previous = target_ids.contains(&self.loaded_images[index - 1].id);
+                    if current && !previous {
+                        self.loaded_images.swap(index, index - 1);
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::RotateClockwise if !any_locked => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.rotation_degrees =
+                            (image.rotation_degrees + 270.0).rem_euclid(360.0) - 180.0;
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::RotateCounterclockwise if !any_locked => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.rotation_degrees =
+                            (image.rotation_degrees + 90.0).rem_euclid(360.0) - 180.0;
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::FlipHorizontal if !any_locked => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.flip_horizontal();
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::FlipVertical if !any_locked => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.flip_vertical();
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::SetVisible(visible) => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.visible = visible;
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::SetLocked(locked) => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.locked = locked;
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::SetCutting(cutting) => {
+                for image in &mut self.loaded_images {
+                    if target_ids.contains(&image.id) {
+                        image.enable_cutting = cutting;
+                    }
+                }
+            }
+            views::ArtworkMenuCommand::Remove if !any_locked => {
+                self.loaded_images
+                    .retain(|image| !target_ids.contains(&image.id));
+                for placeholder in &mut self.template_placeholders {
+                    if placeholder
+                        .assigned_image_id
+                        .as_ref()
+                        .is_some_and(|id| target_ids.contains(id))
+                    {
+                        placeholder.assigned_image_id = None;
+                    }
+                }
+                self.image_processing
+                    .retain(|image_id| !target_ids.contains(image_id));
+                self.selected_images.clear();
+            }
+            _ => return,
+        }
+
+        if !matches!(
+            action.command,
+            views::ArtworkMenuCommand::Duplicate | views::ArtworkMenuCommand::Remove
+        ) {
+            self.selected_images = self
+                .loaded_images
+                .iter()
+                .enumerate()
+                .filter_map(|(index, image)| target_ids.contains(&image.id).then_some(index))
+                .collect();
+        }
+        self.canvas_transform_gesture = None;
+        self.edit_cutlines = false;
+        self.selected_cut_path = None;
+        self.selected_cut_node = None;
+        self.synchronize_cut_geometry();
+
+        if matches!(action.command, views::ArtworkMenuCommand::Remove) {
+            for index in (0..self.cutline_owners.len()).rev() {
+                let remove = matches!(
+                    self.cutline_owners[index].as_ref(),
+                    Some(CutlineOwner::Image(image_id)) if target_ids.contains(image_id)
+                );
+                if remove {
+                    if index >= self.auto_cut_count {
+                        let manual_index = index - self.auto_cut_count;
+                        if manual_index < self.manual_cut_shapes.len() {
+                            self.manual_cut_shapes.remove(manual_index);
+                        }
+                    } else {
+                        self.auto_cut_count = self.auto_cut_count.saturating_sub(1);
+                    }
+                    if index < self.cut_shapes.len() {
+                        self.cut_shapes.remove(index);
+                    }
+                    if index < self.cut_modes.len() {
+                        self.cut_modes.remove(index);
+                    }
+                    self.cutline_owners.remove(index);
+                    if index < self.cutline_locked.len() {
+                        self.cutline_locked.remove(index);
+                    }
+                }
+            }
+        }
+        self.cut_preview_cache_key = None;
+        self.cut_validation_snapshot = None;
+    }
+
     fn add_library_to_sheet(&mut self, shuffle: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         let disk_paths = collect_library_paths(&self.library_folders);
@@ -3167,26 +3353,34 @@ impl SapodillaApp {
             let mut duplicate_clicked = false;
             let mut forward_clicked = false;
             let mut backward_clicked = false;
+            let artwork_id = image.id.clone();
+            let can_reorder = !image.locked;
             ui.horizontal(|ui| {
                 duplicate_clicked = ui.button("Duplicate").clicked();
-                forward_clicked = ui.button("Bring forward").clicked();
-                backward_clicked = ui.button("Send backward").clicked();
+                forward_clicked = ui
+                    .add_enabled(
+                        can_reorder && index + 1 < self.loaded_images.len(),
+                        egui::Button::new("Bring forward"),
+                    )
+                    .clicked();
+                backward_clicked = ui
+                    .add_enabled(can_reorder && index > 0, egui::Button::new("Send backward"))
+                    .clicked();
             });
-            let duplicate = duplicate_clicked.then(|| {
-                let mut duplicate = image.clone();
-                duplicate.id = format!("image-{}", Uuid::new_v4());
-                duplicate.offset += Vec2::splat(20.0);
-                duplicate
-            });
-            if let Some(duplicate) = duplicate {
-                self.loaded_images.push(duplicate);
-                self.selected_images = vec![self.loaded_images.len() - 1];
-            } else if forward_clicked && index + 1 < self.loaded_images.len() {
-                self.loaded_images.swap(index, index + 1);
-                self.selected_images = vec![index + 1];
-            } else if backward_clicked && index > 0 {
-                self.loaded_images.swap(index, index - 1);
-                self.selected_images = vec![index - 1];
+            let inspector_action = if duplicate_clicked {
+                Some(views::ArtworkMenuCommand::Duplicate)
+            } else if forward_clicked {
+                Some(views::ArtworkMenuCommand::BringForward)
+            } else if backward_clicked {
+                Some(views::ArtworkMenuCommand::SendBackward)
+            } else {
+                None
+            };
+            if let Some(command) = inspector_action {
+                self.apply_artwork_menu_action(views::ArtworkMenuAction {
+                    image_ids: vec![artwork_id],
+                    command,
+                });
             }
             if let Some((image_id, source_revision, source, adjustments)) = adjustment_request {
                 self.image_processing.insert(image_id.clone());
@@ -4539,15 +4733,19 @@ impl eframe::App for SapodillaApp {
 
                         if !self.loaded_images.is_empty() {
                             ui.separator();
-                            let layers_changed = views::loaded_images(
+                            let (layers_changed, artwork_action) = views::loaded_images(
                                 ui,
                                 DEVICES[self.selected_device].dpi,
                                 self.get_canvas().size,
                                 &mut self.loaded_images,
+                                &mut self.selected_images,
                                 DEVICES[self.selected_device].modes[self.selected_mode].mode_type,
                             );
                             if layers_changed {
-                                self.selected_images.clear();
+                                self.synchronize_cut_geometry();
+                            }
+                            if let Some(action) = artwork_action {
+                                self.apply_artwork_menu_action(action);
                             }
                             self.selection_inspector(ui);
                         }
@@ -4608,7 +4806,9 @@ impl eframe::App for SapodillaApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(workspace_fill).inner_margin(16.0))
             .show(ctx, |ui| {
-            views::canvas_editor(ui, self);
+            if let Some(action) = views::canvas_editor(ui, self) {
+                self.apply_artwork_menu_action(action);
+            }
             self.synchronize_cut_geometry();
 
             if self.loaded_images.is_empty() {

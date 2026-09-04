@@ -176,11 +176,12 @@ pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
     state.cut_preview_cache_key = Some(key);
 }
 
-pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
+pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuAction> {
     let scene = Scene::new().zoom_range(0.1..=3.0);
 
     let mut inner_rect = Rect::NAN;
     let mut canvas_rect = state.canvas_rect;
+    let mut artwork_action = None;
 
     let response = scene
         .show(ui, &mut canvas_rect, |ui| {
@@ -189,7 +190,7 @@ pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
                 .inner_margin(0.0)
                 .stroke(Stroke::new(4.0_f32, Color32::BLACK))
                 .show(ui, |ui| {
-                    frame(ui, state);
+                    artwork_action = frame(ui, state);
                 });
             inner_rect = ui.min_rect();
         })
@@ -206,9 +207,10 @@ pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
         state.previous_canvas_size = state.get_canvas().size;
         state.canvas_fit_requested = false;
     }
+    artwork_action
 }
 
-fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
+fn frame(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuAction> {
     let size = state.get_canvas().size;
 
     ui.set_min_size(size);
@@ -220,6 +222,40 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         Rect::from_min_size(Pos2::ZERO, response.rect.size()),
         response.rect,
     );
+
+    // Resolve the topmost hit before mutable painting. This makes a secondary
+    // click on an unselected object activate that object before its menu opens.
+    let secondary_target = if !state.edit_cutlines
+        && ui.input(|input| input.pointer.secondary_clicked())
+        && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        && let Some(index) =
+            state
+                .loaded_images
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, image)| {
+                    (image.visible
+                        && Rect::from_min_size(
+                            to_screen.transform_pos(image.visual_offset()),
+                            image.rotated_size(),
+                        )
+                        .contains(pointer))
+                    .then_some(index)
+                }) {
+        if !state.selected_images.contains(&index) {
+            state.selected_images = vec![index];
+        }
+        Some(index)
+    } else {
+        None
+    };
+    let menu_context = super::ArtworkMenuContext::new(
+        &state.loaded_images,
+        &state.selected_images,
+        DEVICES[state.selected_device].modes[state.selected_mode].mode_type,
+    );
+    let mut menu_action = None;
 
     let scene_scale = ui
         .ctx()
@@ -267,6 +303,17 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         let artwork_label = format!("Artwork: {}", image.name);
         rect_response
             .widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, artwork_label.clone()));
+        let mut popup = egui::Popup::context_menu(&rect_response);
+        if secondary_target == Some(idx) {
+            popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+        }
+        popup.show(|ui| {
+            if let Some(context) = menu_context.as_ref()
+                && let Some(action) = super::artwork_context_menu(ui, context)
+            {
+                menu_action = Some(action);
+            }
+        });
 
         if rect_response.clicked() {
             let command = ui.input(|i| i.modifiers.command || i.modifiers.shift);
@@ -353,6 +400,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         }
 
         if rect_response.hovered()
+            && !image.locked
             && ui.input_mut(|i| {
                 i.consume_shortcut(&DELETE_SHORTCUT) || i.consume_shortcut(&BACKSPACE_SHORTCUT)
             })
@@ -468,14 +516,15 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
     }
 
     if let Some(remove) = remove {
-        state.loaded_images.remove(remove);
-        state.selected_images.retain(|selected| *selected != remove);
-        for selected in &mut state.selected_images {
-            if *selected > remove {
-                *selected -= 1;
-            }
-        }
+        let context = super::ArtworkMenuContext::single(
+            &state.loaded_images[remove],
+            remove,
+            state.loaded_images.len(),
+            DEVICES[state.selected_device].modes[state.selected_mode].mode_type,
+        );
+        menu_action = Some(context.action(super::ArtworkMenuCommand::Remove));
     }
+    menu_action
 }
 
 fn transform_gesture_image_id(gesture: &TransformGesture) -> &str {
