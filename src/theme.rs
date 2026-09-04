@@ -432,11 +432,7 @@ pub fn toolbar_toggle(
             } else {
                 palette.surface
             };
-            visuals.widgets.inactive.bg_stroke = if is_selected {
-                stroke(1.0, palette.border)
-            } else {
-                stroke(1.0, palette.border)
-            };
+            visuals.widgets.inactive.bg_stroke = stroke(1.0, palette.border);
             visuals.widgets.hovered.bg_fill = if is_selected {
                 mix(palette.accent_soft, palette.surface_hover, 0.35)
             } else {

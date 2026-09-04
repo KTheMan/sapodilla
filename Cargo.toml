@@ -92,6 +92,9 @@ wasm_thread = { version = "0.3.3", optional = true }
 wasm-bindgen-futures = "0.4.50"
 wasm-tracing = "2.1.0"
 
+[dev-dependencies]
+egui_kittest = { version = "=0.33.3", default-features = false, features = ["eframe"] }
+
 [profile.release]
 opt-level = 2
 

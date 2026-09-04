@@ -47,6 +47,9 @@ pub struct SavedImage {
     pub cutting_enabled: bool,
     pub locked: bool,
     pub visible: bool,
+    /// Preferred replacement behavior if this artwork becomes a template slot.
+    #[serde(default)]
+    pub template_fit: PlaceholderFit,
 }
 
 impl SavedImage {
@@ -71,6 +74,7 @@ impl SavedImage {
             cutting_enabled,
             locked,
             visible,
+            template_fit: PlaceholderFit::Cover,
         }
     }
 
@@ -465,12 +469,8 @@ impl StudioDocument {
         Ok(())
     }
 
-    pub fn extension(kind: DocumentKind) -> &'static str {
-        match kind {
-            DocumentKind::Sticker => "stix",
-            DocumentKind::Sheet => "stixcut",
-            DocumentKind::Template => "stixtpl",
-        }
+    pub const fn extension() -> &'static str {
+        "sapodilla"
     }
 }
 
@@ -1802,6 +1802,7 @@ mod tests {
             false,
             true,
         ));
+        document.images[0].template_fit = PlaceholderFit::Stretch;
         document.ensure_object_ids();
         assert_eq!(
             StudioDocument::from_json(&document.to_json().unwrap()).unwrap(),
@@ -1818,15 +1819,34 @@ mod tests {
     }
 
     #[test]
+    fn sapodilla_document_kinds_share_one_versioned_project_format() {
+        assert_eq!(StudioDocument::extension(), "sapodilla");
+        for kind in [
+            DocumentKind::Sticker,
+            DocumentKind::Sheet,
+            DocumentKind::Template,
+        ] {
+            let document = StudioDocument::new(kind, Vec2::new(10.0, 20.0), [1, 2, 3]);
+            let encoded = document.to_json().unwrap();
+            let decoded = StudioDocument::from_json(&encoded).unwrap();
+            assert_eq!(decoded, document);
+        }
+    }
+
+    #[test]
     fn legacy_documents_default_new_relationship_fields() {
         let legacy = br#"{
             "version":1,"kind":"sheet","canvas_size":[10.0,20.0],
-            "background":[255,255,255],"images":[],"cut_paths":[],
+            "background":[255,255,255],"images":[{
+                "name":"legacy","png":"","offset":[0.0,0.0],"scale":[1.0,1.0],
+                "rotation_degrees":0.0,"cutting_enabled":true,"locked":false,"visible":true
+            }],"cut_paths":[],
             "material":{"name":"Vinyl","blade_pressure":10,"passes":1,"speed":5}
         }"#;
         let document = StudioDocument::from_json(legacy).unwrap();
         assert!(document.cutline_metadata.is_empty());
         assert!(document.template_placeholders.is_empty());
+        assert_eq!(document.images[0].template_fit, PlaceholderFit::Cover);
     }
 
     #[test]

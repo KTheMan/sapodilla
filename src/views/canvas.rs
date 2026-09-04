@@ -5,7 +5,7 @@ use std::{
 
 use egui::{
     Align2, Color32, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut, Modifiers, Painter,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, Ui, Vec2,
+    Pos2, Rect, Scene, Sense, Shape, Stroke, Ui, Vec2, WidgetInfo, WidgetType,
     emath::{self, RectTransform},
 };
 use geo::LineString;
@@ -25,7 +25,7 @@ const MIN_GRID_SCREEN_SPACING: f32 = 24.0;
 const MAX_GRID_LINES_PER_AXIS: usize = 512;
 const RULER_SIZE: f32 = 24.0;
 const TRANSFORM_HANDLE_SIZE: f32 = 9.0;
-const TRANSFORM_HIT_SIZE: f32 = 26.0;
+const TRANSFORM_HIT_SIZE: f32 = 32.0;
 const ROTATION_HANDLE_OFFSET: f32 = 32.0;
 const CORNER_ROTATION_ZONE_OFFSET: f32 = 30.0;
 const MIN_IMAGE_SIZE: f32 = 1.0;
@@ -194,12 +194,17 @@ pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
             inner_rect = ui.min_rect();
         })
         .response;
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Panel, true, "Artwork canvas"));
 
     state.canvas_rect = canvas_rect;
 
-    if response.double_clicked() || state.previous_canvas_size != state.get_canvas().size {
+    if response.double_clicked()
+        || state.canvas_fit_requested
+        || state.previous_canvas_size != state.get_canvas().size
+    {
         state.canvas_rect = inner_rect.shrink(ui.style().spacing.menu_spacing);
         state.previous_canvas_size = state.get_canvas().size;
+        state.canvas_fit_requested = false;
     }
 }
 
@@ -256,9 +261,12 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
         let sense = if state.edit_cutlines {
             Sense::hover()
         } else {
-            Sense::drag()
+            Sense::click_and_drag()
         };
         let rect_response = ui.interact(image_rect, rect_id, sense);
+        let artwork_label = format!("Artwork: {}", image.name);
+        rect_response
+            .widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, artwork_label.clone()));
 
         if rect_response.clicked() {
             let command = ui.input(|i| i.modifiers.command || i.modifiers.shift);
