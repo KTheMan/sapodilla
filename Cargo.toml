@@ -25,6 +25,7 @@ eframe = { version = "0.33.3", default-features = false, features = [
     "persistence",
 ] }
 egui = "0.33.3"
+egui-phosphor = { version = "0.11.0", default-features = false, features = ["regular"] }
 egui_dnd = "0.14.0"
 egui_extras = { version = "0.33.3", features = ["image", "syntect"] }
 enum_dispatch = "0.3.13"

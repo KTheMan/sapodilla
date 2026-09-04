@@ -553,6 +553,7 @@ fn normalize_new_artwork(image: &mut LoadedImage, canvas: &CanvasSize) {
 
 impl SapodillaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::icons::install(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::channel();
@@ -3061,7 +3062,14 @@ impl SapodillaApp {
         let canvas = self.get_canvas().size;
         ui.label("Align to sheet");
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Left").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_LEFT,
+                "Align artwork left",
+                "Align selected artwork to the left edge of the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3070,7 +3078,14 @@ impl SapodillaApp {
                     );
                 }
             }
-            if ui.small_button("Center X").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_CENTER_HORIZONTAL,
+                "Center artwork horizontally",
+                "Center selected artwork horizontally on the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3079,7 +3094,14 @@ impl SapodillaApp {
                     );
                 }
             }
-            if ui.small_button("Right").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_RIGHT,
+                "Align artwork right",
+                "Align selected artwork to the right edge of the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3088,7 +3110,14 @@ impl SapodillaApp {
                     );
                 }
             }
-            if ui.small_button("Top").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_TOP,
+                "Align artwork top",
+                "Align selected artwork to the top edge of the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3097,7 +3126,14 @@ impl SapodillaApp {
                     );
                 }
             }
-            if ui.small_button("Middle").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_CENTER_VERTICAL,
+                "Center artwork vertically",
+                "Center selected artwork vertically on the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3106,7 +3142,14 @@ impl SapodillaApp {
                     );
                 }
             }
-            if ui.small_button("Bottom").clicked() {
+            if theme::icon_button(
+                ui,
+                crate::icons::ALIGN_BOTTOM,
+                "Align artwork bottom",
+                "Align selected artwork to the bottom edge of the sheet",
+            )
+            .clicked()
+            {
                 for &index in &self.selected_images {
                     align_image_to_sheet(
                         &mut self.loaded_images[index],
@@ -3261,6 +3304,87 @@ impl SapodillaApp {
                 let label = ui.label("Selected artwork name");
                 ui.text_edit_singleline(&mut image.name)
                     .labelled_by(label.id);
+            });
+            ui.label("Position and size");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.x = 72.0;
+                let x_label = ui.monospace("X:");
+                ui.add(views::px_slider(
+                    &mut image.offset.x,
+                    DEVICES[self.selected_device].dpi,
+                    (-image.sized_texture.size.x * 2.0)
+                        ..=(canvas.x + image.sized_texture.size.x * 2.0),
+                ))
+                .labelled_by(x_label.id);
+                let y_label = ui.monospace("Y:");
+                ui.add(views::px_slider(
+                    &mut image.offset.y,
+                    DEVICES[self.selected_device].dpi,
+                    (-image.sized_texture.size.y * 2.0)
+                        ..=(canvas.y + image.sized_texture.size.y * 2.0),
+                ))
+                .labelled_by(y_label.id);
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.x = 72.0;
+                let width_label = ui.monospace("W:");
+                let mut width = image.size().x;
+                ui.add(views::px_slider(
+                    &mut width,
+                    DEVICES[self.selected_device].dpi,
+                    1.0..=(canvas.x * 10.0),
+                ))
+                .labelled_by(width_label.id);
+                if width != image.size().x {
+                    let new_scale = if image.scale_locked {
+                        width / image.size().x * image.scale
+                    } else {
+                        Vec2 {
+                            x: width / image.size().x * image.scale.x,
+                            ..image.scale
+                        }
+                    };
+                    image.rescale(new_scale);
+                }
+                let proportions_label = if image.scale_locked {
+                    "Unlock artwork proportions"
+                } else {
+                    "Lock artwork proportions"
+                };
+                if theme::icon_toggle(
+                    ui,
+                    if image.scale_locked {
+                        crate::icons::LINK
+                    } else {
+                        crate::icons::LINK_BREAK
+                    },
+                    image.scale_locked,
+                    proportions_label,
+                    proportions_label,
+                )
+                .clicked()
+                {
+                    image.scale_locked = !image.scale_locked;
+                }
+                let height_label = ui.monospace("H:");
+                let mut height = image.size().y;
+                ui.add(views::px_slider(
+                    &mut height,
+                    DEVICES[self.selected_device].dpi,
+                    1.0..=(canvas.y * 10.0),
+                ))
+                .labelled_by(height_label.id);
+                if height != image.size().y {
+                    let new_scale = if image.scale_locked {
+                        height / image.size().y * image.scale
+                    } else {
+                        Vec2 {
+                            y: height / image.size().y * image.scale.y,
+                            ..image.scale
+                        }
+                    };
+                    image.rescale(new_scale);
+                }
             });
             ui.add(
                 egui::Slider::new(&mut image.rotation_degrees, -180.0..=180.0)
@@ -3955,13 +4079,28 @@ impl eframe::App for SapodillaApp {
             .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
             .show_animated(ctx, self.show_library_panel, |ui| {
                 theme::panel_title(ui, accent, "Assets", "Library");
-                if theme::secondary_button(ui, accent, "Import artwork…").clicked() {
+                if theme::secondary_icon_text_button(
+                    ui,
+                    accent,
+                    crate::icons::UPLOAD,
+                    "Import artwork…",
+                    "Import PNG or JPEG artwork into the Library",
+                )
+                .clicked()
+                {
                     self.import_library_images(ctx);
                 }
                 theme::muted(ui, "Add artwork once, then reuse it across sheets.");
                 ui.add_space(6.0);
                 #[cfg(not(target_arch = "wasm32"))]
-                if ui.button("Import folder…").clicked() {
+                if theme::icon_text_button(
+                    ui,
+                    crate::icons::FOLDER_PLUS,
+                    "Import folder…",
+                    "Add a watched artwork folder",
+                )
+                .clicked()
+                {
                     self.import_library_folder(ctx);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
@@ -3976,7 +4115,14 @@ impl eframe::App for SapodillaApp {
                                 }
                             });
                         }
-                        if ui.button("Rescan folders").clicked() {
+                        if theme::icon_text_button(
+                            ui,
+                            crate::icons::ARROWS_CLOCKWISE,
+                            "Rescan folders",
+                            "Rescan watched artwork folders",
+                        )
+                        .clicked()
+                        {
                             self.reset_library_cycle();
                             self.library_page = 0;
                             (self.library_disk_paths, self.library_has_more) = scan_library_page(
@@ -4048,7 +4194,15 @@ impl eframe::App for SapodillaApp {
                                             asset.image.width(),
                                             asset.image.height()
                                         ));
-                                        if ui.small_button("Remove").clicked() {
+                                        if theme::icon_text_button_named(
+                                            ui,
+                                            crate::icons::TRASH,
+                                            "Remove",
+                                            format!("Remove {} from Library", asset.name),
+                                            format!("Remove {} from the Library", asset.name),
+                                        )
+                                        .clicked()
+                                        {
                                             remove = Some(index);
                                         }
                                     });
@@ -4088,7 +4242,15 @@ impl eframe::App for SapodillaApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(self.library_page > 0, egui::Button::new("Previous"))
+                        .add_enabled_ui(self.library_page > 0, |ui| {
+                            theme::icon_button(
+                                ui,
+                                crate::icons::CARET_LEFT,
+                                "Previous Library page",
+                                "Show the previous Library page",
+                            )
+                        })
+                        .inner
                         .clicked()
                     {
                         self.library_page -= 1;
@@ -4100,7 +4262,15 @@ impl eframe::App for SapodillaApp {
                     }
                     ui.label(format!("Page {}", self.library_page + 1));
                     if ui
-                        .add_enabled(self.library_has_more, egui::Button::new("Next"))
+                        .add_enabled_ui(self.library_has_more, |ui| {
+                            theme::icon_button(
+                                ui,
+                                crate::icons::CARET_RIGHT,
+                                "Next Library page",
+                                "Show the next Library page",
+                            )
+                        })
+                        .inner
                         .clicked()
                     {
                         self.library_page += 1;
@@ -4113,10 +4283,24 @@ impl eframe::App for SapodillaApp {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Fill sheet").clicked() {
+                    if theme::icon_text_button(
+                        ui,
+                        crate::icons::GRID_NINE,
+                        "Fill sheet",
+                        "Fill the sheet with Library artwork",
+                    )
+                    .clicked()
+                    {
                         self.add_library_to_sheet(false);
                     }
-                    if ui.button("Shuffle fill").clicked() {
+                    if theme::icon_text_button(
+                        ui,
+                        crate::icons::SHUFFLE,
+                        "Shuffle fill",
+                        "Shuffle Library artwork while filling the sheet",
+                    )
+                    .clicked()
+                    {
                         self.add_library_to_sheet(true);
                     }
                 });
@@ -4735,8 +4919,6 @@ impl eframe::App for SapodillaApp {
                             ui.separator();
                             let (layers_changed, artwork_action) = views::loaded_images(
                                 ui,
-                                DEVICES[self.selected_device].dpi,
-                                self.get_canvas().size,
                                 &mut self.loaded_images,
                                 &mut self.selected_images,
                                 DEVICES[self.selected_device].modes[self.selected_mode].mode_type,

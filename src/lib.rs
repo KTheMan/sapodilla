@@ -2,6 +2,7 @@ mod app;
 pub mod background_ml;
 mod cut;
 pub mod export;
+mod icons;
 pub mod jobs;
 pub mod path_edit;
 mod protocol;

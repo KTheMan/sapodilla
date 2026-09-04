@@ -396,6 +396,116 @@ pub fn secondary_button_enabled(
     .inner
 }
 
+/// A text button with a leading icon from the shared Phosphor family.
+///
+/// The explicit widget metadata keeps the private-use icon glyph out of the
+/// accessibility name while preserving a single, comfortably sized target.
+pub fn icon_text_button(
+    ui: &mut Ui,
+    icon: &str,
+    label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let label = label.into();
+    icon_text_button_named(ui, icon, label.clone(), label, tooltip)
+}
+
+pub fn icon_text_button_named(
+    ui: &mut Ui,
+    icon: &str,
+    label: impl Into<String>,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let label = label.into();
+    let accessible_label = accessible_label.into();
+    let response = ui.add(
+        egui::Button::new(RichText::new(format!("{icon}  {label}")).size(14.0))
+            .corner_radius(CornerRadius::same(8))
+            .min_size(egui::vec2(0.0, 32.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip.into())
+}
+
+pub fn secondary_icon_text_button(
+    ui: &mut Ui,
+    accent: Color32,
+    icon: &str,
+    label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let palette = Palette::for_accent(ui.visuals().dark_mode, accent);
+    let label = label.into();
+    let tooltip = tooltip.into();
+    ui.scope(|ui| {
+        let visuals = &mut ui.style_mut().visuals;
+        visuals.widgets.inactive.bg_fill = palette.surface;
+        visuals.widgets.inactive.bg_stroke = stroke(1.0, palette.border);
+        visuals.widgets.hovered.bg_fill = palette.accent_soft;
+        visuals.widgets.hovered.bg_stroke = stroke(1.5, palette.focus);
+        visuals.widgets.active.bg_fill = palette.accent_soft;
+        visuals.widgets.active.bg_stroke = stroke(2.0, palette.focus);
+        icon_text_button(ui, icon, label, tooltip).on_hover_cursor(egui::CursorIcon::PointingHand)
+    })
+    .inner
+}
+
+/// A conventional icon-only action with a full semantic name and tooltip.
+pub fn icon_button(
+    ui: &mut Ui,
+    icon: &str,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let accessible_label = accessible_label.into();
+    let response = ui.add(
+        egui::Button::new(RichText::new(icon).size(17.0))
+            .corner_radius(CornerRadius::same(7))
+            .min_size(egui::vec2(32.0, 32.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip.into())
+}
+
+/// An icon-only toggle that exposes its selected state independently of color.
+pub fn icon_toggle(
+    ui: &mut Ui,
+    icon: &str,
+    selected: bool,
+    accessible_label: impl Into<String>,
+    tooltip: impl Into<String>,
+) -> egui::Response {
+    let accessible_label = accessible_label.into();
+    let response = ui.add(
+        egui::Button::new(RichText::new(icon).size(17.0))
+            .selected(selected)
+            .corner_radius(CornerRadius::same(7))
+            .min_size(egui::vec2(32.0, 32.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            accessible_label.clone(),
+        )
+    });
+    response.on_hover_text(tooltip.into())
+}
+
 pub fn danger_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     let palette = Palette::for_dark_mode(ui.visuals().dark_mode);
     let on_danger = readable_foreground(DANGER);
