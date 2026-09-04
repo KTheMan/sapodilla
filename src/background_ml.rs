@@ -1,3 +1,5 @@
+#[cfg(all(feature = "background-ml", not(target_arch = "wasm32")))]
+use std::sync::{Mutex, OnceLock};
 use std::{
     fs::File,
     io::Read,
@@ -134,6 +136,38 @@ impl SegmentationBackend for OrtBiRefNetBackend {
     }
 }
 
+/// Run inference through a process-wide session cache. Building and optimizing
+/// the nearly-gigabyte BiRefNet model dominates repeated background-removal
+/// actions, while ONNX Runtime sessions are explicitly designed for reuse.
+#[cfg(all(feature = "background-ml", not(target_arch = "wasm32")))]
+pub fn remove_background_with_cached_model(
+    image: &RgbaImage,
+    model_path: &Path,
+) -> anyhow::Result<RgbaImage> {
+    static BACKEND: OnceLock<Mutex<Option<OrtBiRefNetBackend>>> = OnceLock::new();
+
+    let model = inspect_model_file(model_path)?;
+    let mut cached = BACKEND
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("background model cache lock was poisoned"))?;
+    if cached
+        .as_ref()
+        .is_none_or(|backend| backend.model_path() != model.path)
+    {
+        // Drop a previously selected near-gigabyte session before loading the
+        // replacement so changing models does not temporarily double memory.
+        *cached = None;
+        *cached = Some(OrtBiRefNetBackend::new(&model.path)?);
+    }
+    remove_background(
+        image,
+        cached
+            .as_mut()
+            .expect("background model cache was initialized"),
+    )
+}
+
 /// Run the complete BiRefNet image pipeline using a local inference backend.
 pub fn remove_background(
     image: &RgbaImage,
@@ -185,18 +219,16 @@ pub fn apply_logits(
     {
         bail!("invalid background model output dimensions");
     }
-    let probabilities = logits
-        .iter()
-        .map(|value| 1.0 / (1.0 + (-value).exp()))
-        .collect::<Vec<_>>();
-    let minimum = probabilities.iter().copied().fold(f32::INFINITY, f32::min);
-    let maximum = probabilities
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let minimum_logit = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    let maximum_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+    // Sigmoid is monotonic, so its extrema can be derived without retaining a
+    // second 4 MiB probability image for the 1024x1024 production mask.
+    let minimum = sigmoid(minimum_logit);
+    let maximum = sigmoid(maximum_logit);
     let range = maximum - minimum;
     let mask = GrayImage::from_fn(mask_width as u32, mask_height as u32, |x, y| {
-        let value = probabilities[y as usize * mask_width + x as usize];
+        let value = sigmoid(logits[y as usize * mask_width + x as usize]);
         let normalized = if range <= f32::EPSILON {
             0.0
         } else {

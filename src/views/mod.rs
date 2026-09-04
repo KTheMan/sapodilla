@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub use canvas::canvas_editor;
+pub(crate) use canvas::synchronize_cut_preview;
 
 mod canvas;
 pub(crate) use canvas::TransformGesture;

@@ -4,8 +4,6 @@
 //! document interchange, background removal, and cut preparation as ordinary
 //! Rust makes the same behavior available to the native and WebAssembly apps.
 
-use std::collections::VecDeque;
-
 use crate::toolpath::CutMode;
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -512,17 +510,47 @@ pub struct ImageAdjustments {
 
 /// Apply non-destructive-preview style color controls to an RGBA image.
 pub fn adjust_image(image: &RgbaImage, adjustment: ImageAdjustments) -> RgbaImage {
-    let mut output = image::imageops::brighten(image, adjustment.brightness);
-    output = image::imageops::contrast(&output, adjustment.contrast);
-    output = image::imageops::huerotate(&output, adjustment.hue_degrees);
-    if adjustment.saturation.abs() > f32::EPSILON {
-        let factor = (1.0 + adjustment.saturation / 100.0).max(0.0);
-        for pixel in output.pixels_mut() {
+    let mut output = image.clone();
+    let contrast = ((100.0 + adjustment.contrast) / 100.0).powi(2);
+    let angle = f64::from(adjustment.hue_degrees).to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let hue_matrix = [
+        0.213 + cos * 0.787 - sin * 0.213,
+        0.715 - cos * 0.715 - sin * 0.715,
+        0.072 - cos * 0.072 + sin * 0.928,
+        0.213 - cos * 0.213 + sin * 0.143,
+        0.715 + cos * 0.285 + sin * 0.140,
+        0.072 - cos * 0.072 - sin * 0.283,
+        0.213 - cos * 0.213 - sin * 0.787,
+        0.715 - cos * 0.715 + sin * 0.715,
+        0.072 + cos * 0.928 + sin * 0.072,
+    ];
+    let saturation = (1.0 + adjustment.saturation / 100.0).max(0.0);
+
+    for pixel in output.pixels_mut() {
+        for channel in &mut pixel.0[..3] {
+            *channel = (i32::from(*channel) + adjustment.brightness).clamp(0, 255) as u8;
+        }
+        for channel in &mut pixel.0 {
+            let value = ((f32::from(*channel) / 255.0 - 0.5) * contrast + 0.5) * 255.0;
+            *channel = value.clamp(0.0, 255.0) as u8;
+        }
+        let [red, green, blue, _] = pixel.0;
+        let red = f64::from(red);
+        let green = f64::from(green);
+        let blue = f64::from(blue);
+        pixel[0] = (hue_matrix[0] * red + hue_matrix[1] * green + hue_matrix[2] * blue)
+            .clamp(0.0, 255.0) as u8;
+        pixel[1] = (hue_matrix[3] * red + hue_matrix[4] * green + hue_matrix[5] * blue)
+            .clamp(0.0, 255.0) as u8;
+        pixel[2] = (hue_matrix[6] * red + hue_matrix[7] * green + hue_matrix[8] * blue)
+            .clamp(0.0, 255.0) as u8;
+        if adjustment.saturation.abs() > f32::EPSILON {
             let luminance = 0.2126 * f32::from(pixel[0])
                 + 0.7152 * f32::from(pixel[1])
                 + 0.0722 * f32::from(pixel[2]);
             for channel in &mut pixel.0[..3] {
-                *channel = (luminance + (f32::from(*channel) - luminance) * factor)
+                *channel = (luminance + (f32::from(*channel) - luminance) * saturation)
                     .clamp(0.0, 255.0) as u8;
             }
         }
@@ -683,18 +711,9 @@ pub fn auto_pack(
     let mut packed = Vec::new();
 
     for item in sorted {
-        let orientations = if allow_rotation && item.size.x != item.size.y {
-            [
-                (item.size, false),
-                (Vec2::new(item.size.y, item.size.x), true),
-            ]
-        } else {
-            [(item.size, false), (item.size, false)]
-        };
-
         let mut best: Option<(usize, Vec2, bool, f32, f32)> = None;
         for (rect_index, rect) in free.iter().copied().enumerate() {
-            for (size, rotated) in orientations {
+            let mut consider = |size: Vec2, rotated: bool| {
                 let inflated = size + Vec2::splat(gap);
                 if inflated.x <= rect.w && inflated.y <= rect.h {
                     let leftover_x = rect.w - inflated.x;
@@ -705,6 +724,10 @@ pub fn auto_pack(
                         best = Some((rect_index, size, rotated, short, long));
                     }
                 }
+            };
+            consider(item.size, false);
+            if allow_rotation && item.size.x != item.size.y {
+                consider(Vec2::new(item.size.y, item.size.x), true);
             }
         }
         let Some((rect_index, size, rotated, _, _)) = best else {
@@ -803,55 +826,65 @@ pub fn remove_background(image: &RgbaImage, tolerance: u16, feather: u16) -> Rgb
         (corners.iter().map(|p| u32::from(p[1])).sum::<u32>() / 4) as u8,
         (corners.iter().map(|p| u32::from(p[2])).sum::<u32>() / 4) as u8,
     ];
-    let distance = |p: &Rgba<u8>| -> u16 {
+    let distance_squared = |p: &[u8]| -> u32 {
         let dr = i32::from(p[0]) - i32::from(background[0]);
         let dg = i32::from(p[1]) - i32::from(background[1]);
         let db = i32::from(p[2]) - i32::from(background[2]);
-        ((dr * dr + dg * dg + db * db) as f32).sqrt() as u16
+        (dr * dr + dg * dg + db * db) as u32
     };
 
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let mut visited = vec![false; width * height];
-    let mut queue = VecDeque::new();
+    // 0 = unseen, 1 = connected background, 2 = examined foreground. Marking
+    // rejected pixels avoids retrying the same boundary from every neighbour.
+    let mut state = vec![0u8; width * height];
+    let mut queue = Vec::with_capacity(width.saturating_mul(2) + height.saturating_mul(2));
+    let limit = tolerance.saturating_add(feather);
+    // The old test was `floor(sqrt(distance_squared)) <= limit`. Keeping the
+    // strict squared comparison preserves that boundary without a sqrt in the
+    // flood-fill hot loop.
+    let squared_limit = u32::from(limit).saturating_add(1).pow(2);
+    let enqueue = |index: usize, state: &mut [u8], queue: &mut Vec<usize>| {
+        if state[index] != 0 {
+            return;
+        }
+        if distance_squared(&image.as_raw()[index * 4..index * 4 + 4]) < squared_limit {
+            state[index] = 1;
+            queue.push(index);
+        } else {
+            state[index] = 2;
+        }
+    };
     for x in 0..image.width() {
-        queue.push_back((x, 0));
-        queue.push_back((x, image.height() - 1));
+        enqueue(x as usize, &mut state, &mut queue);
+        enqueue((height - 1) * width + x as usize, &mut state, &mut queue);
     }
     for y in 0..image.height() {
-        queue.push_back((0, y));
-        queue.push_back((image.width() - 1, y));
+        enqueue(y as usize * width, &mut state, &mut queue);
+        enqueue(y as usize * width + width - 1, &mut state, &mut queue);
     }
 
-    let limit = tolerance.saturating_add(feather);
-    while let Some((x, y)) = queue.pop_front() {
-        let index = y as usize * width + x as usize;
-        if visited[index] || distance(image.get_pixel(x, y)) > limit {
-            continue;
-        }
-        visited[index] = true;
+    while let Some(index) = queue.pop() {
+        let x = index % width;
+        let y = index / width;
         if x > 0 {
-            queue.push_back((x - 1, y));
+            enqueue(index - 1, &mut state, &mut queue);
         }
-        if x + 1 < image.width() {
-            queue.push_back((x + 1, y));
+        if x + 1 < width {
+            enqueue(index + 1, &mut state, &mut queue);
         }
         if y > 0 {
-            queue.push_back((x, y - 1));
+            enqueue(index - width, &mut state, &mut queue);
         }
-        if y + 1 < image.height() {
-            queue.push_back((x, y + 1));
+        if y + 1 < height {
+            enqueue(index + width, &mut state, &mut queue);
         }
     }
 
     let mut result = image.clone();
-    for y in 0..image.height() {
-        for x in 0..image.width() {
-            if !visited[y as usize * width + x as usize] {
-                continue;
-            }
-            let pixel = result.get_pixel_mut(x, y);
-            let d = distance(pixel);
+    for (index, pixel) in result.pixels_mut().enumerate() {
+        if state[index] == 1 {
+            let d = (distance_squared(&pixel.0) as f32).sqrt() as u16;
             pixel[3] = if d <= tolerance || feather == 0 {
                 0
             } else {
@@ -2067,5 +2100,189 @@ mod tests {
         let segments = perf_cut(&path, 5.0, 5.0);
         assert_eq!(segments.len(), 3);
         assert!((segments.iter().map(|p| p.0[1].x - p.0[0].x).sum::<f32>() - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn image_adjustments_match_the_previous_multi_buffer_pipeline() {
+        let image = RgbaImage::from_fn(19, 17, |x, y| {
+            Rgba([
+                (x * 13 + y * 7) as u8,
+                (x * 3 + y * 17) as u8,
+                (x * 11 + y * 5) as u8,
+                (x * 9 + y * 5) as u8,
+            ])
+        });
+        for adjustment in [
+            ImageAdjustments::default(),
+            ImageAdjustments {
+                brightness: 12,
+                contrast: 18.0,
+                saturation: 24.0,
+                hue_degrees: 17,
+            },
+            ImageAdjustments {
+                brightness: -40,
+                contrast: -35.0,
+                saturation: -100.0,
+                hue_degrees: -90,
+            },
+        ] {
+            let mut expected = image::imageops::brighten(&image, adjustment.brightness);
+            expected = image::imageops::contrast(&expected, adjustment.contrast);
+            expected = image::imageops::huerotate(&expected, adjustment.hue_degrees);
+            if adjustment.saturation.abs() > f32::EPSILON {
+                let factor = (1.0 + adjustment.saturation / 100.0).max(0.0);
+                for pixel in expected.pixels_mut() {
+                    let luminance = 0.2126 * f32::from(pixel[0])
+                        + 0.7152 * f32::from(pixel[1])
+                        + 0.0722 * f32::from(pixel[2]);
+                    for channel in &mut pixel.0[..3] {
+                        *channel = (luminance + (f32::from(*channel) - luminance) * factor)
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+            assert_eq!(adjust_image(&image, adjustment), expected);
+        }
+    }
+
+    #[test]
+    fn optimized_background_removal_is_pixel_exact() {
+        use std::collections::VecDeque;
+
+        fn reference(image: &RgbaImage, tolerance: u16, feather: u16) -> RgbaImage {
+            if image.width() == 0 || image.height() == 0 {
+                return image.clone();
+            }
+            let corners = [
+                image.get_pixel(0, 0),
+                image.get_pixel(image.width() - 1, 0),
+                image.get_pixel(0, image.height() - 1),
+                image.get_pixel(image.width() - 1, image.height() - 1),
+            ];
+            let background = [
+                (corners.iter().map(|p| u32::from(p[0])).sum::<u32>() / 4) as u8,
+                (corners.iter().map(|p| u32::from(p[1])).sum::<u32>() / 4) as u8,
+                (corners.iter().map(|p| u32::from(p[2])).sum::<u32>() / 4) as u8,
+            ];
+            let distance = |p: &Rgba<u8>| {
+                let dr = i32::from(p[0]) - i32::from(background[0]);
+                let dg = i32::from(p[1]) - i32::from(background[1]);
+                let db = i32::from(p[2]) - i32::from(background[2]);
+                ((dr * dr + dg * dg + db * db) as f32).sqrt() as u16
+            };
+            let width = image.width() as usize;
+            let mut visited = vec![false; width * image.height() as usize];
+            let mut queue = VecDeque::new();
+            for x in 0..image.width() {
+                queue.push_back((x, 0));
+                queue.push_back((x, image.height() - 1));
+            }
+            for y in 0..image.height() {
+                queue.push_back((0, y));
+                queue.push_back((image.width() - 1, y));
+            }
+            let limit = tolerance.saturating_add(feather);
+            while let Some((x, y)) = queue.pop_front() {
+                let index = y as usize * width + x as usize;
+                if visited[index] || distance(image.get_pixel(x, y)) > limit {
+                    continue;
+                }
+                visited[index] = true;
+                if x > 0 {
+                    queue.push_back((x - 1, y));
+                }
+                if x + 1 < image.width() {
+                    queue.push_back((x + 1, y));
+                }
+                if y > 0 {
+                    queue.push_back((x, y - 1));
+                }
+                if y + 1 < image.height() {
+                    queue.push_back((x, y + 1));
+                }
+            }
+            let mut result = image.clone();
+            for (index, pixel) in result.pixels_mut().enumerate() {
+                if visited[index] {
+                    let d = distance(pixel);
+                    pixel[3] = if d <= tolerance || feather == 0 {
+                        0
+                    } else {
+                        (((d - tolerance) as f32 / feather as f32) * f32::from(pixel[3])) as u8
+                    };
+                }
+            }
+            result
+        }
+
+        for (width, height) in [(1, 1), (1, 7), (7, 1), (17, 13)] {
+            let image = RgbaImage::from_fn(width, height, |x, y| {
+                Rgba([
+                    (x * 19 + y * 3) as u8,
+                    (x * 7 + y * 23) as u8,
+                    (x * 11 + y * 13) as u8,
+                    (80 + x * 5 + y * 7) as u8,
+                ])
+            });
+            for (tolerance, feather) in [(0, 0), (12, 0), (36, 12), (220, 80)] {
+                assert_eq!(
+                    remove_background(&image, tolerance, feather),
+                    reference(&image, tolerance, feather)
+                );
+            }
+        }
+    }
+
+    /// Repeatable, opt-in latency probe for the CPU-bound image tools. The
+    /// generated gradient/noise sample avoids checking a large binary fixture
+    /// into the repository while still exercising every color and alpha range.
+    #[test]
+    #[ignore = "performance probe; run with --release -- --ignored --nocapture"]
+    fn perf_sample_image_tools() {
+        use std::{hint::black_box, time::Instant};
+
+        let sample = RgbaImage::from_fn(2048, 2048, |x, y| {
+            let noise = x
+                .wrapping_mul(1_664_525)
+                .wrapping_add(y.wrapping_mul(1_013_904_223));
+            Rgba([
+                (x.wrapping_add(noise) & 255) as u8,
+                (y.wrapping_add(noise >> 8) & 255) as u8,
+                ((x ^ y).wrapping_add(noise >> 16) & 255) as u8,
+                if (x / 256 + y / 256) % 2 == 0 {
+                    255
+                } else {
+                    192
+                },
+            ])
+        });
+        let adjustments = ImageAdjustments {
+            brightness: 12,
+            contrast: 18.0,
+            saturation: 24.0,
+            hue_degrees: 17,
+        };
+
+        let started = Instant::now();
+        black_box(adjust_image(black_box(&sample), adjustments));
+        println!("adjust 2048x2048: {:?}", started.elapsed());
+
+        let edge_sample = RgbaImage::from_fn(2048, 2048, |x, y| {
+            let dx = x as i64 - 1024;
+            let dy = y as i64 - 1024;
+            if dx * dx + dy * dy < 700 * 700 {
+                Rgba([32, 120, 220, 255])
+            } else {
+                Rgba([248, 248, 246, 255])
+            }
+        });
+        let started = Instant::now();
+        black_box(remove_background(black_box(&edge_sample), 36, 12));
+        println!("edge background 2048x2048: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        black_box(rotate_image(black_box(&sample), 17.0));
+        println!("rotate 2048x2048: {:?}", started.elapsed());
     }
 }

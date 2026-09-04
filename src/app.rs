@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     io::Write,
     sync::mpsc,
 };
@@ -17,19 +18,19 @@ use uuid::Uuid;
 
 use crate::{
     Rc,
-    cut::{CutAction, CutGenerator, CutTuning, OvercutSettings, apply_overcut},
-    export::{cut_svg, jpeg_pdf, toolpath_debug_svg, toolpath_stats},
+    cut::{CutAction, CutGenerator, CutImage, CutTuning, OvercutSettings, apply_overcut},
+    export::{ToolpathStats, cut_svg, jpeg_pdf, toolpath_debug_svg},
     jobs::{JobQueue, JobSpec, JobStatus as QueueJobStatus, Printer as QueuePrinter},
     path_edit::{smooth_path, union_paths},
     protocol::*,
     shapes::{self, ProceduralShape},
-    spawn,
+    spawn, spawn_blocking,
     studio::{
         self, CutlineOwner, DocumentKind, DocumentSettings, ImageAdjustments, MaterialProfile,
         PackItem, PlaceholderFit, SavedImage, StudioDocument, TemplatePlaceholder,
     },
     theme,
-    toolpath::{CutMode, effective_cut_modes, plan_cut_phases},
+    toolpath::{CutMode, CutPhase, effective_cut_modes, plan_cut_phases},
     transports::*,
     views,
 };
@@ -76,6 +77,19 @@ pub enum Action {
         #[debug(skip)]
         result: anyhow::Result<image::RgbaImage>,
     },
+    ImageAdjusted {
+        image_id: String,
+        source_revision: u64,
+        adjustments: ImageAdjustments,
+        #[debug(skip)]
+        image: image::RgbaImage,
+    },
+    EdgeBackgroundRemoved {
+        image_id: String,
+        source_revision: u64,
+        #[debug(skip)]
+        image: image::RgbaImage,
+    },
     LoadedLibraryImages(#[debug(skip)] Vec<anyhow::Result<LoadedImage>>),
     #[cfg(not(target_arch = "wasm32"))]
     LoadedLibraryFolder {
@@ -95,6 +109,11 @@ pub enum Action {
         generation_id: u64,
         source_geometry: CutGeometrySnapshot,
         action: CutAction,
+    },
+    PrintPrepared {
+        capabilities: Vec<&'static str>,
+        #[debug(skip)]
+        job: PendingPrintJob,
     },
 }
 
@@ -178,6 +197,7 @@ pub struct SapodillaApp {
     pub active_queue_job: Option<u64>,
     pub active_queue_jobs: BTreeMap<String, u64>,
     pending_print_jobs: BTreeMap<u64, PendingPrintJob>,
+    print_preparing: bool,
     pub send_progress: Option<f32>,
 
     pub packets: VecDeque<AvocadoPacket>,
@@ -194,6 +214,9 @@ pub struct SapodillaApp {
     pub has_intersections: bool,
     pub off_canvas: bool,
     pub cut_progress: Option<(usize, usize)>,
+    pub(crate) cut_preview_cache_key: Option<u64>,
+    pub(crate) cut_preview_cache: Vec<CutPhase>,
+    pub(crate) cut_preview_stats: ToolpathStats,
 
     pub showing_packet_log: bool,
     pub showing_avocado_packet_debug: bool,
@@ -241,6 +264,7 @@ pub struct SapodillaApp {
     pub shape_height_mm: f32,
     pub background_model_path: Option<std::path::PathBuf>,
     pub background_ml_running: bool,
+    image_processing: BTreeSet<String>,
 
     pub error: Option<anyhow::Error>,
     confirm_new_sheet: bool,
@@ -348,7 +372,7 @@ pub struct LoadedImage {
 }
 
 #[derive(Clone)]
-struct PendingPrintJob {
+pub struct PendingPrintJob {
     encoded_image_len: usize,
     plt: Vec<u8>,
     packet_data: Vec<u8>,
@@ -358,6 +382,35 @@ struct PendingPrintJob {
     device_index: usize,
     mode_index: usize,
     canvas_index: usize,
+}
+
+#[derive(Clone)]
+struct RenderLayer {
+    image: image::RgbaImage,
+    size: Vec2,
+    rotation_degrees: f32,
+    visual_offset: Pos2,
+}
+
+#[derive(Clone)]
+struct RenderSnapshot {
+    canvas: Vec2,
+    background: [u8; 4],
+    layers: Vec<RenderLayer>,
+}
+
+impl RenderSnapshot {
+    fn render(&self) -> image::DynamicImage {
+        let mut buffer = image::ImageBuffer::from_pixel(
+            self.canvas.x as u32,
+            self.canvas.y as u32,
+            image::Rgba(self.background),
+        );
+        for layer in &self.layers {
+            composite_layer(&mut buffer, layer);
+        }
+        buffer.into()
+    }
 }
 
 impl LoadedImage {
@@ -560,6 +613,7 @@ impl SapodillaApp {
             active_queue_job: None,
             active_queue_jobs: BTreeMap::new(),
             pending_print_jobs: BTreeMap::new(),
+            print_preparing: false,
             send_progress: None,
 
             packets: Default::default(),
@@ -576,6 +630,9 @@ impl SapodillaApp {
             has_intersections: false,
             off_canvas: false,
             cut_progress: None,
+            cut_preview_cache_key: None,
+            cut_preview_cache: Vec::new(),
+            cut_preview_stats: ToolpathStats::default(),
 
             showing_packet_log: false,
             showing_avocado_packet_debug: false,
@@ -628,6 +685,7 @@ impl SapodillaApp {
                 .ok()
                 .filter(|path| crate::background_ml::inspect_model_file(path).is_ok()),
             background_ml_running: false,
+            image_processing: BTreeSet::new(),
 
             error: None,
             confirm_new_sheet: false,
@@ -899,8 +957,7 @@ impl SapodillaApp {
                     None => crate::background_ml::ensure_model_available()?,
                     Some(_) => crate::background_ml::ensure_model_available()?,
                 };
-                let mut backend = crate::background_ml::OrtBiRefNetBackend::new(&model_path)?;
-                crate::background_ml::remove_background(&image, &mut backend)
+                crate::background_ml::remove_background_with_cached_model(&image, &model_path)
             })();
             let _ = tx.send(Action::BackgroundRemoved { image_id, result });
         });
@@ -982,24 +1039,22 @@ impl SapodillaApp {
     }
 
     fn export_png(&self) {
-        let image = self.render_image();
-        let mut bytes = Vec::new();
-        if let Err(error) = image::codecs::png::PngEncoder::new(&mut bytes).write_image(
-            image.to_rgba8().as_bytes(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgba8,
-        ) {
-            self.tx.send(Action::Error(error.into())).ok();
-            return;
-        }
-        save_export(
-            self.tx.clone(),
-            "sapodilla-sheet.png",
-            "PNG image",
-            &["png"],
-            bytes,
-        );
+        let snapshot = self.render_snapshot();
+        let tx = self.tx.clone();
+        spawn_blocking(move || {
+            let image = snapshot.render();
+            let mut bytes = Vec::new();
+            if let Err(error) = image::codecs::png::PngEncoder::new(&mut bytes).write_image(
+                image.as_bytes(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            ) {
+                let _ = tx.send(Action::Error(error.into()));
+                return;
+            }
+            save_export(tx, "sapodilla-sheet.png", "PNG image", &["png"], bytes);
+        });
     }
 
     fn export_cut_svg(&self) {
@@ -1013,24 +1068,20 @@ impl SapodillaApp {
     }
 
     fn export_pdf(&self) {
-        let image = self.render_image();
-        match jpeg_pdf(
-            &encode_image(&image),
-            image.width(),
-            image.height(),
-            DEVICES[self.selected_device].dpi,
-        ) {
-            Ok(bytes) => save_export(
-                self.tx.clone(),
-                "sapodilla-sheet.pdf",
-                "PDF document",
-                &["pdf"],
-                bytes,
-            ),
-            Err(error) => {
-                self.tx.send(Action::Error(error)).ok();
+        let snapshot = self.render_snapshot();
+        let dpi = DEVICES[self.selected_device].dpi;
+        let tx = self.tx.clone();
+        spawn_blocking(move || {
+            let image = snapshot.render();
+            match jpeg_pdf(&encode_image(&image), image.width(), image.height(), dpi) {
+                Ok(bytes) => {
+                    save_export(tx, "sapodilla-sheet.pdf", "PDF document", &["pdf"], bytes)
+                }
+                Err(error) => {
+                    let _ = tx.send(Action::Error(error));
+                }
             }
-        }
+        });
     }
 
     fn export_toolpath_debug_svg(&self) {
@@ -1643,19 +1694,33 @@ impl SapodillaApp {
                 "calculated image position"
             );
 
-            let view = resized_image
-                .view(
-                    start_x as u32,
-                    start_y as u32,
-                    width_limit as u32,
-                    height_limit as u32,
-                )
-                .to_image();
-
-            image::imageops::overlay(&mut buf, &view, end_x as i64, end_y as i64);
+            image::imageops::overlay(
+                &mut buf,
+                resized_image.as_ref(),
+                i64::from(offset_x),
+                i64::from(offset_y),
+            );
         }
 
         buf.into()
+    }
+
+    fn render_snapshot(&self) -> RenderSnapshot {
+        RenderSnapshot {
+            canvas: self.get_canvas().size,
+            background: self.background_color32().to_array(),
+            layers: self
+                .loaded_images
+                .iter()
+                .filter(|image| image.visible)
+                .map(|image| RenderLayer {
+                    image: image.image.clone(),
+                    size: image.size(),
+                    rotation_degrees: image.rotation_degrees,
+                    visual_offset: image.visual_offset(),
+                })
+                .collect(),
+        }
     }
 
     pub fn get_canvas(&self) -> &'static CanvasSize {
@@ -1857,6 +1922,47 @@ impl SapodillaApp {
                             loaded.refresh_texture();
                         }
                         Err(error) => self.error = Some(error),
+                    }
+                }
+                Action::ImageAdjusted {
+                    image_id,
+                    source_revision,
+                    adjustments,
+                    image,
+                } => {
+                    self.image_processing.remove(&image_id);
+                    if let Some(loaded) = self
+                        .loaded_images
+                        .iter_mut()
+                        .find(|loaded| loaded.id == image_id)
+                        .filter(|loaded| {
+                            loaded.content_revision == source_revision
+                                && loaded.adjustments == adjustments
+                        })
+                    {
+                        loaded.image = image;
+                        loaded.adjustments = adjustments;
+                        loaded.content_revision = loaded.content_revision.wrapping_add(1);
+                        loaded.refresh_texture();
+                    }
+                }
+                Action::EdgeBackgroundRemoved {
+                    image_id,
+                    source_revision,
+                    image,
+                } => {
+                    self.image_processing.remove(&image_id);
+                    if let Some(loaded) = self
+                        .loaded_images
+                        .iter_mut()
+                        .find(|loaded| loaded.id == image_id)
+                        .filter(|loaded| loaded.content_revision == source_revision)
+                    {
+                        loaded.image = image;
+                        loaded.original_image = loaded.image.clone();
+                        loaded.adjustments = ImageAdjustments::default();
+                        loaded.content_revision = loaded.content_revision.wrapping_add(1);
+                        loaded.refresh_texture();
                     }
                 }
                 Action::LoadedLibraryImages(results) => {
@@ -2118,12 +2224,25 @@ impl SapodillaApp {
                         }
                     }
                 }
+                Action::PrintPrepared { capabilities, job } => {
+                    self.print_preparing = false;
+                    // Preparation is intentionally off the UI thread; only a
+                    // fully encoded payload becomes eligible for dispatch.
+                    let queue_id = self
+                        .job_queue
+                        .enqueue(JobSpec::named("Sapodilla sheet").requiring(capabilities));
+                    self.pending_print_jobs.insert(queue_id, job);
+                }
             }
         }
         self.dispatch_queued_jobs();
     }
 
     fn print_canvas(&mut self) {
+        if self.print_preparing {
+            return;
+        }
+        self.print_preparing = true;
         self.synchronize_cut_geometry();
         let mode_type = DEVICES[self.selected_device].modes[self.selected_mode].mode_type;
         let capabilities = if mode_type.has_cutting() {
@@ -2131,47 +2250,59 @@ impl SapodillaApp {
         } else {
             vec!["print"]
         };
-        let queue_id = self
-            .job_queue
-            .enqueue(JobSpec::named("Sapodilla sheet").requiring(capabilities));
-        let image = encode_image(&self.render_image());
         let mode = &DEVICES[self.selected_device].modes[self.selected_mode];
-        let canvas_size = &mode.canvas_sizes[self.selected_canvas_size];
-        let plt = encode_plt(
-            &self.cut_shapes,
-            &self.cut_modes,
-            DEVICES[self.selected_device]
-                .cutter_calibration
-                .clone()
-                .unwrap_or_default(),
-            canvas_size,
-            &self.material_profiles[self.selected_material],
-            self.perf_cut,
-            self.perf_dash_mm * DEVICES[self.selected_device].dpi / 25.4,
-            self.perf_gap_mm * DEVICES[self.selected_device].dpi / 25.4,
-            self.peel_tabs,
-            self.overcut,
-        );
-        let mut packet_data = Vec::with_capacity(image.len() + plt.len());
-        if mode_type.has_cutting() {
-            packet_data.extend_from_slice(&plt);
-        }
-        packet_data.extend_from_slice(&image);
-        self.pending_print_jobs.insert(
-            queue_id,
-            PendingPrintJob {
+        let canvas_size = mode.canvas_sizes[self.selected_canvas_size].clone();
+        let snapshot = self.render_snapshot();
+        let cut_shapes = self.cut_shapes.clone();
+        let cut_modes = self.cut_modes.clone();
+        let calibration = DEVICES[self.selected_device]
+            .cutter_calibration
+            .clone()
+            .unwrap_or_default();
+        let material = self.material_profiles[self.selected_material].clone();
+        let perf_cut = self.perf_cut;
+        let dpi = DEVICES[self.selected_device].dpi;
+        let perf_dash = self.perf_dash_mm * dpi / 25.4;
+        let perf_gap = self.perf_gap_mm * dpi / 25.4;
+        let peel_tabs = self.peel_tabs;
+        let overcut = self.overcut;
+        let copies = self.copies;
+        let device_index = self.selected_device;
+        let mode_index = self.selected_mode;
+        let canvas_index = self.selected_canvas_size;
+        let tx = self.tx.clone();
+        spawn_blocking(move || {
+            let image = encode_image(&snapshot.render());
+            let plt = encode_plt(
+                &cut_shapes,
+                &cut_modes,
+                calibration,
+                &canvas_size,
+                &material,
+                perf_cut,
+                perf_dash,
+                perf_gap,
+                peel_tabs,
+                overcut,
+            );
+            let mut packet_data = Vec::with_capacity(image.len() + plt.len());
+            if mode_type.has_cutting() {
+                packet_data.extend_from_slice(&plt);
+            }
+            packet_data.extend_from_slice(&image);
+            let job = PendingPrintJob {
                 encoded_image_len: image.len(),
                 plt,
                 packet_data,
                 image_hash: hex::encode(sha1::Sha1::digest(&image)),
                 created_at: current_timestamp_millis(),
-                copies: self.copies,
-                device_index: self.selected_device,
-                mode_index: self.selected_mode,
-                canvas_index: self.selected_canvas_size,
-            },
-        );
-        self.dispatch_queued_jobs();
+                copies,
+                device_index,
+                mode_index,
+                canvas_index,
+            };
+            let _ = tx.send(Action::PrintPrepared { capabilities, job });
+        });
     }
 
     fn dispatch_queued_jobs(&mut self) {
@@ -2760,6 +2891,11 @@ impl SapodillaApp {
 
         if self.selected_images.len() == 1 {
             let index = self.selected_images[0];
+            let image_processing = self
+                .image_processing
+                .contains(&self.loaded_images[index].id);
+            let mut adjustment_request = None;
+            let mut edge_removal_request = None;
             let template_slot = self.template_placeholders.iter().find(|placeholder| {
                 placeholder.assigned_image_id.as_ref() == Some(&self.loaded_images[index].id)
             });
@@ -2847,12 +2983,29 @@ impl SapodillaApp {
                         .text("Hue"),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
-                        image.apply_adjustments();
+                    if ui
+                        .add_enabled(!image_processing, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        adjustment_request = Some((
+                            image.id.clone(),
+                            image.content_revision,
+                            image.original_image.clone(),
+                            image.adjustments,
+                        ));
                     }
-                    if ui.button("Reset").clicked() {
-                        image.adjustments = ImageAdjustments::default();
-                        image.apply_adjustments();
+                    if ui
+                        .add_enabled(!image_processing, egui::Button::new("Reset"))
+                        .clicked()
+                    {
+                        let adjustments = ImageAdjustments::default();
+                        image.adjustments = adjustments;
+                        adjustment_request = Some((
+                            image.id.clone(),
+                            image.content_revision,
+                            image.original_image.clone(),
+                            adjustments,
+                        ));
                     }
                 });
             });
@@ -2861,8 +3014,24 @@ impl SapodillaApp {
                     egui::Slider::new(&mut self.background_tolerance, 0..=220).text("Tolerance"),
                 );
                 ui.add(egui::Slider::new(&mut self.background_feather, 0..=80).text("Feather"));
-                if ui.button("Remove edge background").clicked() {
-                    image.remove_background(self.background_tolerance, self.background_feather);
+                if ui
+                    .add_enabled(
+                        !image_processing,
+                        egui::Button::new(if image_processing {
+                            "Processing image…"
+                        } else {
+                            "Remove edge background"
+                        }),
+                    )
+                    .clicked()
+                {
+                    edge_removal_request = Some((
+                        image.id.clone(),
+                        image.content_revision,
+                        image.image.clone(),
+                        self.background_tolerance,
+                        self.background_feather,
+                    ));
                 }
             });
             let mut duplicate_clicked = false;
@@ -2888,6 +3057,32 @@ impl SapodillaApp {
             } else if backward_clicked && index > 0 {
                 self.loaded_images.swap(index, index - 1);
                 self.selected_images = vec![index - 1];
+            }
+            if let Some((image_id, source_revision, source, adjustments)) = adjustment_request {
+                self.image_processing.insert(image_id.clone());
+                let tx = self.tx.clone();
+                spawn_blocking(move || {
+                    let image = studio::adjust_image(&source, adjustments);
+                    let _ = tx.send(Action::ImageAdjusted {
+                        image_id,
+                        source_revision,
+                        adjustments,
+                        image,
+                    });
+                });
+            } else if let Some((image_id, source_revision, source, tolerance, feather)) =
+                edge_removal_request
+            {
+                self.image_processing.insert(image_id.clone());
+                let tx = self.tx.clone();
+                spawn_blocking(move || {
+                    let image = studio::remove_background(&source, tolerance, feather);
+                    let _ = tx.send(Action::EdgeBackgroundRemoved {
+                        image_id,
+                        source_revision,
+                        image,
+                    });
+                });
             }
         }
     }
@@ -2928,15 +3123,19 @@ impl SapodillaApp {
         let has_visible_artwork = self.loaded_images.iter().any(|image| image.visible);
         let has_enabled_cut_paths =
             has_enabled_cut_path(&self.cut_shapes, &self.cut_modes, self.perf_cut);
-        let print_block_reason = print_block_reason(
-            !self.printer_connections.is_empty(),
-            has_visible_artwork,
-            mode_has_cutting,
-            self.cut_progress.is_some(),
-            has_enabled_cut_paths,
-            self.has_intersections,
-            self.off_canvas,
-        );
+        let print_block_reason = if self.print_preparing {
+            Some("Preparing print job")
+        } else {
+            print_block_reason(
+                !self.printer_connections.is_empty(),
+                has_visible_artwork,
+                mode_has_cutting,
+                self.cut_progress.is_some(),
+                has_enabled_cut_paths,
+                self.has_intersections,
+                self.off_canvas,
+            )
+        };
         let can_print = print_block_reason.is_none();
         let print_label = if mode_has_cutting {
             "Print & cut"
@@ -3082,9 +3281,7 @@ struct CutPathValidation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CutValidationSnapshot {
-    paths: Vec<Vec<[u32; 2]>>,
-    modes: Vec<CutMode>,
-    all_perforation: bool,
+    geometry_hash: u64,
     canvas_size: [u32; 2],
     safe_area: [u32; 2],
 }
@@ -3096,18 +3293,26 @@ fn cut_validation_snapshot(
     canvas_size: Vec2,
     safe_area: Vec2,
 ) -> CutValidationSnapshot {
+    let mut hasher = DefaultHasher::new();
+    cut_shapes.len().hash(&mut hasher);
+    for path in cut_shapes {
+        path.0.len().hash(&mut hasher);
+        for point in &path.0 {
+            point.x.to_bits().hash(&mut hasher);
+            point.y.to_bits().hash(&mut hasher);
+        }
+    }
+    for mode in cut_modes {
+        match mode {
+            CutMode::Kiss => 0u8,
+            CutMode::Perforation => 1,
+            CutMode::Disabled => 2,
+        }
+        .hash(&mut hasher);
+    }
+    all_perforation.hash(&mut hasher);
     CutValidationSnapshot {
-        paths: cut_shapes
-            .iter()
-            .map(|path| {
-                path.0
-                    .iter()
-                    .map(|point| [point.x.to_bits(), point.y.to_bits()])
-                    .collect()
-            })
-            .collect(),
-        modes: cut_modes.to_vec(),
-        all_perforation,
+        geometry_hash: hasher.finish(),
         canvas_size: [canvas_size.x.to_bits(), canvas_size.y.to_bits()],
         safe_area: [safe_area.x.to_bits(), safe_area.y.to_bits()],
     }
@@ -3136,11 +3341,27 @@ fn validate_current_cut_paths(
         })
         .collect::<Vec<_>>();
 
-    let has_intersections = effective_paths.iter().enumerate().any(|(index, path)| {
-        effective_paths[index + 1..]
-            .iter()
-            .any(|other| path.intersects(*other))
-    });
+    let bounds = effective_paths
+        .iter()
+        .map(|path| path.bounding_rect())
+        .collect::<Vec<_>>();
+    let mut has_intersections = false;
+    'intersection: for left in 0..effective_paths.len() {
+        let Some(left_bounds) = bounds[left] else {
+            continue;
+        };
+        for right in left + 1..effective_paths.len() {
+            let Some(right_bounds) = bounds[right] else {
+                continue;
+            };
+            if left_bounds.intersects(&right_bounds)
+                && effective_paths[left].intersects(effective_paths[right])
+            {
+                has_intersections = true;
+                break 'intersection;
+            }
+        }
+    }
     let offset = (canvas_size - safe_area) / 2.0;
     let safe_canvas = GeoRect::new(
         Coord {
@@ -3168,13 +3389,13 @@ impl eframe::App for SapodillaApp {
         let accent = self.accent_color();
         theme::apply(ctx, accent);
         self.apply_actions();
-        self.synchronize_cut_geometry();
         self.cut_modes.resize(self.cut_shapes.len(), CutMode::Kiss);
         self.cut_modes.truncate(self.cut_shapes.len());
         self.cutline_owners.resize(self.cut_shapes.len(), None);
         self.cutline_owners.truncate(self.cut_shapes.len());
         self.cutline_locked.resize(self.cut_shapes.len(), false);
         self.cutline_locked.truncate(self.cut_shapes.len());
+        views::synchronize_cut_preview(self);
         let canvas = self.get_canvas();
         let current_validation_snapshot = cut_validation_snapshot(
             &self.cut_shapes,
@@ -3831,7 +4052,7 @@ impl eframe::App for SapodillaApp {
                                 }
                             });
                             if !self.cut_shapes.is_empty() {
-                                let stats = toolpath_stats(&self.prepared_toolpaths());
+                                let stats = self.cut_preview_stats;
                                 let mm_per_pixel = 25.4 / DEVICES[self.selected_device].dpi;
                                 ui.small(format!(
                                     "{} paths · {} nodes · {:.1} mm cutting · {:.1} mm travel",
@@ -4007,6 +4228,7 @@ impl eframe::App for SapodillaApp {
                                         && let Some(manual) = self
                                             .manual_cut_shapes
                                             .get_mut(path_index - self.auto_cut_count)
+                                        && manual != path
                                     {
                                         manual.clone_from(path);
                                     }
@@ -4052,7 +4274,7 @@ impl eframe::App for SapodillaApp {
                                     self.loaded_images
                                         .iter()
                                         .filter(|image| image.enable_cutting && image.visible)
-                                        .cloned()
+                                        .map(CutImage::from)
                                         .collect(),
                                     self.cut_tuning.clone(),
                                     self.get_canvas(),
@@ -4502,6 +4724,30 @@ fn place_image_in_placeholder(image: &mut LoadedImage, placeholder: &TemplatePla
     image.offset = visual_min - (image.size() - rendered) / 2.0;
 }
 
+fn composite_layer(buffer: &mut image::RgbaImage, layer: &RenderLayer) {
+    let resized = if layer.image.dimensions() == (layer.size.x as u32, layer.size.y as u32) {
+        Cow::Borrowed(&layer.image)
+    } else {
+        Cow::Owned(image::imageops::resize(
+            &layer.image,
+            layer.size.x as u32,
+            layer.size.y as u32,
+            image::imageops::FilterType::Lanczos3,
+        ))
+    };
+    let transformed = if layer.rotation_degrees.abs() > 0.001 {
+        Cow::Owned(studio::rotate_image(&resized, layer.rotation_degrees))
+    } else {
+        resized
+    };
+    image::imageops::overlay(
+        buffer,
+        transformed.as_ref(),
+        layer.visual_offset.x as i64,
+        layer.visual_offset.y as i64,
+    );
+}
+
 fn save_export(
     tx: ContextSender<Action>,
     file_name: &'static str,
@@ -4525,24 +4771,45 @@ fn save_export(
 }
 
 fn encode_image(im: &image::DynamicImage) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1024 * 1024);
-    let mut quality = 100;
-    loop {
-        // Image needs to be under 1MB, so decrease quality
-        // until we get there.
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-        encoder.encode_image(im).unwrap();
-        debug!(quality, len = buf.len(), "got jpeg size");
+    const MAX_BYTES: usize = 1024 * 1024;
+    let encode = |quality| {
+        let mut bytes = Vec::with_capacity(MAX_BYTES);
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(im)
+            .unwrap();
+        debug!(quality, len = bytes.len(), "got jpeg size");
+        bytes
+    };
 
-        if buf.len() <= 1024 * 1024 || quality == 0 {
-            break;
-        }
-
-        quality -= 1;
-        buf.clear();
+    let highest = encode(100);
+    if highest.len() <= MAX_BYTES {
+        return highest;
     }
 
-    buf
+    let lowest = encode(0);
+    if lowest.len() > MAX_BYTES {
+        // Preserve the previous best-effort behaviour for sheets which cannot
+        // meet the device limit even at minimum quality.
+        return lowest;
+    }
+
+    // JPEG size is monotonic enough for encoder quality selection. Find the
+    // highest fitting quality in at most seven additional full encodes instead
+    // of walking every value from 100 downwards.
+    let mut fitting_quality = 0u8;
+    let mut fitting = lowest;
+    let mut too_large_quality = 100u8;
+    while fitting_quality + 1 < too_large_quality {
+        let quality = fitting_quality + (too_large_quality - fitting_quality) / 2;
+        let candidate = encode(quality);
+        if candidate.len() <= MAX_BYTES {
+            fitting_quality = quality;
+            fitting = candidate;
+        } else {
+            too_large_quality = quality;
+        }
+    }
+    fitting
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5396,6 +5663,94 @@ mod tests {
             actual.as_slice(),
             include_bytes!("../tests/fixtures/honeymaro-pixcut/square-exact.plt")
         );
+    }
+
+    #[test]
+    fn print_jpeg_is_decodable_and_respects_the_device_size_target() {
+        let image = image::RgbaImage::from_fn(1024, 1024, |x, y| {
+            let noise = x
+                .wrapping_mul(1_664_525)
+                .wrapping_add(y.wrapping_mul(1_013_904_223));
+            image::Rgba([
+                (noise & 255) as u8,
+                ((noise >> 8) & 255) as u8,
+                ((noise >> 16) & 255) as u8,
+                255,
+            ])
+        });
+        let encoded = encode_image(&image::DynamicImage::ImageRgba8(image));
+        assert!(encoded.len() <= 1024 * 1024);
+        let decoded = image::load_from_memory(&encoded).unwrap();
+        assert_eq!(decoded.dimensions(), (1024, 1024));
+    }
+
+    #[test]
+    fn direct_overlay_matches_the_previous_clipped_rendering() {
+        let source = image::RgbaImage::from_fn(7, 5, |x, y| {
+            image::Rgba([(x * 31) as u8, (y * 47) as u8, 180, 80 + (x * y) as u8])
+        });
+        for offset in [
+            Pos2::new(-3.0, -2.0),
+            Pos2::new(2.0, 3.0),
+            Pos2::new(9.0, 7.0),
+        ] {
+            let layer = RenderLayer {
+                image: source.clone(),
+                size: Vec2::new(7.0, 5.0),
+                rotation_degrees: 0.0,
+                visual_offset: offset,
+            };
+            let mut actual = image::RgbaImage::from_pixel(10, 8, image::Rgba([7, 9, 11, 255]));
+            composite_layer(&mut actual, &layer);
+
+            let mut expected = image::RgbaImage::from_pixel(10, 8, image::Rgba([7, 9, 11, 255]));
+            let offset_x = offset.x as i32;
+            let offset_y = offset.y as i32;
+            let start_x = -offset_x.min(0);
+            let start_y = -offset_y.min(0);
+            let end_x = offset_x.max(0);
+            let end_y = offset_y.max(0);
+            let width = (7 - start_x).min(10 - end_x);
+            let height = (5 - start_y).min(8 - end_y);
+            if width > 0 && height > 0 {
+                let clipped = source
+                    .view(start_x as u32, start_y as u32, width as u32, height as u32)
+                    .to_image();
+                image::imageops::overlay(
+                    &mut expected,
+                    &clipped,
+                    i64::from(end_x),
+                    i64::from(end_y),
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release -- --ignored --nocapture"]
+    fn perf_sample_print_encoding() {
+        use std::{hint::black_box, time::Instant};
+
+        let sample = image::RgbaImage::from_fn(1600, 1600, |x, y| {
+            let noise = x
+                .wrapping_mul(1_664_525)
+                .wrapping_add(y.wrapping_mul(1_013_904_223));
+            image::Rgba([
+                (noise & 255) as u8,
+                ((noise >> 8) & 255) as u8,
+                ((noise >> 16) & 255) as u8,
+                255,
+            ])
+        });
+        let started = Instant::now();
+        let encoded = encode_image(black_box(&image::DynamicImage::ImageRgba8(sample)));
+        println!(
+            "print JPEG 1600x1600: {:?} ({} bytes)",
+            started.elapsed(),
+            encoded.len()
+        );
+        black_box(encoded);
     }
 }
 

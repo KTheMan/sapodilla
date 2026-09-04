@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use egui::Vec2;
+use egui::{Pos2, Vec2};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use geo::{
-    Buffer, ChaikinSmoothing, Contains, Coord, Euclidean, Intersects, LineString, MultiPolygon,
-    Polygon, Rect, Scale, SimplifyVwPreserve, Validation, Winding, coord,
+    BoundingRect, Buffer, ChaikinSmoothing, Contains, Coord, Euclidean, Intersects, LineString,
+    MultiPolygon, Polygon, Rect, Scale, SimplifyVwPreserve, Validation, Winding, coord,
     line_measures::LengthMeasurable,
 };
 use image::{
@@ -12,7 +12,6 @@ use image::{
     imageops::{self, FilterType},
 };
 use imageproc::contours::BorderType;
-use itertools::Itertools;
 use tracing::{debug, error, trace, warn};
 
 use crate::{app::LoadedImage, protocol::CanvasSize, spawn_blocking};
@@ -175,14 +174,35 @@ impl Default for CutTuning {
 
 pub struct CutGenerator {
     tx: UnboundedSender<CutAction>,
-    images: Vec<LoadedImage>,
+    images: Vec<CutImage>,
     tuning: CutTuning,
     canvas_size: &'static CanvasSize,
 }
 
+/// Minimal immutable snapshot needed by the cut worker. Avoid cloning the
+/// source/original raster and GPU texture handle along with every current
+/// raster when a generation starts.
+pub(crate) struct CutImage {
+    image: image::RgbaImage,
+    size: Vec2,
+    offset: Pos2,
+    rotation_degrees: f32,
+}
+
+impl From<&LoadedImage> for CutImage {
+    fn from(image: &LoadedImage) -> Self {
+        Self {
+            image: image.image.clone(),
+            size: image.size(),
+            offset: image.offset,
+            rotation_degrees: image.rotation_degrees,
+        }
+    }
+}
+
 impl CutGenerator {
     pub fn start(
-        images: Vec<LoadedImage>,
+        images: Vec<CutImage>,
         tuning: CutTuning,
         canvas_size: &'static CanvasSize,
     ) -> UnboundedReceiver<CutAction> {
@@ -224,10 +244,7 @@ impl CutGenerator {
             })?;
         }
 
-        let has_intersections = line_strings
-            .iter()
-            .combinations(2)
-            .any(|polygons| polygons[0].intersects(polygons[1]));
+        let has_intersections = has_any_intersections(&line_strings);
 
         let offset = (self.canvas_size.size - self.canvas_size.safe_area) / 2.0;
 
@@ -250,12 +267,13 @@ impl CutGenerator {
         Ok(())
     }
 
-    fn image(&self, image: &LoadedImage) -> Vec<LineString<f32>> {
+    fn image(&self, image: &CutImage) -> Vec<LineString<f32>> {
         trace!("starting processing image");
 
-        // Resize image to the expected dimensions. Doesn't need to be a high
-        // quality resize, so nearest filter is fine.
-        let size = image.size();
+        // Preserve the antialiased edge topology used by contour extraction.
+        // Nearest-neighbor sampling can materially change thresholded curves
+        // and diagonals.
+        let size = image.size;
         let resized = imageops::resize(
             &image.image,
             size.x as u32,
@@ -440,6 +458,29 @@ impl CutGenerator {
     }
 }
 
+fn has_any_intersections(line_strings: &[LineString<f32>]) -> bool {
+    let bounds = line_strings
+        .iter()
+        .map(LineString::bounding_rect)
+        .collect::<Vec<_>>();
+    for left in 0..line_strings.len() {
+        let Some(left_bounds) = bounds[left] else {
+            continue;
+        };
+        for right in left + 1..line_strings.len() {
+            let Some(right_bounds) = bounds[right] else {
+                continue;
+            };
+            if left_bounds.intersects(&right_bounds)
+                && line_strings[left].intersects(&line_strings[right])
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +533,74 @@ mod tests {
             assert!(((incoming.x - seam.x) + (outgoing.x - seam.x)).abs() < 1e-3);
             assert!((incoming.y - outgoing.y).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn intersection_prefilter_preserves_exact_geometry_results() {
+        let disjoint = LineString::from(vec![(0.0, 0.0), (2.0, 2.0)]);
+        let crossing = LineString::from(vec![(0.0, 2.0), (2.0, 0.0)]);
+        let far = LineString::from(vec![(100.0, 100.0), (102.0, 102.0)]);
+        assert!(!has_any_intersections(&[disjoint.clone(), far.clone()]));
+        assert!(has_any_intersections(&[
+            disjoint.clone(),
+            far,
+            crossing.clone()
+        ]));
+
+        let mut paths = Vec::new();
+        for index in 0..64 {
+            let x = (index * 37 % 101) as f32;
+            let y = (index * 53 % 97) as f32;
+            paths.push(LineString::from(vec![(x, y), (x + 7.0, y + 11.0)]));
+        }
+        let expected = paths
+            .iter()
+            .enumerate()
+            .any(|(left, path)| paths[left + 1..].iter().any(|other| path.intersects(other)));
+        assert_eq!(has_any_intersections(&paths), expected);
+    }
+
+    #[test]
+    fn raster_cut_snapshot_scales_and_closes_transparent_artwork() {
+        let pixels = image::RgbaImage::from_fn(32, 24, |x, y| {
+            if (5..27).contains(&x) && (4..20).contains(&y) {
+                image::Rgba([220, 40, 90, 255])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            }
+        });
+        let image = CutImage {
+            image: pixels,
+            size: Vec2::new(64.0, 48.0),
+            offset: Pos2::new(10.0, 20.0),
+            rotation_degrees: 0.0,
+        };
+        let (tx, _rx) = unbounded();
+        let canvas = Box::leak(Box::new(CanvasSize {
+            name: "test".into(),
+            media_size: 0,
+            media_type: 0,
+            size: Vec2::new(100.0, 100.0),
+            safe_area: Vec2::new(100.0, 100.0),
+        }));
+        let generator = CutGenerator {
+            tx,
+            images: Vec::new(),
+            tuning: CutTuning {
+                buffer: 0.0,
+                minimum_length: 0.0,
+                smoothing: 0,
+                simplify: 0.0,
+                internal: false,
+                white_transparent: false,
+            },
+            canvas_size: canvas,
+        };
+        let paths = generator.image(&image);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0.first(), paths[0].0.last());
+        let bounds = paths[0].bounding_rect().unwrap();
+        assert!(bounds.min().x >= 19.0 && bounds.max().x <= 65.0);
+        assert!(bounds.min().y >= 27.0 && bounds.max().y <= 61.0);
     }
 }

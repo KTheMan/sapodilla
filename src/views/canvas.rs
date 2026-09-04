@@ -1,3 +1,8 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use egui::{
     Align2, Color32, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut, Modifiers, Painter,
     Pos2, Rect, Scene, Sense, Shape, Stroke, Ui, Vec2,
@@ -10,6 +15,7 @@ use crate::{
     SapodillaApp,
     app::peel_tab_unmirrored,
     cut::apply_overcut,
+    export::toolpath_stats_iter,
     protocol::DEVICES,
     toolpath::{CutMode, CutPhase, effective_cut_modes, plan_cut_phases},
 };
@@ -112,6 +118,62 @@ impl ResizeHandle {
             Self::West => Self::East,
         }
     }
+}
+
+/// Rebuild dense perforation/overcut preview geometry only when its source
+/// paths or settings actually change. A compact fingerprint is still computed
+/// each frame so direct node editing cannot leave stale cached geometry.
+pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
+    let mut hasher = DefaultHasher::new();
+    state.cut_shapes.len().hash(&mut hasher);
+    for path in &state.cut_shapes {
+        path.0.len().hash(&mut hasher);
+        for point in &path.0 {
+            point.x.to_bits().hash(&mut hasher);
+            point.y.to_bits().hash(&mut hasher);
+        }
+    }
+    for mode in &state.cut_modes {
+        match mode {
+            CutMode::Kiss => 0u8,
+            CutMode::Perforation => 1,
+            CutMode::Disabled => 2,
+        }
+        .hash(&mut hasher);
+    }
+    state.perf_cut.hash(&mut hasher);
+    state.selected_device.hash(&mut hasher);
+    state.perf_dash_mm.to_bits().hash(&mut hasher);
+    state.perf_gap_mm.to_bits().hash(&mut hasher);
+    state.peel_tabs.hash(&mut hasher);
+    state.overcut.enabled.hash(&mut hasher);
+    state.overcut.steps.hash(&mut hasher);
+    state
+        .overcut
+        .maximum_angle_degrees
+        .to_bits()
+        .hash(&mut hasher);
+    state.overcut.reach_pixels.to_bits().hash(&mut hasher);
+    state.overcut.snap_to_pixels.hash(&mut hasher);
+    let key = hasher.finish();
+    if state.cut_preview_cache_key == Some(key) {
+        return;
+    }
+
+    let dpi = DEVICES[state.selected_device].dpi;
+    let phases = preview_cut_phases(
+        &state.cut_shapes,
+        &state.cut_modes,
+        state.perf_cut,
+        state.perf_dash_mm * dpi / 25.4,
+        state.perf_gap_mm * dpi / 25.4,
+        state.overcut,
+        state.peel_tabs,
+    );
+    state.cut_preview_stats =
+        toolpath_stats_iter(phases.iter().flat_map(|phase| phase.paths.iter()));
+    state.cut_preview_cache = phases;
+    state.cut_preview_cache_key = Some(key);
 }
 
 pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
@@ -318,15 +380,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
     }
 
     if state.show_cutlines {
-        for phase in preview_cut_phases(
-            &state.cut_shapes,
-            &state.cut_modes,
-            state.perf_cut,
-            state.perf_dash_mm * dpi / 25.4,
-            state.perf_gap_mm * dpi / 25.4,
-            state.overcut,
-            state.peel_tabs,
-        ) {
+        for phase in &state.cut_preview_cache {
             let stroke = match phase.mode {
                 CutMode::Kiss => Stroke::new(CUT_LINE_WIDTH, Color32::from_rgb(67, 170, 139)),
                 CutMode::Perforation => Stroke::new(CUT_LINE_WIDTH, Color32::from_rgb(249, 65, 68)),
@@ -1264,15 +1318,18 @@ fn paint_polygons(
     stroke: Stroke,
 ) {
     for line_string in cut_shapes {
-        // Create a line shape for each line from all our polygons.
-        let shapes = line_string.lines().map(|line| {
-            let start = to_screen.transform_pos(Pos2::new(line.start.x, line.start.y));
-            let end = to_screen.transform_pos(Pos2::new(line.end.x, line.end.y));
-
-            Shape::line(vec![start, end], stroke)
-        });
-
-        painter.extend(shapes);
+        if line_string.0.len() < 2 {
+            continue;
+        }
+        // A contour is one meshable line shape. Creating a separate two-point
+        // allocation for every segment made dense generated paths expensive to
+        // paint and multiplied egui's shape-processing overhead every frame.
+        let points = line_string
+            .0
+            .iter()
+            .map(|point| to_screen.transform_pos(Pos2::new(point.x, point.y)))
+            .collect();
+        painter.add(Shape::line(points, stroke));
     }
 }
 
