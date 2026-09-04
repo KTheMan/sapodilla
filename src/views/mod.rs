@@ -347,33 +347,38 @@ pub fn image_controls(
             ui.spacing_mut().item_spacing.y = 8.0;
 
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut image.name);
+                let label = ui.label("Layer name");
+                ui.text_edit_singleline(&mut image.name)
+                    .labelled_by(label.id);
                 ui.checkbox(&mut image.visible, "Visible");
                 ui.checkbox(&mut image.locked, "Lock");
             });
 
             ui.horizontal(|ui| {
-                ui.monospace("X:");
+                let x_label = ui.monospace("X:");
                 ui.add(px_slider(
                     &mut image.offset.x,
                     dpi,
                     (-image.sized_texture.size.x * 2.0)
                         ..=(canvas_size.x + image.sized_texture.size.x * 2.0),
-                ));
+                ))
+                .labelled_by(x_label.id);
 
-                ui.monospace("Y:");
+                let y_label = ui.monospace("Y:");
                 ui.add(px_slider(
                     &mut image.offset.y,
                     dpi,
                     (-image.sized_texture.size.y * 2.0)
                         ..=(canvas_size.y + image.sized_texture.size.y * 2.0),
-                ));
+                ))
+                .labelled_by(y_label.id);
             });
 
             ui.horizontal(|ui| {
-                ui.monospace("W:");
+                let width_label = ui.monospace("W:");
                 let mut width = image.size().x;
-                ui.add(px_slider(&mut width, dpi, 1.0..=(canvas_size.x * 10.0)));
+                ui.add(px_slider(&mut width, dpi, 1.0..=(canvas_size.x * 10.0)))
+                    .labelled_by(width_label.id);
 
                 if width != image.size().x {
                     let new_scale = if image.scale_locked {
@@ -388,9 +393,10 @@ pub fn image_controls(
                     image.rescale(new_scale);
                 }
 
-                ui.monospace("H:");
+                let height_label = ui.monospace("H:");
                 let mut height = image.size().y;
-                ui.add(px_slider(&mut height, dpi, 1.0..=(canvas_size.y * 10.0)));
+                ui.add(px_slider(&mut height, dpi, 1.0..=(canvas_size.y * 10.0)))
+                    .labelled_by(height_label.id);
 
                 if height != image.size().y {
                     let new_scale = if image.scale_locked {
@@ -417,12 +423,14 @@ pub fn image_controls(
                 *remove_index = Some(index);
             }
 
+            let rotation_label = ui.label("Layer rotation");
             ui.add(
                 egui::DragValue::new(&mut image.rotation_degrees)
                     .speed(0.25)
                     .range(-180.0..=180.0)
                     .suffix("° rotation"),
-            );
+            )
+            .labelled_by(rotation_label.id);
 
             if mode_type.has_cutting() {
                 ui.checkbox(&mut image.enable_cutting, "Cut")

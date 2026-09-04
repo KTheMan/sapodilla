@@ -15,6 +15,13 @@ The hosted browser build is available at [gh.knnygrdn.com/sapodilla](https://gh.
 
 ### Features
 
+Feature controls are contextual: select artwork to reveal image tools, choose
+**Print & Cut** mode to reveal cutline tools, and use the **Library** and
+**Inspector** toolbar buttons to show their panels. See the
+[feature reachability audit](docs/feature-reachability.md) for exact UI paths and
+platform availability. The tested roles, actions, and minimum workspace bounds
+are recorded in the [UI accessibility claims](docs/ui-accessibility-claims.md).
+
 - [x] Connect to device
     - [x] Native vendor USB discovery and bulk transfer
     - [x] Native PixCut Bluetooth LE GATT discovery and transfer
@@ -27,28 +34,28 @@ The hosted browser build is available at [gh.knnygrdn.com/sapodilla](https://gh.
     - [x] DPI-aware rulers, configurable grid, and direct resize/rotation handles
     - [x] Reorderable layers, multi-selection, sheet alignment, and smart snapping
     - [x] Brightness, contrast, saturation, and hue controls
-    - [x] One-click local edge-background removal
-    - [x] One-click local neural background removal with first-use model caching
+    - [x] One-click in-process edge-background removal (no upload)
+    - [x] Native-only on-device neural background removal with first-use model download and caching
     - [x] MaxRects auto-pack with gaps and optional rotation
-    - [x] Cut mark preview
-    - [x] Cut mark generation
+    - [x] Cutline preview
+    - [x] Cutline generation
     - [x] Editable cutline nodes and multiple paths
     - [x] Per-path kiss cut, perforation, or disabled operations
     - [x] Path smoothing and boolean union
-    - [x] SVG paths, basic shapes, transforms, units, and viewBox import
+    - [x] SVG cutline import for paths, basic shapes, transforms, units, and viewBox
     - [x] 18-shape procedural designer
     - [x] Contour perforation, peel-tab paths, overcut ramps, and material profiles
 - [x] Local Library
-    - [x] Persistent recursive folder libraries with startup/rescan refresh
+    - [x] Native desktop persistent recursive folder libraries with startup/rescan refresh
     - [x] Add, fill, and shuffled/cycled fill workflows
 - [x] Share & Save
-    - [x] Versioned `.stix`, `.stixcut`, and `.stixtpl` Sapodilla documents
+    - [x] Versioned `.sapodilla` project documents for stickers, sheets, and templates
     - [x] Template slots with fit modes, stable artwork identity, and locked cutlines
     - [x] PNG, artwork PDF, cut SVG, PLT, and debug toolpath SVG export
 - [x] Production Queue
-    - [x] Simultaneous USB/BLE/serial connections and capability-aware automatic routing
-    - [x] Retained FIFO jobs with concurrent dispatch as printers become available
-    - [x] Progress, cancellation, failure, retry, and offline transitions
+    - [x] Simultaneous native USB/BLE/serial connections with automatic routing
+    - [x] In-session oldest-routable jobs with concurrent dispatch as printers become available
+    - [x] Progress, queued-job cancellation, failure, retry, and offline transitions
 - [x] Photo Printing
     - [x] Single print job
     - [x] Set number of copies

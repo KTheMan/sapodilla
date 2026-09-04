@@ -45,6 +45,8 @@ const APPEARANCE_VERSION: u8 = 1;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const LIBRARY_PAGE_SIZE: usize = 100;
 const MAX_LIBRARY_FILL_ATTEMPTS: usize = 512;
+const NEW_ARTWORK_MIN_FRACTION: f32 = 0.22;
+const NEW_ARTWORK_MAX_FRACTION: f32 = 0.72;
 
 #[derive(derive_more::Debug)]
 pub enum Action {
@@ -254,6 +256,7 @@ pub struct SapodillaApp {
     pub edit_cutlines: bool,
     pub selected_cut_path: Option<usize>,
     pub selected_cut_node: Option<usize>,
+    pub canvas_fit_requested: bool,
     pub pack_cycle: usize,
     pub library_consumed_ahead: BTreeSet<usize>,
     pub pack_overflow: usize,
@@ -363,6 +366,7 @@ pub struct LoadedImage {
     pub rotation_degrees: f32,
     pub locked: bool,
     pub visible: bool,
+    pub template_fit: PlaceholderFit,
     pub adjustments: ImageAdjustments,
     pub content_revision: u64,
 
@@ -445,6 +449,7 @@ impl LoadedImage {
             rotation_degrees: 0.0,
             locked: false,
             visible: true,
+            template_fit: PlaceholderFit::Cover,
             adjustments: ImageAdjustments::default(),
             content_revision: 0,
             handle,
@@ -517,6 +522,33 @@ impl LoadedImage {
         self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
+}
+
+/// Give newly placed artwork a predictable, usable initial footprint while
+/// preserving its aspect ratio. Document loads and replacements deliberately
+/// bypass this: their saved/user-authored transforms are authoritative.
+fn normalize_new_artwork(image: &mut LoadedImage, canvas: &CanvasSize) {
+    let size = image.size();
+    if !size.x.is_finite() || !size.y.is_finite() || size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+
+    let min_size = canvas.safe_area * NEW_ARTWORK_MIN_FRACTION;
+    let max_size = canvas.safe_area * NEW_ARTWORK_MAX_FRACTION;
+    let grow = (min_size.x / size.x).max(min_size.y / size.y);
+    let fit = (max_size.x / size.x).min(max_size.y / size.y);
+    let factor = if size.x > max_size.x || size.y > max_size.y {
+        fit
+    } else if size.x < min_size.x || size.y < min_size.y {
+        grow.min(fit)
+    } else {
+        1.0
+    };
+
+    if factor.is_finite() && factor > 0.0 {
+        image.scale *= factor;
+    }
+    image.offset = ((canvas.size - image.rotated_size()) / 2.0).to_pos2();
 }
 
 impl SapodillaApp {
@@ -673,6 +705,7 @@ impl SapodillaApp {
             edit_cutlines: false,
             selected_cut_path: None,
             selected_cut_node: None,
+            canvas_fit_requested: false,
             pack_cycle: library_cycle,
             library_consumed_ahead,
             pack_overflow: 0,
@@ -885,7 +918,7 @@ impl SapodillaApp {
 
         spawn(async move {
             let file = rfd::AsyncFileDialog::new()
-                .add_filter("image", &["jpg", "png"])
+                .add_filter("image", &["jpg", "jpeg", "png"])
                 .pick_file()
                 .await;
 
@@ -1210,6 +1243,7 @@ impl SapodillaApp {
                 image.locked || kind == DocumentKind::Template,
                 image.visible,
             );
+            saved.template_fit = image.template_fit;
             saved.id.clone_from(&image.id);
             document.images.push(saved);
         }
@@ -1246,7 +1280,7 @@ impl SapodillaApp {
                                 size.y,
                             ],
                             rotation_degrees: image.rotation_degrees,
-                            fit: PlaceholderFit::Cover,
+                            fit: image.template_fit,
                             assigned_image_id: Some(image_id.clone()),
                         }
                     })
@@ -1363,10 +1397,15 @@ impl SapodillaApp {
         };
         let tx = self.tx.clone();
         spawn(async move {
-            let extension = StudioDocument::extension(kind);
+            let extension = StudioDocument::extension();
+            let document_name = match kind {
+                DocumentKind::Sticker => "sticker",
+                DocumentKind::Sheet => "sheet",
+                DocumentKind::Template => "template",
+            };
             let Some(file) = rfd::AsyncFileDialog::new()
-                .add_filter("Sapodilla studio document", &[extension])
-                .set_file_name(format!("untitled.{extension}"))
+                .add_filter("Sapodilla project", &[extension])
+                .set_file_name(format!("untitled-{document_name}.{extension}"))
                 .save_file()
                 .await
             else {
@@ -1387,10 +1426,7 @@ impl SapodillaApp {
         let tx = self.tx.clone();
         spawn(async move {
             let Some(file) = rfd::AsyncFileDialog::new()
-                .add_filter(
-                    "Sapodilla studio documents",
-                    &["stix", "stixcut", "stixtpl"],
-                )
+                .add_filter("Sapodilla projects", &[StudioDocument::extension()])
                 .pick_file()
                 .await
             else {
@@ -1412,6 +1448,14 @@ impl SapodillaApp {
                     image.enable_cutting = saved.cutting_enabled;
                     image.locked = saved.locked;
                     image.visible = saved.visible;
+                    image.template_fit = document
+                        .template_placeholders
+                        .iter()
+                        .find(|placeholder| {
+                            placeholder.assigned_image_id.as_ref() == Some(&saved.id)
+                        })
+                        .map(|placeholder| placeholder.fit)
+                        .unwrap_or(saved.template_fit);
                     images.push(image);
                 }
                 Ok::<_, anyhow::Error>((document, images))
@@ -1501,6 +1545,21 @@ impl SapodillaApp {
                 placement.offset + safe_offset + (image.rotated_size() - image.size()) / 2.0;
         }
         packed
+    }
+
+    fn add_new_artwork(&mut self, mut image: LoadedImage) {
+        let was_empty = self.loaded_images.is_empty();
+        normalize_new_artwork(&mut image, self.get_canvas());
+        self.loaded_images.push(image);
+        self.selected_images = vec![self.loaded_images.len() - 1];
+        self.canvas_fit_requested = true;
+
+        // The asset drawer has served its purpose once the first item is on
+        // the sheet. Keep the inspector available for immediate refinement and
+        // return horizontal space to the workspace; Library remains one click away.
+        if was_empty {
+            self.show_library_panel = false;
+        }
     }
 
     fn add_library_to_sheet(&mut self, shuffle: bool) {
@@ -1861,7 +1920,7 @@ impl SapodillaApp {
                 Action::LoadedAvocadoPackets(packets) => self.avocado_debug_packets = Some(packets),
                 Action::LoadedImage(res) => match res {
                     Ok(image) => {
-                        self.loaded_images.push(image);
+                        self.add_new_artwork(image);
                     }
                     Err(err) => self.error = Some(err),
                 },
@@ -1888,6 +1947,10 @@ impl SapodillaApp {
                         replacement.locked = existing.locked;
                         replacement.visible = existing.visible;
                         replacement.enable_cutting = existing.enable_cutting;
+                        replacement.template_fit = template_slot
+                            .as_ref()
+                            .map(|slot| slot.fit)
+                            .unwrap_or(existing.template_fit);
                         if let Some(slot) = template_slot {
                             place_image_in_placeholder(&mut replacement, &slot);
                         } else {
@@ -2583,15 +2646,15 @@ impl SapodillaApp {
                 ui.close();
             }
             ui.menu_button("Save As", |ui| {
-                if ui.button("Sticker (.stix)").clicked() {
+                if ui.button("Sticker project (.sapodilla)").clicked() {
                     self.save_document(DocumentKind::Sticker);
                     ui.close();
                 }
-                if ui.button("Sheet (.stixcut)").clicked() {
+                if ui.button("Sheet project (.sapodilla)").clicked() {
                     self.save_document(DocumentKind::Sheet);
                     ui.close();
                 }
-                if ui.button("Template (.stixtpl)").clicked() {
+                if ui.button("Template project (.sapodilla)").clicked() {
                     self.save_document(DocumentKind::Template);
                     ui.close();
                 }
@@ -2814,36 +2877,56 @@ impl SapodillaApp {
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("Left").clicked() {
                 for &index in &self.selected_images {
-                    self.loaded_images[index].offset.x = 0.0;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::Left,
+                    );
                 }
             }
             if ui.small_button("Center X").clicked() {
                 for &index in &self.selected_images {
-                    let width = self.loaded_images[index].size().x;
-                    self.loaded_images[index].offset.x = (canvas.x - width) / 2.0;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::CenterX,
+                    );
                 }
             }
             if ui.small_button("Right").clicked() {
                 for &index in &self.selected_images {
-                    let width = self.loaded_images[index].size().x;
-                    self.loaded_images[index].offset.x = canvas.x - width;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::Right,
+                    );
                 }
             }
             if ui.small_button("Top").clicked() {
                 for &index in &self.selected_images {
-                    self.loaded_images[index].offset.y = 0.0;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::Top,
+                    );
                 }
             }
             if ui.small_button("Middle").clicked() {
                 for &index in &self.selected_images {
-                    let height = self.loaded_images[index].size().y;
-                    self.loaded_images[index].offset.y = (canvas.y - height) / 2.0;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::Middle,
+                    );
                 }
             }
             if ui.small_button("Bottom").clicked() {
                 for &index in &self.selected_images {
-                    let height = self.loaded_images[index].size().y;
-                    self.loaded_images[index].offset.y = canvas.y - height;
+                    align_image_to_sheet(
+                        &mut self.loaded_images[index],
+                        canvas,
+                        SheetAlignment::Bottom,
+                    );
                 }
             }
         });
@@ -2883,6 +2966,7 @@ impl SapodillaApp {
                     .iter_mut()
                     .find(|image| image.id == image_id)
                 {
+                    image.template_fit = slot.fit;
                     place_image_in_placeholder(image, slot);
                     image.locked = true;
                 }
@@ -2896,14 +2980,38 @@ impl SapodillaApp {
                 .contains(&self.loaded_images[index].id);
             let mut adjustment_request = None;
             let mut edge_removal_request = None;
-            let template_slot = self.template_placeholders.iter().find(|placeholder| {
+            let template_slot_index = self.template_placeholders.iter().position(|placeholder| {
                 placeholder.assigned_image_id.as_ref() == Some(&self.loaded_images[index].id)
             });
-            if let Some(slot) = template_slot {
+            if let Some(slot_index) = template_slot_index {
+                let slot = &mut self.template_placeholders[slot_index];
                 ui.label(format!("Template slot: {} ({:?})", slot.name, slot.fit));
+                let previous_fit = slot.fit;
+                egui::ComboBox::from_label("Slot fit")
+                    .selected_text(placeholder_fit_label(slot.fit))
+                    .show_ui(ui, |ui| {
+                        for fit in [
+                            PlaceholderFit::Contain,
+                            PlaceholderFit::Cover,
+                            PlaceholderFit::Stretch,
+                        ] {
+                            ui.selectable_value(&mut slot.fit, fit, placeholder_fit_label(fit));
+                        }
+                    });
+                if slot.fit != previous_fit {
+                    let slot = slot.clone();
+                    if let Some(image) = self
+                        .loaded_images
+                        .iter_mut()
+                        .find(|image| slot.assigned_image_id.as_ref() == Some(&image.id))
+                    {
+                        image.template_fit = slot.fit;
+                        place_image_in_placeholder(image, &slot);
+                    }
+                }
             }
             if ui
-                .button(if template_slot.is_some() {
+                .button(if template_slot_index.is_some() {
                     "Replace slot artwork…"
                 } else {
                     "Replace artwork…"
@@ -2945,7 +3053,29 @@ impl SapodillaApp {
                 ui.small("Available in native builds with the background-ml feature enabled.");
             });
             let image = &mut self.loaded_images[index];
-            ui.text_edit_singleline(&mut image.name);
+            if template_slot_index.is_none() {
+                egui::ComboBox::from_label("Template slot fit")
+                    .selected_text(placeholder_fit_label(image.template_fit))
+                    .show_ui(ui, |ui| {
+                        for fit in [
+                            PlaceholderFit::Contain,
+                            PlaceholderFit::Cover,
+                            PlaceholderFit::Stretch,
+                        ] {
+                            ui.selectable_value(
+                                &mut image.template_fit,
+                                fit,
+                                placeholder_fit_label(fit),
+                            );
+                        }
+                    });
+                ui.small("Used if this artwork is saved as a template slot.");
+            }
+            ui.horizontal(|ui| {
+                let label = ui.label("Selected artwork name");
+                ui.text_edit_singleline(&mut image.name)
+                    .labelled_by(label.id);
+            });
             ui.add(
                 egui::Slider::new(&mut image.rotation_degrees, -180.0..=180.0)
                     .suffix("°")
@@ -3173,6 +3303,20 @@ impl SapodillaApp {
 
         ui.separator();
         ui.strong("Add printer");
+        let previous_transport = self.selected_transport_index;
+        egui::ComboBox::from_label("Transport")
+            .selected_text(self.transport_names[self.selected_transport_index].as_ref())
+            .show_index(
+                ui,
+                &mut self.selected_transport_index,
+                self.transport_names.len(),
+                |index| self.transport_names[index].as_ref(),
+            );
+        if self.selected_transport_index != previous_transport {
+            self.discovered_devices.clear();
+            self.selected_transport_device = None;
+            self.discovering_devices = false;
+        }
         if self.transport_status == TransportStatus::Connecting {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -3223,6 +3367,37 @@ impl SapodillaApp {
         {
             self.connect_transport();
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SheetAlignment {
+    Left,
+    CenterX,
+    Right,
+    Top,
+    Middle,
+    Bottom,
+}
+
+fn align_image_to_sheet(image: &mut LoadedImage, canvas: Vec2, alignment: SheetAlignment) {
+    let visual_offset = image.visual_offset();
+    let visual_size = image.rotated_size();
+    match alignment {
+        SheetAlignment::Left => image.offset.x -= visual_offset.x,
+        SheetAlignment::CenterX => image.offset.x = (canvas.x - image.size().x) / 2.0,
+        SheetAlignment::Right => image.offset.x += canvas.x - visual_offset.x - visual_size.x,
+        SheetAlignment::Top => image.offset.y -= visual_offset.y,
+        SheetAlignment::Middle => image.offset.y = (canvas.y - image.size().y) / 2.0,
+        SheetAlignment::Bottom => image.offset.y += canvas.y - visual_offset.y - visual_size.y,
+    }
+}
+
+const fn placeholder_fit_label(fit: PlaceholderFit) -> &'static str {
+    match fit {
+        PlaceholderFit::Contain => "Contain",
+        PlaceholderFit::Cover => "Cover",
+        PlaceholderFit::Stretch => "Stretch",
     }
 }
 
@@ -3537,10 +3712,10 @@ impl eframe::App for SapodillaApp {
 
                     if theme::toolbar_toggle(ui, accent, &mut self.show_library_panel, "Library")
                         .clicked()
+                        && compact_layout
+                        && self.show_library_panel
                     {
-                        if compact_layout && self.show_library_panel {
-                            self.show_inspector_panel = false;
-                        }
+                        self.show_inspector_panel = false;
                     }
                     if theme::toolbar_toggle(
                         ui,
@@ -3549,10 +3724,10 @@ impl eframe::App for SapodillaApp {
                         "Inspector",
                     )
                     .clicked()
+                        && compact_layout
+                        && self.show_inspector_panel
                     {
-                        if compact_layout && self.show_inspector_panel {
-                            self.show_library_panel = false;
-                        }
+                        self.show_library_panel = false;
                     }
 
                     if !compact_layout {
@@ -3660,11 +3835,16 @@ impl eframe::App for SapodillaApp {
                                 ui.horizontal(|ui| {
                                     let image = egui::Image::new(asset.sized_texture)
                                         .fit_to_exact_size(Vec2::splat(52.0));
-                                    if ui
-                                        .add(egui::Button::image(image))
-                                        .on_hover_text("Add to sheet")
-                                        .clicked()
-                                    {
+                                    let add_button = ui.add(egui::Button::image(image));
+                                    let add_label = format!("Add {} to sheet", asset.name);
+                                    add_button.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            add_label.clone(),
+                                        )
+                                    });
+                                    if add_button.on_hover_text("Add to sheet").clicked() {
                                         add = Some(index);
                                     }
                                     ui.vertical(|ui| {
@@ -3684,9 +3864,7 @@ impl eframe::App for SapodillaApp {
                         if let Some(index) = add {
                             let mut image = self.library[index].clone();
                             image.id = format!("image-{}", Uuid::new_v4());
-                            image.offset =
-                                ((self.get_canvas().size - image.size()) / 2.0).to_pos2();
-                            self.loaded_images.push(image);
+                            self.add_new_artwork(image);
                         }
                         if let Some(index) = remove {
                             self.library.remove(index);
@@ -3767,49 +3945,58 @@ impl eframe::App for SapodillaApp {
 
                         self.device_status(ui);
 
-                        ui.collapsing("Production queue", |ui| {
-                            let jobs = self.job_queue.jobs().cloned().collect::<Vec<_>>();
-                            let mut cancel = None;
-                            let mut retry = None;
-                            for job in jobs {
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("#{} {}", job.id, job.spec.name));
-                                        ui.label(format!("{:?}", job.status));
-                                    });
-                                    ui.add(
-                                        egui::ProgressBar::new(
-                                            f32::from(job.progress_percent) / 100.0,
-                                        )
-                                        .show_percentage(),
-                                    );
-                                    if let Some(error) = &job.error {
-                                        ui.small(error);
-                                    }
-                                    ui.horizontal(|ui| {
-                                        if job.status == QueueJobStatus::Queued
-                                            && ui.small_button("Cancel").clicked()
-                                        {
-                                            cancel = Some(job.id);
-                                        }
-                                        if matches!(
-                                            job.status,
-                                            QueueJobStatus::Error | QueueJobStatus::Cancelled
-                                        ) && self.pending_print_jobs.contains_key(&job.id)
-                                            && ui.small_button("Retry").clicked()
-                                        {
-                                            retry = Some(job.id);
-                                        }
-                                    });
-                                });
-                            }
-                            if let Some(job_id) = cancel {
-                                let _ = self.job_queue.cancel(job_id);
-                            }
-                            if let Some(job_id) = retry {
-                                let _ = self.job_queue.retry(job_id);
-                            }
+                        let jobs = self.job_queue.jobs().cloned().collect::<Vec<_>>();
+                        let queue_needs_attention = jobs.iter().any(|job| {
+                            matches!(
+                                job.status,
+                                QueueJobStatus::Error | QueueJobStatus::Cancelled
+                            )
                         });
+                        egui::CollapsingHeader::new(format!("Production queue ({})", jobs.len()))
+                            .id_salt("production_queue")
+                            .default_open(queue_needs_attention)
+                            .show(ui, |ui| {
+                                let mut cancel = None;
+                                let mut retry = None;
+                                for job in jobs {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("#{} {}", job.id, job.spec.name));
+                                            ui.label(format!("{:?}", job.status));
+                                        });
+                                        ui.add(
+                                            egui::ProgressBar::new(
+                                                f32::from(job.progress_percent) / 100.0,
+                                            )
+                                            .show_percentage(),
+                                        );
+                                        if let Some(error) = &job.error {
+                                            ui.small(error);
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if job.status == QueueJobStatus::Queued
+                                                && ui.small_button("Cancel").clicked()
+                                            {
+                                                cancel = Some(job.id);
+                                            }
+                                            if matches!(
+                                                job.status,
+                                                QueueJobStatus::Error | QueueJobStatus::Cancelled
+                                            ) && self.pending_print_jobs.contains_key(&job.id)
+                                                && ui.small_button("Retry").clicked()
+                                            {
+                                                retry = Some(job.id);
+                                            }
+                                        });
+                                    });
+                                }
+                                if let Some(job_id) = cancel {
+                                    let _ = self.job_queue.cancel(job_id);
+                                }
+                                if let Some(job_id) = retry {
+                                    let _ = self.job_queue.retry(job_id);
+                                }
+                            });
 
                         ui.separator();
 
@@ -4294,6 +4481,22 @@ impl eframe::App for SapodillaApp {
                                     }
                                 });
                             }
+                        } else {
+                            ui.separator();
+                            ui.heading("Cut Preparation");
+                            theme::muted(
+                                ui,
+                                "Cutline generation and editing are available in Print & Cut mode.",
+                            );
+                            if ui.button("Switch to Print & Cut").clicked()
+                                && let Some(mode) = DEVICES[self.selected_device]
+                                    .modes
+                                    .iter()
+                                    .position(|mode| mode.mode_type.has_cutting())
+                            {
+                                self.selected_mode = mode;
+                                self.selected_canvas_size = 0;
+                            }
                         }
 
                         ui.separator();
@@ -4355,7 +4558,6 @@ impl eframe::App for SapodillaApp {
             .exact_height(44.0)
             .frame(theme::panel_frame(ctx.style().visuals.dark_mode))
             .show(ctx, |ui| {
-                let show_shortcut_hint = ui.available_width() >= 900.0;
                 ui.horizontal(|ui| {
                     let canvas = self.get_canvas().size;
                     let dpi = DEVICES[self.selected_device].dpi;
@@ -4385,11 +4587,20 @@ impl eframe::App for SapodillaApp {
                         ui.colored_label(palette.kiss_text, "— Kiss cut");
                         ui.colored_label(palette.perforation_text, "-- Perforation");
                     }
-                    if show_shortcut_hint {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            theme::muted(ui, "Double-click canvas to fit · Scroll to zoom");
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::secondary_button(ui, accent, "Fit sheet")
+                            .on_hover_text("Fit the full sheet in the workspace")
+                            .clicked()
+                        {
+                            self.canvas_fit_requested = true;
+                        }
+                        if ui.available_width() >= 460.0 {
+                            theme::muted(
+                                ui,
+                                "Ctrl/Cmd+scroll or pinch to zoom · drag blank canvas to pan",
+                            );
+                        }
+                    });
                 });
             });
 
@@ -4939,6 +5150,9 @@ fn current_timestamp_millis() -> u64 {
 }
 
 #[cfg(test)]
+mod ui_tests;
+
+#[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
@@ -5284,6 +5498,43 @@ mod tests {
             size: Vec2::new(1200.0, 2100.0),
             safe_area: Vec2::new(1200.0, 2100.0),
         }
+    }
+
+    #[test]
+    fn new_artwork_normalization_handles_small_and_oversized_sources() {
+        let context = egui::Context::default();
+        let source = image::RgbaImage::new(240, 150);
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                source.as_bytes(),
+                source.width(),
+                source.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+
+        let sheet = canvas();
+        let mut small = LoadedImage::new(&context, &png, None).unwrap();
+        normalize_new_artwork(&mut small, &sheet);
+        assert!(small.size().x >= sheet.safe_area.x * NEW_ARTWORK_MIN_FRACTION);
+        assert!(small.size().y >= sheet.safe_area.y * NEW_ARTWORK_MIN_FRACTION);
+        assert_eq!(
+            small.visual_offset(),
+            ((sheet.size - small.rotated_size()) / 2.0).to_pos2()
+        );
+
+        let mut oversized = LoadedImage::new(&context, &png, None).unwrap();
+        oversized.sized_texture.size = Vec2::new(4000.0, 3000.0);
+        normalize_new_artwork(&mut oversized, &sheet);
+        assert!(oversized.size().x <= sheet.safe_area.x * NEW_ARTWORK_MAX_FRACTION + 0.01);
+        assert!(oversized.size().y <= sheet.safe_area.y * NEW_ARTWORK_MAX_FRACTION + 0.01);
+        assert!(oversized.scale.x.is_finite() && oversized.scale.x > 0.0);
+        assert_eq!(oversized.scale.x, oversized.scale.y);
+        assert_eq!(
+            oversized.visual_offset(),
+            ((sheet.size - oversized.rotated_size()) / 2.0).to_pos2()
+        );
     }
 
     #[test]
