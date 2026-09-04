@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use crate::{
     SapodillaApp,
-    app::peel_tab_unmirrored,
+    app::{CanvasUnit, peel_tab_unmirrored},
     cut::apply_overcut,
     export::toolpath_stats_iter,
     protocol::DEVICES,
@@ -24,6 +24,9 @@ const CUT_LINE_WIDTH: f32 = 3.0;
 const MIN_GRID_SCREEN_SPACING: f32 = 24.0;
 const MAX_GRID_LINES_PER_AXIS: usize = 512;
 const RULER_SIZE: f32 = 24.0;
+const CANVAS_BORDER_WIDTH: f32 = 4.0;
+const MIN_SCENE_SCALE: f32 = 0.1;
+const MAX_SCENE_SCALE: f32 = 3.0;
 const TRANSFORM_HANDLE_SIZE: f32 = 9.0;
 const TRANSFORM_HIT_SIZE: f32 = 32.0;
 const ROTATION_HANDLE_OFFSET: f32 = 32.0;
@@ -177,22 +180,26 @@ pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
 }
 
 pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuAction> {
-    let scene = Scene::new().zoom_range(0.1..=3.0);
+    let scene = Scene::new().zoom_range(MIN_SCENE_SCALE..=MAX_SCENE_SCALE);
+    let viewport_size = ui.available_size_before_wrap();
 
-    let mut inner_rect = Rect::NAN;
+    let mut canvas_content_rect = Rect::NAN;
     let mut canvas_rect = state.canvas_rect;
     let mut artwork_action = None;
 
     let response = scene
         .show(ui, &mut canvas_rect, |ui| {
-            Frame::canvas(ui.style())
+            let document = Frame::canvas(ui.style())
                 .fill(state.background_color32())
                 .inner_margin(0.0)
-                .stroke(Stroke::new(4.0_f32, Color32::BLACK))
-                .show(ui, |ui| {
-                    artwork_action = frame(ui, state);
-                });
-            inner_rect = ui.min_rect();
+                .stroke(Stroke::new(CANVAS_BORDER_WIDTH, Color32::BLACK))
+                .show(ui, |ui| frame(ui, state));
+            let (action, ruler_bounds, content_rect) = document.inner;
+            artwork_action = action;
+            canvas_content_rect = content_rect;
+            if let Some(ruler_bounds) = ruler_bounds {
+                ui.expand_to_include_rect(ruler_bounds);
+            }
         })
         .response;
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Panel, true, "Artwork canvas"));
@@ -203,20 +210,29 @@ pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::Art
         || state.canvas_fit_requested
         || state.previous_canvas_size != state.get_canvas().size
     {
-        state.canvas_rect = inner_rect.shrink(ui.style().spacing.menu_spacing);
+        state.canvas_rect = fitted_scene_rect(
+            canvas_content_rect,
+            viewport_size,
+            state.show_rulers,
+            ui.style().spacing.menu_spacing,
+        );
         state.previous_canvas_size = state.get_canvas().size;
         state.canvas_fit_requested = false;
     }
     artwork_action
 }
 
-fn frame(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuAction> {
+fn frame(
+    ui: &mut Ui,
+    state: &mut SapodillaApp,
+) -> (Option<super::ArtworkMenuAction>, Option<Rect>, Rect) {
     let size = state.get_canvas().size;
 
     ui.set_min_size(size);
     ui.set_max_size(size);
 
     let (response, mut painter) = ui.allocate_painter(size, Sense::empty());
+    let scene_painter = ui.painter().clone();
 
     let to_screen = emath::RectTransform::from_to(
         Rect::from_min_size(Pos2::ZERO, response.rect.size()),
@@ -271,6 +287,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuActi
             size,
             dpi,
             state.grid_spacing_mm,
+            state.ruler_unit,
             scene_scale,
         );
     }
@@ -503,17 +520,22 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuActi
 
     paint_transform_controls(&painter, state, &to_screen, scene_scale);
 
-    if state.show_rulers {
+    let ruler_bounds = if state.show_rulers {
+        let layout = RulerLayout::outside(response.rect, scene_scale);
         paint_rulers(
-            &painter,
-            response.rect,
+            &scene_painter,
+            layout,
             ui.clip_rect(),
             size,
             dpi,
             state.grid_spacing_mm,
+            state.ruler_unit,
             scene_scale,
         );
-    }
+        Some(layout.bounds())
+    } else {
+        None
+    };
 
     if let Some(remove) = remove {
         let context = super::ArtworkMenuContext::single(
@@ -524,7 +546,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) -> Option<super::ArtworkMenuActi
         );
         menu_action = Some(context.action(super::ArtworkMenuCommand::Remove));
     }
-    menu_action
+    (menu_action, ruler_bounds, response.rect)
 }
 
 fn transform_gesture_image_id(gesture: &TransformGesture) -> &str {
@@ -1107,15 +1129,15 @@ fn nice_step_ceiling(value: f32) -> f32 {
     nice * magnitude
 }
 
-fn adaptive_grid_step_mm(
-    requested_mm: f32,
-    pixels_per_mm: f32,
+fn adaptive_grid_step(
+    requested: f32,
+    pixels_per_unit: f32,
     scene_scale: f32,
     extent_pixels: f32,
 ) -> f32 {
-    let base = requested_mm.clamp(0.5, 100.0);
-    let screen_requirement = MIN_GRID_SCREEN_SPACING / (pixels_per_mm * scene_scale).max(0.001);
-    let count_requirement = extent_pixels / pixels_per_mm / MAX_GRID_LINES_PER_AXIS as f32;
+    let base = requested.max(f32::EPSILON);
+    let screen_requirement = MIN_GRID_SCREEN_SPACING / (pixels_per_unit * scene_scale).max(0.001);
+    let count_requirement = extent_pixels / pixels_per_unit / MAX_GRID_LINES_PER_AXIS as f32;
     let required = screen_requirement.max(count_requirement);
     if required <= base {
         base
@@ -1145,16 +1167,17 @@ fn paint_grid(
     canvas_size: Vec2,
     dpi: f32,
     requested_mm: f32,
+    unit: CanvasUnit,
     scene_scale: f32,
 ) {
-    let pixels_per_mm = dpi / 25.4;
-    let step_mm = adaptive_grid_step_mm(
-        requested_mm,
-        pixels_per_mm,
+    let pixels_per_unit = unit.pixels_per_unit(dpi);
+    let step = adaptive_grid_step(
+        unit.from_mm(requested_mm, dpi),
+        pixels_per_unit,
         scene_scale,
         canvas_size.x.max(canvas_size.y),
     );
-    let step_pixels = step_mm * pixels_per_mm;
+    let step_pixels = step * pixels_per_unit;
     let minor = Stroke::new(
         0.75 / scene_scale,
         Color32::from_rgba_unmultiplied(80, 96, 112, 42),
@@ -1194,129 +1217,181 @@ fn paint_grid(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RulerLayout {
+    canvas: Rect,
+    top: Rect,
+    left: Rect,
+    corner: Rect,
+}
+
+fn fitted_scene_rect(
+    canvas_rect: Rect,
+    viewport_size: Vec2,
+    show_rulers: bool,
+    padding_screen: f32,
+) -> Rect {
+    let document_bounds = canvas_rect.expand(CANVAS_BORDER_WIDTH);
+    let ruler_screen = if show_rulers { RULER_SIZE } else { 0.0 };
+    let reserved_screen = ruler_screen + padding_screen.max(0.0) * 2.0;
+    let available = Vec2::new(
+        (viewport_size.x - reserved_screen).max(1.0),
+        (viewport_size.y - reserved_screen).max(1.0),
+    );
+    let scale = (available / document_bounds.size())
+        .min_elem()
+        .clamp(MIN_SCENE_SCALE, MAX_SCENE_SCALE);
+    let ruler_scene = ruler_screen / scale;
+    let padding_scene = padding_screen.max(0.0) / scale;
+    Rect::from_min_max(
+        document_bounds.min - Vec2::splat(ruler_scene),
+        document_bounds.max,
+    )
+    .expand(padding_scene)
+}
+
+impl RulerLayout {
+    fn outside(canvas_rect: Rect, scene_scale: f32) -> Self {
+        let band = RULER_SIZE / scene_scale.max(0.001);
+        let document_edge = canvas_rect.expand(CANVAS_BORDER_WIDTH);
+        Self {
+            canvas: canvas_rect,
+            top: Rect::from_min_max(
+                Pos2::new(document_edge.left(), document_edge.top() - band),
+                document_edge.right_top(),
+            ),
+            left: Rect::from_min_max(
+                Pos2::new(document_edge.left() - band, document_edge.top()),
+                document_edge.left_bottom(),
+            ),
+            corner: Rect::from_min_max(document_edge.min - Vec2::splat(band), document_edge.min),
+        }
+    }
+
+    fn bounds(self) -> Rect {
+        self.top.union(self.left).union(self.corner)
+    }
+}
+
 fn paint_rulers(
     painter: &Painter,
-    canvas_rect: Rect,
+    layout: RulerLayout,
     viewport_rect: Rect,
     canvas_size: Vec2,
     dpi: f32,
     requested_mm: f32,
+    unit: CanvasUnit,
     scene_scale: f32,
 ) {
-    let visible = canvas_rect.intersect(viewport_rect);
-    if !visible.is_positive() {
+    let canvas_rect = layout.canvas;
+    if !layout.bounds().intersects(viewport_rect) {
         return;
     }
 
-    let pixels_per_mm = dpi / 25.4;
-    let step_mm = adaptive_grid_step_mm(
-        requested_mm,
-        pixels_per_mm,
+    let pixels_per_unit = unit.pixels_per_unit(dpi);
+    let step = adaptive_grid_step(
+        unit.from_mm(requested_mm, dpi),
+        pixels_per_unit,
         scene_scale,
         canvas_size.x.max(canvas_size.y),
     );
-    let step_pixels = step_mm * pixels_per_mm;
-    let band = RULER_SIZE / scene_scale;
+    let step_pixels = step * pixels_per_unit;
+    let band = layout.top.height();
     let stroke_width = 1.0 / scene_scale;
-    let top_band = Rect::from_min_max(
-        visible.min,
-        Pos2::new(
-            visible.right(),
-            (visible.top() + band).min(visible.bottom()),
-        ),
-    );
-    let left_band = Rect::from_min_max(
-        visible.min,
-        Pos2::new(
-            (visible.left() + band).min(visible.right()),
-            visible.bottom(),
-        ),
-    );
-    let overlay = painter.with_clip_rect(visible);
+    let overlay = painter.with_clip_rect(viewport_rect);
     let fill = Color32::from_rgba_unmultiplied(245, 248, 250, 232);
-    overlay.rect_filled(top_band, 0.0, fill);
-    overlay.rect_filled(left_band, 0.0, fill);
+    overlay.rect_filled(layout.top, 0.0, fill);
+    overlay.rect_filled(layout.left, 0.0, fill);
     overlay.line_segment(
-        [top_band.left_bottom(), top_band.right_bottom()],
+        [layout.top.left_bottom(), layout.top.right_bottom()],
         Stroke::new(stroke_width, Color32::from_gray(105)),
     );
     overlay.line_segment(
-        [left_band.right_top(), left_band.right_bottom()],
+        [layout.left.right_top(), layout.left.right_bottom()],
         Stroke::new(stroke_width, Color32::from_gray(105)),
     );
 
     let font = FontId::monospace(9.0 / scene_scale);
     let tick_color = Color32::from_gray(75);
-    let first_x = (((visible.left() - canvas_rect.left()) / step_pixels).floor() as isize).max(0);
-    let last_x = (((visible.right() - canvas_rect.left()) / step_pixels).ceil() as usize)
+    let visible_left = viewport_rect.left().max(canvas_rect.left());
+    let visible_right = viewport_rect.right().min(canvas_rect.right());
+    let first_x = (((visible_left - canvas_rect.left()) / step_pixels).floor() as isize).max(0);
+    let last_x = (((visible_right - canvas_rect.left()) / step_pixels).ceil() as usize)
         .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
     for index in first_x as usize..=last_x {
         let x = canvas_rect.left() + index as f32 * step_pixels;
-        if x > canvas_rect.right() {
+        if x > canvas_rect.right() || visible_left > visible_right {
             break;
         }
         let major = index % 5 == 0;
         let tick = if major { band * 0.5 } else { band * 0.25 };
         overlay.line_segment(
             [
-                Pos2::new(x, top_band.bottom()),
-                Pos2::new(x, top_band.bottom() - tick),
+                Pos2::new(x, layout.top.bottom()),
+                Pos2::new(x, layout.top.bottom() - tick),
             ],
             Stroke::new(stroke_width, tick_color),
         );
-        if major && x >= left_band.right() {
+        if major {
             overlay.text(
-                Pos2::new(x + 2.0 / scene_scale, top_band.top() + 2.0 / scene_scale),
+                Pos2::new(x + 2.0 / scene_scale, layout.top.top() + 2.0 / scene_scale),
                 Align2::LEFT_TOP,
-                format_tick(index as f32 * step_mm),
+                format_tick(index as f32 * step, unit),
                 font.clone(),
                 tick_color,
             );
         }
     }
 
-    let first_y = (((visible.top() - canvas_rect.top()) / step_pixels).floor() as isize).max(0);
-    let last_y = (((visible.bottom() - canvas_rect.top()) / step_pixels).ceil() as usize)
+    let visible_top = viewport_rect.top().max(canvas_rect.top());
+    let visible_bottom = viewport_rect.bottom().min(canvas_rect.bottom());
+    let first_y = (((visible_top - canvas_rect.top()) / step_pixels).floor() as isize).max(0);
+    let last_y = (((visible_bottom - canvas_rect.top()) / step_pixels).ceil() as usize)
         .min(MAX_GRID_LINES_PER_AXIS.saturating_sub(1));
     for index in first_y as usize..=last_y {
         let y = canvas_rect.top() + index as f32 * step_pixels;
-        if y > canvas_rect.bottom() {
+        if y > canvas_rect.bottom() || visible_top > visible_bottom {
             break;
         }
         let major = index % 5 == 0;
         let tick = if major { band * 0.5 } else { band * 0.25 };
         overlay.line_segment(
             [
-                Pos2::new(left_band.right(), y),
-                Pos2::new(left_band.right() - tick, y),
+                Pos2::new(layout.left.right(), y),
+                Pos2::new(layout.left.right() - tick, y),
             ],
             Stroke::new(stroke_width, tick_color),
         );
-        if major && y >= top_band.bottom() {
+        if major {
             overlay.text(
-                Pos2::new(left_band.left() + 2.0 / scene_scale, y + 2.0 / scene_scale),
+                Pos2::new(
+                    layout.left.left() + 2.0 / scene_scale,
+                    y + 2.0 / scene_scale,
+                ),
                 Align2::LEFT_TOP,
-                format_tick(index as f32 * step_mm),
+                format_tick(index as f32 * step, unit),
                 font.clone(),
                 tick_color,
             );
         }
     }
-    overlay.rect_filled(top_band.intersect(left_band), 0.0, Color32::from_gray(225));
+    overlay.rect_filled(layout.corner, 0.0, Color32::from_gray(225));
     overlay.text(
-        top_band.intersect(left_band).center(),
+        layout.corner.center(),
         Align2::CENTER_CENTER,
-        "mm",
+        unit.label(),
         font,
         tick_color,
     );
 }
 
-fn format_tick(value_mm: f32) -> String {
-    if value_mm.fract().abs() < 0.001 {
-        format!("{value_mm:.0}")
+fn format_tick(value: f32, unit: CanvasUnit) -> String {
+    if value.fract().abs() < 0.001 {
+        format!("{value:.0}")
+    } else if unit == CanvasUnit::In {
+        format!("{value:.2}")
     } else {
-        format!("{value_mm:.1}")
+        format!("{value:.1}")
     }
 }
 
@@ -1444,15 +1519,26 @@ mod tests {
     #[test]
     fn physical_grid_spacing_uses_selected_device_dpi() {
         let dpi = 254.0;
-        let step_mm = adaptive_grid_step_mm(10.0, dpi / 25.4, 1.0, 1_000.0);
+        let step_mm = adaptive_grid_step(10.0, dpi / 25.4, 1.0, 1_000.0);
         assert_eq!(step_mm, 10.0);
         assert!((step_mm * dpi / 25.4 - 100.0).abs() < 0.001);
     }
 
     #[test]
+    fn changing_units_preserves_the_physical_grid_spacing() {
+        let dpi = 300.0;
+        let expected_pixels = 10.0 * dpi / 25.4;
+        for unit in CanvasUnit::ALL {
+            let pixels_per_unit = unit.pixels_per_unit(dpi);
+            let step = adaptive_grid_step(unit.from_mm(10.0, dpi), pixels_per_unit, 1.0, 1_000.0);
+            assert!((step * pixels_per_unit - expected_pixels).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn adaptive_grid_uses_nice_steps_and_caps_line_count() {
         let pixels_per_mm = 10.0;
-        let step = adaptive_grid_step_mm(0.5, pixels_per_mm, 0.1, 1_000_000.0);
+        let step = adaptive_grid_step(0.5, pixels_per_mm, 0.1, 1_000_000.0);
         assert_eq!(step, 250.0);
         let ticks = tick_positions(1_000_000.0, step * pixels_per_mm);
         assert!(ticks.len() <= MAX_GRID_LINES_PER_AXIS);
@@ -1462,12 +1548,9 @@ mod tests {
     #[test]
     fn grid_preserves_requested_spacing_until_adaptation_is_needed() {
         for requested in [6.0, 25.0, 75.0] {
-            assert_eq!(
-                adaptive_grid_step_mm(requested, 10.0, 1.0, 1_000.0),
-                requested
-            );
+            assert_eq!(adaptive_grid_step(requested, 10.0, 1.0, 1_000.0), requested);
         }
-        assert_eq!(adaptive_grid_step_mm(6.0, 10.0, 0.01, 1_000.0), 300.0);
+        assert_eq!(adaptive_grid_step(6.0, 10.0, 0.01, 1_000.0), 300.0);
     }
 
     #[test]
@@ -1475,6 +1558,43 @@ mod tests {
         assert!(tick_positions(100.0, 0.0).is_empty());
         assert!(tick_positions(f32::NAN, 10.0).is_empty());
         assert_eq!(nice_step_ceiling(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn ruler_bands_stay_outside_the_document_at_every_zoom() {
+        let canvas = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(400.0, 700.0));
+        let document_edge = canvas.expand(CANVAS_BORDER_WIDTH);
+
+        for scene_scale in [0.1, 0.75, 1.0, 3.0] {
+            let layout = RulerLayout::outside(canvas, scene_scale);
+
+            assert_eq!(layout.canvas, canvas);
+            assert_eq!(layout.top.bottom(), document_edge.top());
+            assert_eq!(layout.left.right(), document_edge.left());
+            assert!(!layout.top.intersect(document_edge).is_positive());
+            assert!(!layout.left.intersect(document_edge).is_positive());
+            assert!(!layout.corner.intersect(document_edge).is_positive());
+            assert!((layout.top.height() * scene_scale - RULER_SIZE).abs() < 0.001);
+            assert!((layout.left.width() * scene_scale - RULER_SIZE).abs() < 0.001);
+            assert!(layout.bounds().contains_rect(layout.top));
+            assert!(layout.bounds().contains_rect(layout.left));
+            assert!(layout.bounds().contains_rect(layout.corner));
+        }
+    }
+
+    #[test]
+    fn fit_reserves_the_full_screen_space_ruler_gutter_at_the_final_scale() {
+        let canvas = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(400.0, 700.0));
+
+        for viewport in [Vec2::new(700.0, 500.0), Vec2::new(1280.0, 720.0)] {
+            let fitted = fitted_scene_rect(canvas, viewport, true, 2.0);
+            let final_scale = (viewport / fitted.size()).min_elem();
+            let layout = RulerLayout::outside(canvas, final_scale);
+
+            assert!(fitted.contains_rect(layout.bounds()));
+            assert!((layout.top.height() * final_scale - RULER_SIZE).abs() < 0.001);
+            assert!((layout.left.width() * final_scale - RULER_SIZE).abs() < 0.001);
+        }
     }
 
     fn assert_pos_close(actual: Pos2, expected: Pos2) {
