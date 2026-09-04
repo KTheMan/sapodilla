@@ -475,6 +475,10 @@ fn library_thumbnail_button_has_an_action_specific_accessible_name() {
     harness.state_mut().library.push(image);
     harness.run();
 
+    harness.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        "Remove Library fixture from Library",
+    );
     harness
         .get_by_role_and_label(
             egui::accesskit::Role::Button,
@@ -491,12 +495,129 @@ fn layer_transform_fields_have_associated_accessible_names() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
     add_selected_fixture(&mut harness);
 
-    harness.get_by_label("Layer name").scroll_to_me();
+    harness.get_by_label("Selected artwork name").scroll_to_me();
     harness.run();
-    harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Layer name");
-    for label in ["X:", "Y:", "W:", "H:", "Layer rotation"] {
+    harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Selected artwork name");
+    for label in ["X:", "Y:", "W:", "H:"] {
         harness.get_by_role_and_label(egui::accesskit::Role::SpinButton, label);
     }
+    harness.get_by_role_and_label(egui::accesskit::Role::Slider, "Rotation");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Unlock artwork proportions");
+}
+
+#[test]
+fn sidebar_icon_controls_have_clear_names_states_and_targets() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+
+    harness.get_by_label("Align artwork left").scroll_to_me();
+    harness.run();
+    for label in [
+        "Align artwork left",
+        "Center artwork horizontally",
+        "Align artwork right",
+        "Align artwork top",
+        "Center artwork vertically",
+        "Align artwork bottom",
+        "Unlock artwork proportions",
+    ] {
+        let node = harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
+        let rect = node.rect();
+        assert!(
+            rect.width() >= 32.0 && rect.height() >= 32.0,
+            "{label} target should be at least 32×32 points, got {rect:?}"
+        );
+    }
+
+    harness.get_by_label("Hide Untitled sticker").scroll_to_me();
+    harness.run();
+    let visibility =
+        harness.get_by_role_and_label(egui::accesskit::Role::Button, "Hide Untitled sticker");
+    assert_eq!(
+        visibility.accesskit_node().data().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    assert!(visibility.rect().width() >= 32.0 && visibility.rect().height() >= 32.0);
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Lock Untitled sticker");
+    harness.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        "Actions for layer Untitled sticker",
+    );
+}
+
+#[test]
+fn compact_layer_row_keeps_every_icon_action_inside_the_viewport() {
+    let mut harness = app_harness(Vec2::new(700.0, 720.0));
+    add_selected_fixture(&mut harness);
+    harness.get_by_label("Inspector").click();
+    harness.run();
+
+    harness
+        .get_by_label("Actions for layer Untitled sticker")
+        .scroll_to_me();
+    harness.run();
+    for label in [
+        "Hide Untitled sticker",
+        "Lock Untitled sticker",
+        "Actions for layer Untitled sticker",
+    ] {
+        let rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, label)
+            .rect();
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 700.0,
+            "{label} should remain inside the compact viewport, got {rect:?}"
+        );
+        assert!(rect.width() >= 32.0 && rect.height() >= 32.0);
+    }
+}
+
+#[test]
+fn adjacent_layers_use_compact_scannable_rows() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let first_layer = fixture_image(&harness, "First layer", Pos2::ZERO);
+    let second_layer = fixture_image(&harness, "Second layer", Pos2::new(50.0, 50.0));
+    harness.state_mut().loaded_images = vec![first_layer, second_layer];
+    harness.state_mut().selected_images = vec![0];
+    harness.run();
+
+    harness
+        .get_by_label("Actions for layer First layer")
+        .scroll_to_me();
+    harness.run();
+    let first = harness.get_by_label("Actions for layer First layer").rect();
+    let second = harness
+        .get_by_label("Actions for layer Second layer")
+        .rect();
+    let row_pitch = (second.center().y - first.center().y).abs();
+    assert!(
+        row_pitch <= 80.0,
+        "adjacent layers should stay compact and scannable, got {row_pitch:.1} points"
+    );
+}
+
+#[test]
+fn layer_thumbnail_accessible_action_selects_the_promised_layer() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let first_layer = fixture_image(&harness, "First layer", Pos2::ZERO);
+    let second_layer = fixture_image(&harness, "Second layer", Pos2::new(50.0, 50.0));
+    harness.state_mut().loaded_images = vec![first_layer, second_layer];
+    harness.state_mut().selected_images = vec![0];
+    harness.run();
+
+    harness
+        .get_by_label("Select layer Second layer from thumbnail")
+        .scroll_to_me();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Select layer Second layer from thumbnail",
+        )
+        .click_accesskit();
+    harness.run();
+
+    assert_eq!(harness.state().selected_images, [1]);
 }
 
 #[test]
@@ -542,10 +663,10 @@ fn rotated_alignment_buttons_use_visible_bounds() {
     harness.state_mut().loaded_images[0].rotation_degrees = 37.0;
     harness.run();
 
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Left");
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Right");
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Top");
-    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Bottom");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Align artwork left");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Align artwork right");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Align artwork top");
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Align artwork bottom");
 
     let canvas = harness.state().get_canvas().size;
     align_image_to_sheet(

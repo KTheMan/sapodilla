@@ -498,13 +498,11 @@ impl<T> DragDropItem for EnumeratedItem<T> {
 )]
 pub fn loaded_images(
     ui: &mut Ui,
-    dpi: f32,
-    canvas_size: Vec2,
     loaded_images: &mut Vec<LoadedImage>,
     selected_images: &mut Vec<usize>,
     mode_type: ModeType,
 ) -> (bool, Option<ArtworkMenuAction>) {
-    ui.heading("Images");
+    ui.heading("Layers");
 
     let mut changed = false;
     let mut select = None;
@@ -534,8 +532,6 @@ pub fn loaded_images(
                 |ui, EnumeratedItem { item, index, .. }, handle, _dragging| {
                     let interaction = image_controls(
                         ui,
-                        dpi,
-                        canvas_size,
                         item,
                         handle,
                         mode_type,
@@ -547,16 +543,11 @@ pub fn loaded_images(
                     if interaction.select {
                         select = Some(index);
                     }
-                    if interaction.remove {
-                        menu_action = Some(ArtworkMenuAction {
-                            image_ids: vec![item.id.clone()],
-                            command: ArtworkMenuCommand::Remove,
-                        });
-                    }
                     if interaction.menu_action.is_some() {
                         menu_action = interaction.menu_action;
                     }
-                    ui.add_space(16.0);
+                    changed |= interaction.changed;
+                    ui.add_space(6.0);
                 },
             );
 
@@ -579,15 +570,13 @@ pub fn loaded_images(
 
 struct ImageControlsInteraction {
     select: bool,
-    remove: bool,
+    changed: bool,
     menu_action: Option<ArtworkMenuAction>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn image_controls(
     ui: &mut Ui,
-    dpi: f32,
-    canvas_size: Vec2,
     image: &mut LoadedImage,
     handle: Handle<'_>,
     mode_type: ModeType,
@@ -598,7 +587,7 @@ fn image_controls(
 ) -> ImageControlsInteraction {
     let mut interaction = ImageControlsInteraction {
         select: false,
-        remove: false,
+        changed: false,
         menu_action: None,
     };
     let own_context = ArtworkMenuContext::single(image, index, image_count, mode_type);
@@ -607,169 +596,155 @@ fn image_controls(
     } else {
         &own_context
     };
-    ui.horizontal(|ui| {
-        let preview = handle.sense(egui::Sense::click_and_drag()).ui(ui, |ui| {
-            let (response, painter) = ui.allocate_painter(Vec2::splat(50.0), egui::Sense::empty());
-
-            painter.image(
-                image.sized_texture.id,
-                response.rect,
-                egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        });
-        let preview_label = format!("Layer preview: {}", image.name);
-        preview.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Image, true, preview_label.clone())
-        });
-        let preview_secondary_clicked = ui.input(|input| {
-            input.pointer.secondary_clicked()
-                && input
-                    .pointer
-                    .interact_pos()
-                    .is_some_and(|pointer| preview.rect.contains(pointer))
-        });
-        if (preview.clicked() || preview_secondary_clicked) && !active {
-            interaction.select = true;
-        }
-        let mut popup = egui::Popup::context_menu(&preview);
-        if preview_secondary_clicked {
-            popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
-        }
-        popup.show(|ui| {
-            if let Some(action) = artwork_context_menu(ui, context) {
-                interaction.menu_action = Some(action);
-            }
-        });
-
-        ui.vertical(|ui| {
-            ui.spacing_mut().interact_size.x = 72.0;
-            ui.spacing_mut().item_spacing.y = 8.0;
-
+    let selected_fill = ui.visuals().selection.bg_fill;
+    let selected_stroke = ui.visuals().selection.stroke;
+    egui::Frame::new()
+        .fill(if active {
+            selected_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(if active {
+            selected_stroke
+        } else {
+            egui::Stroke::NONE
+        })
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(6, 5))
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(active, if active { "Active" } else { "Select" })
-                    .on_hover_text("Make this the active artwork")
-                    .clicked()
-                {
+                let preview = handle.sense(egui::Sense::click_and_drag()).ui(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(crate::icons::DOTS_SIX_VERTICAL).size(16.0));
+                        let (response, painter) =
+                            ui.allocate_painter(Vec2::splat(44.0), egui::Sense::empty());
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Image,
+                                true,
+                                format!("Layer preview: {}", image.name),
+                            )
+                        });
+
+                        painter.image(
+                            image.sized_texture.id,
+                            response.rect,
+                            egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    });
+                });
+                let preview = preview.on_hover_text(format!("Drag to reorder {}", image.name));
+                preview.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Button,
+                        true,
+                        active,
+                        format!("Select layer {} from thumbnail", image.name),
+                    )
+                });
+                let preview_secondary_clicked = ui.input(|input| {
+                    input.pointer.secondary_clicked()
+                        && input
+                            .pointer
+                            .interact_pos()
+                            .is_some_and(|pointer| preview.rect.contains(pointer))
+                });
+                if (preview.clicked() || preview_secondary_clicked) && !active {
                     interaction.select = true;
                 }
-                let label = ui.label("Layer name");
-                ui.text_edit_singleline(&mut image.name)
-                    .labelled_by(label.id);
-                ui.checkbox(&mut image.visible, "Visible");
-                ui.checkbox(&mut image.locked, "Lock");
-            });
-
-            ui.horizontal(|ui| {
-                let x_label = ui.monospace("X:");
-                ui.add(px_slider(
-                    &mut image.offset.x,
-                    dpi,
-                    (-image.sized_texture.size.x * 2.0)
-                        ..=(canvas_size.x + image.sized_texture.size.x * 2.0),
-                ))
-                .labelled_by(x_label.id);
-
-                let y_label = ui.monospace("Y:");
-                ui.add(px_slider(
-                    &mut image.offset.y,
-                    dpi,
-                    (-image.sized_texture.size.y * 2.0)
-                        ..=(canvas_size.y + image.sized_texture.size.y * 2.0),
-                ))
-                .labelled_by(y_label.id);
-            });
-
-            ui.horizontal(|ui| {
-                let width_label = ui.monospace("W:");
-                let mut width = image.size().x;
-                ui.add(px_slider(&mut width, dpi, 1.0..=(canvas_size.x * 10.0)))
-                    .labelled_by(width_label.id);
-
-                if width != image.size().x {
-                    let new_scale = if image.scale_locked {
-                        width / image.size().x * image.scale
-                    } else {
-                        Vec2 {
-                            x: width / image.size().x * image.scale.x,
-                            ..image.scale
-                        }
-                    };
-
-                    image.rescale(new_scale);
+                let mut popup = egui::Popup::context_menu(&preview);
+                if preview_secondary_clicked {
+                    popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+                }
+                popup.show(|ui| {
+                    if let Some(action) = artwork_context_menu(ui, context) {
+                        interaction.menu_action = Some(action);
+                    }
+                });
+                let name_response = ui
+                    .vertical(|ui| {
+                        ui.set_min_width(92.0);
+                        let name = ui.add(
+                            egui::Label::new(egui::RichText::new(&image.name).strong())
+                                .sense(egui::Sense::click()),
+                        );
+                        ui.small(format!("{:.0} × {:.0} px", image.size().x, image.size().y));
+                        name
+                    })
+                    .inner;
+                name_response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Button,
+                        true,
+                        active,
+                        format!("Select layer {}", image.name),
+                    )
+                });
+                if name_response.clicked() && !active {
+                    interaction.select = true;
                 }
 
-                let height_label = ui.monospace("H:");
-                let mut height = image.size().y;
-                ui.add(px_slider(&mut height, dpi, 1.0..=(canvas_size.y * 10.0)))
-                    .labelled_by(height_label.id);
-
-                if height != image.size().y {
-                    let new_scale = if image.scale_locked {
-                        height / image.size().y * image.scale
+                let visibility_label = if image.visible {
+                    format!("Hide {}", image.name)
+                } else {
+                    format!("Show {}", image.name)
+                };
+                if crate::theme::icon_toggle(
+                    ui,
+                    if image.visible {
+                        crate::icons::EYE
                     } else {
-                        Vec2 {
-                            y: height / image.size().y * image.scale.y,
-                            ..image.scale
-                        }
-                    };
-
-                    image.rescale(new_scale);
-                }
-
-                if ui
-                    .small_button(if image.scale_locked { "Unlock" } else { "Lock" })
-                    .clicked()
+                        crate::icons::EYE_SLASH
+                    },
+                    image.visible,
+                    visibility_label.clone(),
+                    visibility_label,
+                )
+                .clicked()
                 {
-                    image.scale_locked = !image.scale_locked;
+                    image.visible = !image.visible;
+                    interaction.changed = true;
                 }
-            });
 
-            ui.horizontal(|ui| {
-                if active {
-                    let menu = ui.menu_button("Actions", |ui| {
+                let lock_label = if image.locked {
+                    format!("Unlock {}", image.name)
+                } else {
+                    format!("Lock {}", image.name)
+                };
+                if crate::theme::icon_toggle(
+                    ui,
+                    if image.locked {
+                        crate::icons::LOCK
+                    } else {
+                        crate::icons::LOCK_OPEN
+                    },
+                    image.locked,
+                    lock_label.clone(),
+                    lock_label,
+                )
+                .clicked()
+                {
+                    image.locked = !image.locked;
+                    interaction.changed = true;
+                }
+
+                ui.spacing_mut().interact_size = Vec2::splat(32.0);
+                let menu = ui.menu_button(
+                    egui::RichText::new(crate::icons::DOTS_THREE).size(17.0),
+                    |ui| {
                         if let Some(action) = artwork_context_menu(ui, context) {
                             interaction.menu_action = Some(action);
                         }
-                    });
-                    let actions_label = format!("Actions for layer {}", image.name);
-                    menu.response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
-                            true,
-                            actions_label.clone(),
-                        )
-                    });
-                }
-                if ui
-                    .add_enabled(!image.locked, egui::Button::new("Remove"))
-                    .on_disabled_hover_text("Unlock this artwork to remove it")
-                    .clicked()
-                {
-                    interaction.remove = true;
-                }
+                    },
+                );
+                let actions_label = format!("Actions for layer {}", image.name);
+                menu.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, actions_label.clone())
+                });
+                menu.response.on_hover_text(actions_label);
             });
-
-            if interaction.remove {
-                ui.ctx().request_repaint();
-            }
-
-            let rotation_label = ui.label("Layer rotation");
-            ui.add(
-                egui::DragValue::new(&mut image.rotation_degrees)
-                    .speed(0.25)
-                    .range(-180.0..=180.0)
-                    .suffix("° rotation"),
-            )
-            .labelled_by(rotation_label.id);
-
-            if mode_type.has_cutting() {
-                ui.checkbox(&mut image.enable_cutting, "Cut")
-                    .on_hover_text("Enable cut line generation for this image");
-            }
         });
-    });
     interaction
 }
 

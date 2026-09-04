@@ -34,6 +34,7 @@ are recorded in the [UI accessibility claims](docs/ui-accessibility-claims.md).
     - [x] DPI-aware rulers, configurable grid, and direct resize/rotation handles
     - [x] Reorderable layers, multi-selection, sheet alignment, and smart snapping
     - [x] Shared canvas and layer context actions for duplicate, arrange, transform, state, and removal
+    - [x] Compact icon-assisted layer, alignment, and Library controls with named accessible actions
     - [x] Brightness, contrast, saturation, and hue controls
     - [x] One-click in-process edge-background removal (no upload)
     - [x] Native-only on-device neural background removal with first-use model download and caching
