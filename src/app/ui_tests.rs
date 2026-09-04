@@ -11,6 +11,78 @@ fn app_harness(size: Vec2) -> Harness<'static, SapodillaApp> {
         .build_eframe(|cc| SapodillaApp::new(cc))
 }
 
+fn open_calibration_fixture(harness: &mut Harness<'_, SapodillaApp>) {
+    let wizard = CalibrationWizard::new("ui-calibration", 1).unwrap();
+    harness.state_mut().calibration_session = Some(CalibrationSession {
+        printer_id: "printer-a".into(),
+        printer_key: PrinterCalibrationKey {
+            identity: StablePrinterIdentity::SerialNumber {
+                serial_number: "SERIAL-A".into(),
+            },
+            model: "DHP700".into(),
+            firmware_revision: "1.0".into(),
+            media_size: 5013,
+            media_type: 2030,
+        },
+        wizard,
+        baseline_profile_id: None,
+        baseline_profile_version: default_calibration_profile_version(),
+        baseline_mapping: CanvasToPlotter::legacy_pixcut_s1(2100.0),
+        material: MaterialProfile::built_ins().remove(0),
+        candidate: None,
+        candidate_mapping: None,
+        validation_metrics: None,
+        training_scan_report: None,
+        validation_scan_report: None,
+        training_scan_preview_png: None,
+        validation_scan_preview_png: None,
+        training_scan_preview_sha1: None,
+        validation_scan_preview_sha1: None,
+        primary_queue_job: None,
+        second_queue_job: None,
+        validation_queue_job: None,
+        historical_queue_job_ids: [None; 3],
+        image_sha1: [None, None, None],
+        plotter_sha1: [None, None, None],
+        plotter_commands: std::array::from_fn(|_| Vec::new()),
+        validation_generation: 0,
+        device_job_ids: Vec::new(),
+        validation_device_job_ids: Vec::new(),
+        device_job_ids_by_slot: std::array::from_fn(|_| Vec::new()),
+        physical_sheet_attempts: [0; 3],
+        scan_request_generations: [0; 2],
+    });
+    harness.state_mut().calibration_ui_state = calibration_ui::CalibrationUiState::default();
+    harness.run();
+}
+
+#[test]
+fn calibration_method_chooser_names_printer_media_and_east_bay_credit() {
+    let mut harness = app_harness(Vec2::new(1180.0, 900.0));
+    open_calibration_fixture(&mut harness);
+    harness.get_by_label("Printer: DHP700 · serial SERIAL-A · firmware 1.0");
+    harness.get_by_label(
+        "Media: PixCut S1 · 4×7 sticker paper · Liene Photo · kiss 0 · through 0 · 0 passes",
+    );
+    harness.get_by_label("Flatbed Scanner");
+    harness.get_by_label("Manual");
+    harness.get_by_label("View the documented method");
+    harness.get_by_label("Progress");
+}
+
+#[test]
+fn compact_calibration_uses_progress_header_and_reaches_manual_prepare() {
+    let mut harness = app_harness(Vec2::new(560.0, 720.0));
+    open_calibration_fixture(&mut harness);
+    harness.get_by_label("Step 1 of 1");
+    harness.get_by_label("Use Manual").click_accesskit();
+    harness.run();
+    harness.get_by_label("Next").click_accesskit();
+    harness.run();
+    harness.get_by_label("Before you start");
+    harness.get_by_label("View the documented method");
+}
+
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {
     let ctx = harness.ctx.clone();
     let fixture = include_bytes!("../../docs/review-evidence/transform-fixture.png");

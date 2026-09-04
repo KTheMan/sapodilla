@@ -1,5 +1,22 @@
 # Third-party notices
 
+## East Bay Makers Club PixCut calibration methodology
+
+Sapodilla's guided Manual calibration uses the seven-target measurement
+method publicly documented by East Bay Makers Club in `pixcut-s1`, inspected at
+commit `a73cd65b7374e5b9e1eb7a0c54594f3276c14f8f` (target generator commit
+`f71a8f882b2462990e95554a0927a6e1d9860993`). The Rust target generator,
+artwork, wizard, formulas, and tests in Sapodilla are an independent clean-room
+implementation. No upstream source code or generated artwork is included.
+
+Method credit: East Bay Makers Club · pixcut-s1
+
+Source: https://github.com/eastbaymakersclub/pixcut-s1#calibration-workflow
+
+The inspected upstream repository did not declare a software license. This
+notice therefore credits the publicly documented methodology and does not
+assert or reproduce an upstream license grant.
+
 ## honeymaro/pixcut conformance fixtures
 
 The files under `tests/fixtures/honeymaro-pixcut/` named `square-exact.plt`
