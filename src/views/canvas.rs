@@ -19,8 +19,9 @@ const MIN_GRID_SCREEN_SPACING: f32 = 24.0;
 const MAX_GRID_LINES_PER_AXIS: usize = 512;
 const RULER_SIZE: f32 = 24.0;
 const TRANSFORM_HANDLE_SIZE: f32 = 9.0;
-const TRANSFORM_HIT_SIZE: f32 = 18.0;
+const TRANSFORM_HIT_SIZE: f32 = 26.0;
 const ROTATION_HANDLE_OFFSET: f32 = 32.0;
+const CORNER_ROTATION_ZONE_OFFSET: f32 = 30.0;
 const MIN_IMAGE_SIZE: f32 = 1.0;
 const MAX_IMAGE_SCALE: f32 = 1_000.0;
 
@@ -33,7 +34,7 @@ const NORMAL_UV: Rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1
 pub(crate) enum TransformGesture {
     Resize {
         image_id: String,
-        corner: usize,
+        handle: ResizeHandle,
         offset: Pos2,
         size: Vec2,
         scale: Vec2,
@@ -44,7 +45,73 @@ pub(crate) enum TransformGesture {
     Rotate {
         image_id: String,
         center: Pos2,
+        start_pointer_degrees: f32,
+        initial_rotation_degrees: f32,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeHandle {
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+impl ResizeHandle {
+    const ALL: [Self; 8] = [
+        Self::NorthWest,
+        Self::North,
+        Self::NorthEast,
+        Self::East,
+        Self::SouthEast,
+        Self::South,
+        Self::SouthWest,
+        Self::West,
+    ];
+
+    const fn signs(self) -> Vec2 {
+        match self {
+            Self::NorthWest => Vec2::new(-1.0, -1.0),
+            Self::North => Vec2::new(0.0, -1.0),
+            Self::NorthEast => Vec2::new(1.0, -1.0),
+            Self::East => Vec2::new(1.0, 0.0),
+            Self::SouthEast => Vec2::new(1.0, 1.0),
+            Self::South => Vec2::new(0.0, 1.0),
+            Self::SouthWest => Vec2::new(-1.0, 1.0),
+            Self::West => Vec2::new(-1.0, 0.0),
+        }
+    }
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::NorthWest => "north-west",
+            Self::North => "north",
+            Self::NorthEast => "north-east",
+            Self::East => "east",
+            Self::SouthEast => "south-east",
+            Self::South => "south",
+            Self::SouthWest => "south-west",
+            Self::West => "west",
+        }
+    }
+
+    const fn opposite(self) -> Self {
+        match self {
+            Self::NorthWest => Self::SouthEast,
+            Self::North => Self::South,
+            Self::NorthEast => Self::SouthWest,
+            Self::East => Self::West,
+            Self::SouthEast => Self::NorthWest,
+            Self::South => Self::North,
+            Self::SouthWest => Self::NorthEast,
+            Self::West => Self::East,
+        }
+    }
 }
 
 pub fn canvas_editor(ui: &mut Ui, state: &mut SapodillaApp) {
@@ -114,6 +181,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
 
     let mut hovers = Vec::new();
     let mut remove = None;
+    let mut selection_translation = None;
 
     for (idx, image) in state.loaded_images.iter_mut().enumerate() {
         if !image.visible {
@@ -148,13 +216,30 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
             }
         }
 
+        // Direct manipulation starts by selecting the object under the pointer,
+        // rather than moving an unselected object while handles remain elsewhere.
+        if rect_response.drag_started() && !state.selected_images.contains(&idx) {
+            let additive = ui.input(|i| i.modifiers.command || i.modifiers.shift);
+            if !additive {
+                state.selected_images.clear();
+            }
+            state.selected_images.push(idx);
+        }
+
         let handle_owns_gesture = transform_active_image_id.as_deref() == Some(&image.id);
         if !image.locked && !handle_owns_gesture && !state.edit_cutlines {
             if rect_response.drag_delta() != Vec2::ZERO {
                 artwork_transform_changed = true;
             }
-            image.offset += rect_response.drag_delta();
-            if state.snap_to_guides && rect_response.dragged() {
+            let drag_delta = rect_response.drag_delta();
+            let moving_selection =
+                state.selected_images.contains(&idx) && state.selected_images.len() > 1;
+            if moving_selection && drag_delta != Vec2::ZERO {
+                selection_translation = Some(drag_delta);
+            } else {
+                image.offset += drag_delta;
+            }
+            if !moving_selection && state.snap_to_guides && rect_response.dragged() {
                 let snap_tolerance = 6.0 / scene_scale;
                 let visual = image.visual_offset();
                 let visual_size = image.rotated_size();
@@ -187,7 +272,7 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
             }
         }
 
-        if rect_response.hovered() {
+        if rect_response.hovered() && !state.selected_images.contains(&idx) {
             hovers.push(image_rect);
         }
         if state.selected_images.contains(&idx)
@@ -212,6 +297,18 @@ fn frame(ui: &mut Ui, state: &mut SapodillaApp) {
                 image.rotation_degrees,
             );
         }
+    }
+
+    if let Some(delta) = selection_translation {
+        for &selected in &state.selected_images {
+            if let Some(image) = state.loaded_images.get_mut(selected)
+                && image.visible
+                && !image.locked
+            {
+                image.offset += delta;
+            }
+        }
+        artwork_transform_changed = true;
     }
 
     artwork_transform_changed |=
@@ -327,6 +424,25 @@ fn transform_gesture_image_id(gesture: &TransformGesture) -> &str {
     }
 }
 
+fn canceled_transform(
+    gesture: &TransformGesture,
+    current_offset: Pos2,
+    current_scale: Vec2,
+) -> (Pos2, Vec2, f32) {
+    match gesture {
+        TransformGesture::Resize {
+            offset,
+            scale,
+            rotation_degrees,
+            ..
+        } => (*offset, *scale, *rotation_degrees),
+        TransformGesture::Rotate {
+            initial_rotation_degrees,
+            ..
+        } => (current_offset, current_scale, *initial_rotation_degrees),
+    }
+}
+
 fn rotate_vector(vector: Vec2, degrees: f32) -> Vec2 {
     let (sin, cos) = degrees.to_radians().sin_cos();
     Vec2::new(
@@ -351,13 +467,47 @@ fn rotation_handle_position(offset: Pos2, size: Vec2, degrees: f32, distance: f3
     center + rotate_vector(Vec2::new(0.0, -size.y / 2.0 - distance), degrees)
 }
 
+fn resize_handle_position(offset: Pos2, size: Vec2, degrees: f32, handle: ResizeHandle) -> Pos2 {
+    let center = offset + size / 2.0;
+    let signs = handle.signs();
+    center
+        + rotate_vector(
+            Vec2::new(signs.x * size.x / 2.0, signs.y * size.y / 2.0),
+            degrees,
+        )
+}
+
+fn resize_cursor(handle: ResizeHandle, rotation_degrees: f32) -> CursorIcon {
+    let direction = rotate_vector(handle.signs(), rotation_degrees);
+    let octant =
+        ((direction.y.atan2(direction.x).to_degrees() / 45.0).round() as i32).rem_euclid(4);
+    match octant {
+        0 => CursorIcon::ResizeHorizontal,
+        1 => CursorIcon::ResizeNwSe,
+        2 => CursorIcon::ResizeVertical,
+        _ => CursorIcon::ResizeNeSw,
+    }
+}
+
 fn normalize_degrees(degrees: f32) -> f32 {
     (degrees + 180.0).rem_euclid(360.0) - 180.0
 }
 
-fn rotation_from_pointer(center: Pos2, pointer: Pos2, snap: bool) -> f32 {
+fn pointer_rotation_degrees(center: Pos2, pointer: Pos2) -> f32 {
     let delta = pointer - center;
-    let degrees = normalize_degrees(delta.y.atan2(delta.x).to_degrees() + 90.0);
+    normalize_degrees(delta.y.atan2(delta.x).to_degrees() + 90.0)
+}
+
+fn rotation_from_gesture(
+    initial_rotation_degrees: f32,
+    start_pointer_degrees: f32,
+    center: Pos2,
+    pointer: Pos2,
+    snap: bool,
+) -> f32 {
+    let delta =
+        normalize_degrees(pointer_rotation_degrees(center, pointer) - start_pointer_degrees);
+    let degrees = normalize_degrees(initial_rotation_degrees + delta);
     if snap {
         normalize_degrees((degrees / 15.0).round() * 15.0)
     } else {
@@ -366,18 +516,18 @@ fn rotation_from_pointer(center: Pos2, pointer: Pos2, snap: bool) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resize_from_corner(
+fn resize_from_handle(
     offset: Pos2,
     size: Vec2,
     scale: Vec2,
     natural_size: Vec2,
     rotation_degrees: f32,
-    corner: usize,
+    handle: ResizeHandle,
     pointer: Pos2,
     aspect_locked: bool,
+    from_center: bool,
 ) -> Option<(Pos2, Vec2)> {
-    if corner >= 4
-        || !size.x.is_finite()
+    if !size.x.is_finite()
         || !size.y.is_finite()
         || size.x <= 0.0
         || size.y <= 0.0
@@ -386,28 +536,34 @@ fn resize_from_corner(
     {
         return None;
     }
-    let signs = [
-        Vec2::new(-1.0, -1.0),
-        Vec2::new(1.0, -1.0),
-        Vec2::new(1.0, 1.0),
-        Vec2::new(-1.0, 1.0),
-    ];
-    let sign = signs[corner];
-    let opposite = oriented_corners(offset, size, rotation_degrees)[(corner + 2) % 4];
-    let local_delta = rotate_vector(pointer - opposite, -rotation_degrees);
+    let sign = handle.signs();
+    let original_center = offset + size / 2.0;
+    let anchor = if from_center {
+        original_center
+    } else {
+        resize_handle_position(offset, size, rotation_degrees, handle.opposite())
+    };
+    let local_delta = rotate_vector(pointer - anchor, -rotation_degrees);
+    let center_multiplier = if from_center { 2.0 } else { 1.0 };
 
     let (new_size, new_scale) = if aspect_locked {
-        let diagonal = Vec2::new(sign.x * size.x, sign.y * size.y);
-        let denominator = diagonal.length_sq();
-        if denominator <= f32::EPSILON {
-            return None;
-        }
+        let reference = if sign.x != 0.0 && sign.y != 0.0 {
+            Vec2::new(
+                sign.x * size.x / center_multiplier,
+                sign.y * size.y / center_multiplier,
+            )
+        } else if sign.x != 0.0 {
+            Vec2::new(sign.x * size.x / center_multiplier, 0.0)
+        } else {
+            Vec2::new(0.0, sign.y * size.y / center_multiplier)
+        };
+        let denominator = reference.length_sq().max(f32::EPSILON);
         let minimum = (MIN_IMAGE_SIZE / size.x)
             .max(MIN_IMAGE_SIZE / size.y)
             .max(f32::EPSILON);
         let maximum = (MAX_IMAGE_SCALE / scale.x.abs().max(f32::EPSILON))
             .min(MAX_IMAGE_SCALE / scale.y.abs().max(f32::EPSILON));
-        let requested_factor = local_delta.dot(diagonal) / denominator;
+        let requested_factor = local_delta.dot(reference) / denominator;
         let factor = if minimum <= maximum {
             requested_factor.clamp(minimum, maximum)
         } else {
@@ -418,10 +574,18 @@ fn resize_from_corner(
         };
         (size * factor, scale * factor)
     } else {
-        let width =
-            (sign.x * local_delta.x).clamp(MIN_IMAGE_SIZE, natural_size.x * MAX_IMAGE_SCALE);
-        let height =
-            (sign.y * local_delta.y).clamp(MIN_IMAGE_SIZE, natural_size.y * MAX_IMAGE_SCALE);
+        let width = if sign.x == 0.0 {
+            size.x
+        } else {
+            (center_multiplier * sign.x * local_delta.x)
+                .clamp(MIN_IMAGE_SIZE, natural_size.x * MAX_IMAGE_SCALE)
+        };
+        let height = if sign.y == 0.0 {
+            size.y
+        } else {
+            (center_multiplier * sign.y * local_delta.y)
+                .clamp(MIN_IMAGE_SIZE, natural_size.y * MAX_IMAGE_SCALE)
+        };
         (
             Vec2::new(width, height),
             Vec2::new(width / natural_size.x, height / natural_size.y),
@@ -431,11 +595,15 @@ fn resize_from_corner(
     if !new_size.is_finite() || !new_scale.is_finite() {
         return None;
     }
-    let center = opposite
-        + rotate_vector(
-            Vec2::new(sign.x * new_size.x / 2.0, sign.y * new_size.y / 2.0),
-            rotation_degrees,
-        );
+    let center = if from_center {
+        original_center
+    } else {
+        anchor
+            + rotate_vector(
+                Vec2::new(sign.x * new_size.x / 2.0, sign.y * new_size.y / 2.0),
+                rotation_degrees,
+            )
+    };
     Some((center - new_size / 2.0, new_scale))
 }
 
@@ -470,7 +638,6 @@ fn interact_transform_handles(
     let natural_size = image.sized_texture.size;
     let rotation_degrees = image.rotation_degrees;
     let aspect_locked = image.scale_locked;
-    let corners = oriented_corners(offset, size, rotation_degrees);
     let hit_size = TRANSFORM_HIT_SIZE / scene_scale;
     let rotation_distance = ROTATION_HANDLE_OFFSET / scene_scale;
     let rotate_handle = rotation_handle_position(offset, size, rotation_degrees, rotation_distance);
@@ -479,24 +646,44 @@ fn interact_transform_handles(
     let mut pending_resize = None;
     let mut pending_rotation = None;
 
-    for (corner, position) in corners.into_iter().enumerate() {
-        let position = to_screen.transform_pos(position);
+    if let Some(active_gesture) = gesture.as_ref()
+        && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        if let Some(image) = state.loaded_images.get_mut(index) {
+            let (offset, scale, rotation) =
+                canceled_transform(active_gesture, image.offset, image.scale);
+            changed = image.offset != offset
+                || image.scale != scale
+                || image.rotation_degrees != rotation;
+            image.offset = offset;
+            image.scale = scale;
+            image.rotation_degrees = rotation;
+        }
+        state.canvas_transform_gesture = None;
+        return changed;
+    }
+
+    for handle in ResizeHandle::ALL {
+        let position = to_screen.transform_pos(resize_handle_position(
+            offset,
+            size,
+            rotation_degrees,
+            handle,
+        ));
         let response = ui
             .interact(
                 Rect::from_center_size(position, Vec2::splat(hit_size)),
-                canvas_id.with(("resize", image_id.as_str(), corner)),
+                canvas_id.with(("resize", image_id.as_str(), handle.id())),
                 Sense::drag(),
             )
-            .on_hover_cursor(if corner % 2 == 0 {
-                CursorIcon::ResizeNwSe
-            } else {
-                CursorIcon::ResizeNeSw
-            })
-            .on_hover_text("Drag to resize · Hold Shift to toggle aspect lock");
+            .on_hover_cursor(resize_cursor(handle, rotation_degrees))
+            .on_hover_text(
+                "Drag to resize · Shift toggles proportions · Alt/Option scales from center",
+            );
         if response.drag_started() {
             gesture = Some(TransformGesture::Resize {
                 image_id: image_id.clone(),
-                corner,
+                handle,
                 offset,
                 size,
                 scale,
@@ -509,7 +696,7 @@ fn interact_transform_handles(
             && let Some(pointer) = response.interact_pointer_pos()
             && let Some(TransformGesture::Resize {
                 image_id: active_id,
-                corner,
+                handle,
                 offset,
                 size,
                 scale,
@@ -520,22 +707,48 @@ fn interact_transform_handles(
             && active_id == &image_id
         {
             let pointer = to_screen.inverse().transform_pos(pointer);
-            let invert_lock = ui.input(|input| input.modifiers.shift);
-            pending_resize = resize_from_corner(
+            let (invert_lock, from_center) =
+                ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
+            pending_resize = resize_from_handle(
                 *offset,
                 *size,
                 *scale,
                 *natural_size,
                 *rotation_degrees,
-                *corner,
+                *handle,
                 pointer,
                 *aspect_locked ^ invert_lock,
+                from_center,
             );
         }
     }
 
-    let rotate_response = ui
-        .interact(
+    let mut rotation_responses = Vec::with_capacity(5);
+    for handle in [
+        ResizeHandle::NorthWest,
+        ResizeHandle::NorthEast,
+        ResizeHandle::SouthEast,
+        ResizeHandle::SouthWest,
+    ] {
+        let signs = handle.signs().normalized();
+        let corner = resize_handle_position(offset, size, rotation_degrees, handle);
+        let zone = corner
+            + rotate_vector(
+                signs * (CORNER_ROTATION_ZONE_OFFSET / scene_scale),
+                rotation_degrees,
+            );
+        rotation_responses.push(
+            ui.interact(
+                Rect::from_center_size(to_screen.transform_pos(zone), Vec2::splat(hit_size)),
+                canvas_id.with(("rotate-corner", image_id.as_str(), handle.id())),
+                Sense::drag(),
+            )
+            .on_hover_cursor(CursorIcon::Grab)
+            .on_hover_text("Drag outside a corner to rotate · Hold Shift to snap to 15°"),
+        );
+    }
+    rotation_responses.push(
+        ui.interact(
             Rect::from_center_size(
                 to_screen.transform_pos(rotate_handle),
                 Vec2::splat(hit_size),
@@ -543,28 +756,41 @@ fn interact_transform_handles(
             canvas_id.with(("rotate", image_id.as_str())),
             Sense::drag(),
         )
-        .on_hover_cursor(CursorIcon::Crosshair)
-        .on_hover_text("Drag to rotate · Hold Shift to snap to 15°");
-    if rotate_response.drag_started() {
-        gesture = Some(TransformGesture::Rotate {
-            image_id: image_id.clone(),
-            center: offset + size / 2.0,
-        });
-    }
-    if rotate_response.dragged()
-        && let Some(pointer) = rotate_response.interact_pointer_pos()
-        && let Some(TransformGesture::Rotate {
-            image_id: active_id,
-            center,
-        }) = gesture.as_ref()
-        && active_id == &image_id
-    {
-        let pointer = to_screen.inverse().transform_pos(pointer);
-        pending_rotation = Some(rotation_from_pointer(
-            *center,
-            pointer,
-            ui.input(|input| input.modifiers.shift),
-        ));
+        .on_hover_cursor(CursorIcon::Grab)
+        .on_hover_text("Drag to rotate · Hold Shift to snap to 15°"),
+    );
+    for rotate_response in rotation_responses {
+        if rotate_response.drag_started()
+            && let Some(pointer) = rotate_response.interact_pointer_pos()
+        {
+            let pointer = to_screen.inverse().transform_pos(pointer);
+            let center = offset + size / 2.0;
+            gesture = Some(TransformGesture::Rotate {
+                image_id: image_id.clone(),
+                center,
+                start_pointer_degrees: pointer_rotation_degrees(center, pointer),
+                initial_rotation_degrees: rotation_degrees,
+            });
+        }
+        if rotate_response.dragged()
+            && let Some(pointer) = rotate_response.interact_pointer_pos()
+            && let Some(TransformGesture::Rotate {
+                image_id: active_id,
+                center,
+                start_pointer_degrees,
+                initial_rotation_degrees,
+            }) = gesture.as_ref()
+            && active_id == &image_id
+        {
+            let pointer = to_screen.inverse().transform_pos(pointer);
+            pending_rotation = Some(rotation_from_gesture(
+                *initial_rotation_degrees,
+                *start_pointer_degrees,
+                *center,
+                pointer,
+                ui.input(|input| input.modifiers.shift),
+            ));
+        }
     }
 
     if let Some(image) = state.loaded_images.get_mut(index) {
@@ -611,13 +837,23 @@ fn paint_transform_controls(
         .map(|position| to_screen.transform_pos(position));
     let mut outline = corners.to_vec();
     outline.push(corners[0]);
+    painter.add(Shape::line(
+        outline.clone(),
+        Stroke::new(3.5 / scene_scale, Color32::WHITE),
+    ));
     painter.add(Shape::line(outline, Stroke::new(1.5 / scene_scale, color)));
     if image.locked || state.edit_cutlines {
         return;
     }
 
     let visual_size = TRANSFORM_HANDLE_SIZE / scene_scale;
-    for position in corners {
+    for handle in ResizeHandle::ALL {
+        let position = to_screen.transform_pos(resize_handle_position(
+            image.offset,
+            image.size(),
+            image.rotation_degrees,
+            handle,
+        ));
         painter.rect_filled(
             Rect::from_center_size(position, Vec2::splat(visual_size)),
             1.5 / scene_scale,
@@ -647,6 +883,99 @@ fn paint_transform_controls(
         visual_size / 2.0,
         Stroke::new(1.5 / scene_scale, color),
     );
+    painter.text(
+        rotate_handle,
+        Align2::CENTER_CENTER,
+        "↻",
+        FontId::proportional(8.0 / scene_scale),
+        color,
+    );
+
+    let center = to_screen.transform_pos(image.offset + image.size() / 2.0);
+    let pivot_radius = 4.0 / scene_scale;
+    painter.line_segment(
+        [
+            center - Vec2::new(pivot_radius, 0.0),
+            center + Vec2::new(pivot_radius, 0.0),
+        ],
+        Stroke::new(1.0 / scene_scale, color),
+    );
+    painter.line_segment(
+        [
+            center - Vec2::new(0.0, pivot_radius),
+            center + Vec2::new(0.0, pivot_radius),
+        ],
+        Stroke::new(1.0 / scene_scale, color),
+    );
+
+    paint_transform_feedback(painter, state, image, corners, scene_scale);
+}
+
+fn paint_transform_feedback(
+    painter: &Painter,
+    state: &SapodillaApp,
+    image: &crate::app::LoadedImage,
+    corners: [Pos2; 4],
+    scene_scale: f32,
+) {
+    let Some(gesture) = state.canvas_transform_gesture.as_ref() else {
+        return;
+    };
+    if transform_gesture_image_id(gesture) != image.id {
+        return;
+    }
+
+    let dpi = DEVICES[state.selected_device].dpi.max(f32::EPSILON);
+    let size_mm = image.size() / dpi * 25.4;
+    let label = match gesture {
+        TransformGesture::Resize { .. } => {
+            format!("W {:.1} mm  ·  H {:.1} mm", size_mm.x, size_mm.y)
+        }
+        TransformGesture::Rotate { .. } => {
+            format!("Rotation {:.1}°", normalize_degrees(image.rotation_degrees))
+        }
+    };
+
+    let font = FontId::proportional(12.0 / scene_scale);
+    let text_color = Color32::WHITE;
+    let galley = painter.layout_no_wrap(label, font, text_color);
+    let padding = Vec2::new(9.0, 6.0) / scene_scale;
+    let tooltip_size = galley.size() + padding * 2.0;
+    let min_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let gap = 14.0 / scene_scale;
+    let min_left = painter.clip_rect().left();
+    let max_left = (painter.clip_rect().right() - tooltip_size.x).max(min_left);
+    let centered_x = ((min_x + max_x) / 2.0 - tooltip_size.x / 2.0).clamp(min_left, max_left);
+    let below_y = max_y + gap;
+    let top = if below_y + tooltip_size.y <= painter.clip_rect().bottom() {
+        below_y
+    } else {
+        min_y - gap - tooltip_size.y
+    };
+    let tooltip = Rect::from_min_size(Pos2::new(centered_x, top), tooltip_size);
+    painter.rect(
+        tooltip,
+        7.0 / scene_scale,
+        Color32::from_rgba_unmultiplied(11, 11, 16, 235),
+        Stroke::new(1.0 / scene_scale, Color32::from_rgb(39, 221, 235)),
+        egui::StrokeKind::Outside,
+    );
+    painter.galley(tooltip.min + padding, galley, text_color);
 }
 
 fn nice_step_ceiling(value: f32) -> f32 {
@@ -1059,14 +1388,15 @@ mod tests {
             let desired_size = Vec2::new(180.0, 90.0);
             let pointer =
                 opposite + rotate_vector(Vec2::new(-desired_size.x, -desired_size.y), rotation);
-            let (new_offset, new_scale) = resize_from_corner(
+            let (new_offset, new_scale) = resize_from_handle(
                 offset,
                 size,
                 Vec2::new(1.2, 0.6),
                 Vec2::new(100.0, 100.0),
                 rotation,
-                0,
+                ResizeHandle::NorthWest,
                 pointer,
+                false,
                 false,
             )
             .unwrap();
@@ -1080,18 +1410,105 @@ mod tests {
     }
 
     #[test]
+    fn every_resize_handle_preserves_its_opposite_anchor_when_rotated() {
+        let offset = Pos2::new(100.0, 80.0);
+        let size = Vec2::new(120.0, 60.0);
+        let natural_size = Vec2::new(100.0, 100.0);
+        let scale = Vec2::new(1.2, 0.6);
+        for rotation in [0.0, 37.0, 90.0, -135.0] {
+            for handle in ResizeHandle::ALL {
+                let signs = handle.signs();
+                let desired = Vec2::new(
+                    if signs.x == 0.0 { size.x } else { 180.0 },
+                    if signs.y == 0.0 { size.y } else { 90.0 },
+                );
+                let anchor = resize_handle_position(offset, size, rotation, handle.opposite());
+                let pointer = anchor
+                    + rotate_vector(
+                        Vec2::new(signs.x * desired.x, signs.y * desired.y),
+                        rotation,
+                    );
+                let (new_offset, new_scale) = resize_from_handle(
+                    offset,
+                    size,
+                    scale,
+                    natural_size,
+                    rotation,
+                    handle,
+                    pointer,
+                    false,
+                    false,
+                )
+                .unwrap();
+                let new_size = natural_size * new_scale;
+                assert!((new_size.x - desired.x).abs() < 0.001);
+                assert!((new_size.y - desired.y).abs() < 0.001);
+                assert_pos_close(
+                    resize_handle_position(new_offset, new_size, rotation, handle.opposite()),
+                    anchor,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alt_option_resize_keeps_center_fixed() {
+        let offset = Pos2::new(100.0, 80.0);
+        let size = Vec2::new(120.0, 60.0);
+        let center = offset + size / 2.0;
+        let rotation = 37.0;
+        let pointer = center + rotate_vector(Vec2::new(90.0, 0.0), rotation);
+        let (new_offset, new_scale) = resize_from_handle(
+            offset,
+            size,
+            Vec2::new(1.2, 0.6),
+            Vec2::new(100.0, 100.0),
+            rotation,
+            ResizeHandle::East,
+            pointer,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_pos_close(new_offset + Vec2::new(180.0, 60.0) / 2.0, center);
+        assert!((new_scale.x - 1.8).abs() < 0.001);
+        assert!((new_scale.y - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn resize_cursors_follow_object_rotation() {
+        assert_eq!(
+            resize_cursor(ResizeHandle::East, 0.0),
+            CursorIcon::ResizeHorizontal
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::East, 90.0),
+            CursorIcon::ResizeVertical
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::NorthWest, 0.0),
+            CursorIcon::ResizeNwSe
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::NorthWest, 90.0),
+            CursorIcon::ResizeNeSw
+        );
+    }
+
+    #[test]
     fn aspect_locked_resize_keeps_ratio_and_clamps_positive() {
         let offset = Pos2::new(0.0, 0.0);
         let size = Vec2::new(100.0, 50.0);
-        let (new_offset, new_scale) = resize_from_corner(
+        let (new_offset, new_scale) = resize_from_handle(
             offset,
             size,
             Vec2::splat(1.0),
             size,
             0.0,
-            0,
+            ResizeHandle::NorthWest,
             Pos2::new(-100.0, -25.0),
             true,
+            false,
         )
         .unwrap();
         let new_size = size * new_scale;
@@ -1101,15 +1518,16 @@ mod tests {
             Pos2::new(100.0, 50.0),
         );
 
-        let (_, clamped_scale) = resize_from_corner(
+        let (_, clamped_scale) = resize_from_handle(
             offset,
             size,
             Vec2::splat(1.0),
             size,
             0.0,
-            0,
+            ResizeHandle::NorthWest,
             Pos2::new(200.0, 100.0),
             true,
+            false,
         )
         .unwrap();
         assert!(clamped_scale.x.is_finite());
@@ -1122,15 +1540,16 @@ mod tests {
         let scale = Vec2::new(2_000.0, 0.0001);
         let natural = Vec2::splat(100.0);
         let size = natural * scale;
-        let result = resize_from_corner(
+        let result = resize_from_handle(
             Pos2::ZERO,
             size,
             scale,
             natural,
             23.0,
-            0,
+            ResizeHandle::NorthWest,
             Pos2::new(-20.0, -20.0),
             true,
+            false,
         )
         .unwrap();
         assert!(result.0.x.is_finite() && result.0.y.is_finite());
@@ -1139,23 +1558,56 @@ mod tests {
     }
 
     #[test]
-    fn rotation_is_normalized_and_shift_snaps_to_fifteen_degrees() {
+    fn rotation_drag_preserves_grab_offset_and_shift_snaps_to_fifteen_degrees() {
         let center = Pos2::new(50.0, 50.0);
-        assert!((rotation_from_pointer(center, Pos2::new(50.0, 0.0), false)).abs() < 0.001);
-        assert!(
-            (rotation_from_pointer(center, Pos2::new(100.0, 50.0), false) - 90.0).abs() < 0.001
+        let pickup = Pos2::new(45.0, 0.0);
+        let start = pointer_rotation_degrees(center, pickup);
+        assert_eq!(
+            rotation_from_gesture(30.0, start, center, pickup, false),
+            30.0
         );
         assert!(
-            (rotation_from_pointer(center, Pos2::new(50.0, 100.0), false) + 180.0).abs() < 0.001
+            (rotation_from_gesture(30.0, start, center, Pos2::new(50.0, -10.0), false) - 35.7)
+                .abs()
+                < 0.1
         );
         assert_eq!(
-            rotation_from_pointer(center, Pos2::new(100.0, 40.0), true),
-            75.0
+            rotation_from_gesture(30.0, start, center, Pos2::new(100.0, 40.0), true),
+            120.0
         );
         for degrees in [-1080.0, -180.0, 180.0, 1080.0] {
             let normalized = normalize_degrees(degrees);
             assert!((-180.0..180.0).contains(&normalized));
         }
+    }
+
+    #[test]
+    fn escape_cancel_snapshot_restores_resize_and_rotation_starts() {
+        let resize = TransformGesture::Resize {
+            image_id: "artwork".into(),
+            handle: ResizeHandle::SouthEast,
+            offset: Pos2::new(10.0, 20.0),
+            size: Vec2::new(100.0, 50.0),
+            scale: Vec2::new(1.0, 0.5),
+            natural_size: Vec2::splat(100.0),
+            rotation_degrees: 25.0,
+            aspect_locked: false,
+        };
+        assert_eq!(
+            canceled_transform(&resize, Pos2::new(40.0, 50.0), Vec2::splat(2.0)),
+            (Pos2::new(10.0, 20.0), Vec2::new(1.0, 0.5), 25.0)
+        );
+
+        let rotate = TransformGesture::Rotate {
+            image_id: "artwork".into(),
+            center: Pos2::new(60.0, 45.0),
+            start_pointer_degrees: 0.0,
+            initial_rotation_degrees: -35.0,
+        };
+        assert_eq!(
+            canceled_transform(&rotate, Pos2::new(10.0, 20.0), Vec2::new(1.0, 0.5)),
+            (Pos2::new(10.0, 20.0), Vec2::new(1.0, 0.5), -35.0)
+        );
     }
 
     #[test]
