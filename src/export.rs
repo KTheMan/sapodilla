@@ -10,14 +10,21 @@ pub struct ToolpathStats {
 }
 
 pub fn toolpath_stats(paths: &[LineString<f32>]) -> ToolpathStats {
+    toolpath_stats_iter(paths)
+}
+
+pub fn toolpath_stats_iter<'a>(
+    paths: impl IntoIterator<Item = &'a LineString<f32>>,
+) -> ToolpathStats {
+    let paths = paths.into_iter();
     let mut stats = ToolpathStats {
-        paths: paths.len(),
-        nodes: paths.iter().map(|path| path.0.len()).sum(),
-        cut_length: paths.iter().map(|path| path.length(&Euclidean)).sum(),
-        travel_length: 0.0,
+        ..ToolpathStats::default()
     };
     let mut cursor: Option<geo::Coord<f32>> = None;
     for path in paths {
+        stats.paths += 1;
+        stats.nodes += path.0.len();
+        stats.cut_length += path.length(&Euclidean);
         let (Some(first), Some(last)) = (path.0.first(), path.0.last()) else {
             continue;
         };

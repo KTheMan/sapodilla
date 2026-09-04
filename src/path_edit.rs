@@ -1,4 +1,4 @@
-use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon};
+use geo::{BooleanOps, BoundingRect, Coord, Intersects, LineString, MultiPolygon, Polygon};
 
 /// Smooth a path with Chaikin corner cutting while preserving whether it was
 /// open or closed. Repeated passes are deliberately capped to keep interactive
@@ -48,11 +48,19 @@ pub fn union_paths(paths: &[LineString<f32>]) -> Vec<LineString<f32>> {
             continue;
         };
         let polygon = Polygon::new(ring, Vec::new());
-        merged = if merged.0.is_empty() {
-            MultiPolygon(vec![polygon])
+        let bounds = polygon.bounding_rect();
+        if merged.0.is_empty()
+            || !merged.0.iter().any(|existing| {
+                existing
+                    .bounding_rect()
+                    .zip(bounds)
+                    .is_some_and(|(existing, incoming)| existing.intersects(&incoming))
+            })
+        {
+            merged.0.push(polygon);
         } else {
-            merged.union(&polygon)
-        };
+            merged = merged.union(&polygon);
+        }
     }
 
     let mut result = Vec::new();
@@ -120,5 +128,15 @@ mod tests {
     #[test]
     fn union_ignores_open_and_degenerate_paths() {
         assert!(union_paths(&[LineString::from(vec![(0., 0.), (1., 1.), (2., 0.)])]).is_empty());
+    }
+
+    #[test]
+    fn union_keeps_large_disjoint_batches_independent() {
+        let paths = (0..100)
+            .map(|index| rectangle(index as f32 * 20.0, 0.0, 10.0, 10.0))
+            .collect::<Vec<_>>();
+        let result = union_paths(&paths);
+        assert_eq!(result.len(), paths.len());
+        assert_eq!(result, paths);
     }
 }
