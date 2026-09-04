@@ -11,6 +11,8 @@ pub const ALIGN_CENTER_VERTICAL: &str = phosphor::ALIGN_CENTER_VERTICAL;
 pub const ALIGN_LEFT: &str = phosphor::ALIGN_LEFT;
 pub const ALIGN_RIGHT: &str = phosphor::ALIGN_RIGHT;
 pub const ALIGN_TOP: &str = phosphor::ALIGN_TOP;
+pub const ADD_ARTWORK: &str = phosphor::PLUS_CIRCLE;
+pub const AUTO_PACK: &str = phosphor::MAGIC_WAND;
 #[cfg(not(target_arch = "wasm32"))]
 pub const ARROWS_CLOCKWISE: &str = phosphor::ARROWS_CLOCKWISE;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,11 +26,19 @@ pub const EYE_SLASH: &str = phosphor::EYE_SLASH;
 #[cfg(not(target_arch = "wasm32"))]
 pub const FOLDER_PLUS: &str = phosphor::FOLDER_PLUS;
 pub const GRID_NINE: &str = phosphor::GRID_NINE;
+pub const GRID: &str = phosphor::GRID_FOUR;
+pub const INSPECTOR: &str = phosphor::SLIDERS_HORIZONTAL;
+pub const LIBRARY: &str = phosphor::IMAGES_SQUARE;
 pub const LINK: &str = phosphor::LINK;
 pub const LINK_BREAK: &str = phosphor::LINK_BREAK;
 pub const LOCK: &str = phosphor::LOCK;
 pub const LOCK_OPEN: &str = phosphor::LOCK_OPEN;
+pub const CUT_PREVIEW: &str = phosphor::SCISSORS;
+pub const EDIT_NODES: &str = phosphor::VECTOR_THREE;
+pub const RULERS: &str = phosphor::RULER;
+pub const SAVE: &str = phosphor::FLOPPY_DISK;
 pub const SHUFFLE: &str = phosphor::SHUFFLE;
+pub const SNAP: &str = phosphor::MAGNET;
 pub const TRASH: &str = phosphor::TRASH_SIMPLE;
 pub const UPLOAD: &str = phosphor::UPLOAD_SIMPLE;
 
@@ -52,6 +62,16 @@ mod tests {
             LOCK,
             DOTS_THREE,
             UPLOAD,
+            ADD_ARTWORK,
+            AUTO_PACK,
+            SAVE,
+            SNAP,
+            GRID,
+            RULERS,
+            CUT_PREVIEW,
+            EDIT_NODES,
+            LIBRARY,
+            INSPECTOR,
         ] {
             let mut chars = icon.chars();
             let glyph = chars.next().expect("icon has a glyph");
@@ -67,7 +87,22 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |_| {});
         context.fonts_mut(|fonts| {
             let font = egui::FontId::proportional(17.0);
-            for icon in [EYE, LOCK, DOTS_THREE, ALIGN_BOTTOM] {
+            for icon in [
+                EYE,
+                LOCK,
+                DOTS_THREE,
+                ALIGN_BOTTOM,
+                ADD_ARTWORK,
+                AUTO_PACK,
+                SAVE,
+                SNAP,
+                GRID,
+                RULERS,
+                CUT_PREVIEW,
+                EDIT_NODES,
+                LIBRARY,
+                INSPECTOR,
+            ] {
                 assert!(fonts.has_glyph(&font, icon.chars().next().unwrap()));
             }
         });
