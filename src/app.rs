@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io::Write,
-    sync::mpsc,
+    sync::{Arc, mpsc},
 };
 
 use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
@@ -18,6 +18,17 @@ use uuid::Uuid;
 
 use crate::{
     Rc,
+    calibration::{
+        CalibrationActivationPolicy, CalibrationCutMode, CalibrationMethod, CalibrationObservation,
+        CalibrationPayloadHashes, CalibrationPlotterCommand, CalibrationPlotterCommandKind,
+        CalibrationPolicy, CalibrationProfile, CalibrationRun, CalibrationRunState,
+        CalibrationSolution, CalibrationStore, CalibrationTargetManifest, CalibrationWizard,
+        CanvasToPlotter, CutPathDirection, JobSlot as CalibrationJobSlot, ManifestIdentity,
+        PrinterCalibrationKey, ScanAnalysisConfig, ScanAnalysisReport, ScanSlot,
+        StablePrinterIdentity, TargetCutMode, TargetManifest, TransformBounds, ValidationMetrics,
+        analyze_flatbed_scan, flatbed_calibration, flatbed_validation, manual_calibration,
+        manual_validation, observation_error_metrics, render_print_raster, solve_calibration,
+    },
     cut::{CutAction, CutGenerator, CutImage, CutTuning, OvercutSettings, apply_overcut},
     export::{ToolpathStats, cut_svg, jpeg_pdf, toolpath_debug_svg},
     jobs::{JobQueue, JobSpec, JobStatus as QueueJobStatus, Printer as QueuePrinter},
@@ -35,18 +46,32 @@ use crate::{
     views,
 };
 
+mod calibration_ui;
+
 const MATERIAL_PROFILES_STORAGE_KEY: &str = "sapodilla.material-profiles.v1";
 const LIBRARY_FOLDERS_STORAGE_KEY: &str = "sapodilla.library-folders.v1";
 const LIBRARY_CYCLE_STORAGE_KEY: &str = "sapodilla.library-cycle.v1";
 const LIBRARY_CONSUMED_STORAGE_KEY: &str = "sapodilla.library-consumed-ahead.v1";
 const CANVAS_VIEW_STORAGE_KEY: &str = "sapodilla.canvas-view.v1";
 const APPEARANCE_STORAGE_KEY: &str = "sapodilla.appearance.v1";
+const CALIBRATION_STORAGE_KEY: &str = "sapodilla.calibration.v1";
+const CALIBRATION_SESSION_STORAGE_KEY: &str = "sapodilla.calibration-session.v1";
+const PRINTER_FALLBACK_NAMES_STORAGE_KEY: &str = "sapodilla.printer-fallback-names.v1";
 const APPEARANCE_VERSION: u8 = 1;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const LIBRARY_PAGE_SIZE: usize = 100;
 const MAX_LIBRARY_FILL_ATTEMPTS: usize = 512;
 const NEW_ARTWORK_MIN_FRACTION: f32 = 0.22;
 const NEW_ARTWORK_MAX_FRACTION: f32 = 0.72;
+
+#[derive(Clone, Debug)]
+pub struct CalibrationScanImport {
+    report: ScanAnalysisReport,
+    /// Runtime-only, bounded PNG used to let the operator visually verify the
+    /// detected cut centers. The original full-resolution scan is not kept.
+    preview_png: Arc<[u8]>,
+    preview_sha1: String,
+}
 
 #[derive(derive_more::Debug)]
 pub enum Action {
@@ -64,6 +89,10 @@ pub enum Action {
     TransportEvent {
         printer_id: String,
         event: TransportEvent,
+    },
+    PrinterIdentityLoaded {
+        printer_id: String,
+        result: anyhow::Result<PrinterIdentityInfo>,
     },
     LoadedAvocadoPackets(Result<Vec<AvocadoPacket>, ProtocolError>),
     LoadedImage(#[debug(skip)] anyhow::Result<LoadedImage>),
@@ -116,6 +145,45 @@ pub enum Action {
         capabilities: Vec<&'static str>,
         #[debug(skip)]
         job: PendingPrintJob,
+    },
+    PrintRouteEncoded {
+        printer_id: String,
+        job_id: u64,
+        #[debug(skip)]
+        payload: EncodedPrintJob,
+    },
+    CalibrationJobPrepared {
+        run_id: String,
+        validation_generation: u32,
+        physical_sheet_attempt: u32,
+        slot: CalibrationJobSlot,
+        spec: JobSpec,
+        #[debug(skip)]
+        result: anyhow::Result<PendingPrintJob>,
+    },
+    CalibrationScanAnalyzed {
+        run_id: String,
+        validation_generation: u32,
+        physical_sheet_attempt: u32,
+        scan_request_generation: u32,
+        slot: ScanSlot,
+        file_name: String,
+        #[debug(skip)]
+        result: Result<CalibrationScanImport, String>,
+    },
+    CalibrationCandidateSolved {
+        run_id: String,
+        validation_generation: u32,
+        #[debug(skip)]
+        result: Result<CalibrationSolution, String>,
+    },
+    CalibrationStoreImported {
+        #[debug(skip)]
+        result: Result<CalibrationStore, String>,
+    },
+    CalibrationDeviceJobStarted {
+        queue_id: u64,
+        device_job_id: u32,
     },
 }
 
@@ -185,6 +253,11 @@ pub struct SapodillaApp {
     pub transport_manager: Option<Rc<TransportManager>>,
     pub printer_connections: BTreeMap<String, Rc<TransportManager>>,
     pub printer_statuses: BTreeMap<String, TransportStatus>,
+    pub printer_identities: BTreeMap<String, PrinterIdentityInfo>,
+    pub printer_identity_errors: BTreeMap<String, String>,
+    printer_identity_loading: BTreeSet<String>,
+    printer_fallback_names: BTreeMap<String, String>,
+    printer_fallback_drafts: BTreeMap<String, String>,
     pub transport_status: TransportStatus,
 
     pub selected_device: usize,
@@ -239,6 +312,11 @@ pub struct SapodillaApp {
     pub(crate) canvas_transform_gesture: Option<views::TransformGesture>,
     pub background_color: [u8; 3],
     pub material_profiles: Vec<MaterialProfile>,
+    pub calibration_store: CalibrationStore,
+    calibration_session: Option<CalibrationSession>,
+    calibration_ui_state: calibration_ui::CalibrationUiState,
+    show_calibration_profiles: bool,
+    calibration_message: Option<String>,
     pub selected_material: usize,
     pub perf_cut: bool,
     pub perf_dash_mm: f32,
@@ -469,15 +547,302 @@ pub struct LoadedImage {
 
 #[derive(Clone)]
 pub struct PendingPrintJob {
+    encoded_image: Vec<u8>,
     encoded_image_len: usize,
-    plt: Vec<u8>,
-    packet_data: Vec<u8>,
     image_hash: String,
     created_at: u64,
     copies: usize,
     device_index: usize,
     mode_index: usize,
     canvas_index: usize,
+    cut_shapes: Vec<LineString<f32>>,
+    cut_modes: Vec<CutMode>,
+    material: MaterialProfile,
+    perf_cut: bool,
+    perf_dash: f32,
+    perf_gap: f32,
+    peel_tabs: bool,
+    overcut: OvercutSettings,
+    /// Calibration targets already contain explicit blade-up bridge segments;
+    /// these phases bypass production perforation dashing.
+    calibration_phases: Option<Vec<CutPhase>>,
+    /// Validation must use the candidate without activating it globally.
+    mapping_override: Option<CanvasToPlotter>,
+}
+
+#[derive(Clone)]
+pub struct EncodedPrintJob {
+    source: PendingPrintJob,
+    plt: Vec<u8>,
+    packet_data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CalibrationSession {
+    printer_id: String,
+    printer_key: PrinterCalibrationKey,
+    wizard: CalibrationWizard,
+    baseline_profile_id: Option<String>,
+    #[serde(default = "default_calibration_profile_version")]
+    baseline_profile_version: u16,
+    baseline_mapping: CanvasToPlotter,
+    material: MaterialProfile,
+    candidate: Option<CalibrationSolution>,
+    candidate_mapping: Option<CanvasToPlotter>,
+    validation_metrics: Option<ValidationMetrics>,
+    #[serde(default)]
+    training_scan_report: Option<ScanAnalysisReport>,
+    #[serde(default)]
+    validation_scan_report: Option<ScanAnalysisReport>,
+    #[serde(skip)]
+    training_scan_preview_png: Option<Arc<[u8]>>,
+    #[serde(skip)]
+    validation_scan_preview_png: Option<Arc<[u8]>>,
+    #[serde(skip)]
+    training_scan_preview_sha1: Option<String>,
+    #[serde(skip)]
+    validation_scan_preview_sha1: Option<String>,
+    primary_queue_job: Option<u64>,
+    second_queue_job: Option<u64>,
+    validation_queue_job: Option<u64>,
+    /// Persisted audit IDs are separate from live queue handles, which are
+    /// process-local and must never be resumed after a restart.
+    #[serde(default)]
+    historical_queue_job_ids: [Option<u64>; 3],
+    #[serde(default)]
+    image_sha1: [Option<String>; 3],
+    #[serde(default)]
+    plotter_sha1: [Option<String>; 3],
+    #[serde(default)]
+    plotter_commands: [Vec<CalibrationPlotterCommand>; 3],
+    #[serde(default)]
+    validation_generation: u32,
+    #[serde(default)]
+    device_job_ids: Vec<u32>,
+    #[serde(default)]
+    validation_device_job_ids: Vec<u32>,
+    #[serde(default)]
+    device_job_ids_by_slot: [Vec<u32>; 3],
+    /// Incremented whenever a completed or ambiguous physical sheet is
+    /// reprinted. It becomes part of the manifest run ID so an older scan can
+    /// never bind to the replacement sheet.
+    #[serde(default)]
+    physical_sheet_attempts: [u32; 3],
+    #[serde(default)]
+    scan_request_generations: [u32; 2],
+}
+
+impl CalibrationSession {
+    fn manifest_identity(&self, run_id: impl Into<String>) -> ManifestIdentity {
+        ManifestIdentity {
+            run_id: run_id.into(),
+            baseline_mapping_id: self
+                .baseline_profile_id
+                .clone()
+                .unwrap_or_else(|| "pixcut-s1-stock-v1".into()),
+            profile_version: self.baseline_profile_version,
+            candidate_generation: 0,
+        }
+    }
+
+    fn validation_manifest_identity(&self) -> ManifestIdentity {
+        let mut identity = self.manifest_identity_for_slot(CalibrationJobSlot::Validation);
+        identity.candidate_generation = self.wizard.validation_generation;
+        identity
+    }
+
+    fn manifest_identity_for_slot(&self, slot: CalibrationJobSlot) -> ManifestIdentity {
+        let attempt = self.physical_sheet_attempts[Self::slot_index(slot)];
+        let base_run_id = if attempt == 0 {
+            self.wizard.run_id.clone()
+        } else {
+            format!("{}-attempt-{attempt}", self.wizard.run_id)
+        };
+        let run_id = calibration_slot_run_id(&base_run_id, slot);
+        self.manifest_identity(run_id)
+    }
+
+    fn accepts_async_result(&self, run_id: &str, validation_generation: u32) -> bool {
+        self.wizard.run_id == run_id && self.wizard.validation_generation == validation_generation
+    }
+
+    fn accepts_job_result(
+        &self,
+        run_id: &str,
+        validation_generation: u32,
+        slot: CalibrationJobSlot,
+        physical_sheet_attempt: u32,
+    ) -> bool {
+        self.accepts_async_result(run_id, validation_generation)
+            && self.physical_sheet_attempts[Self::slot_index(slot)] == physical_sheet_attempt
+    }
+
+    const fn scan_slot_index(slot: ScanSlot) -> usize {
+        match slot {
+            ScanSlot::Training => 0,
+            ScanSlot::Validation => 1,
+        }
+    }
+
+    fn accepts_scan_result(
+        &self,
+        run_id: &str,
+        validation_generation: u32,
+        slot: ScanSlot,
+        physical_sheet_attempt: u32,
+        scan_request_generation: u32,
+    ) -> bool {
+        let job_slot = match slot {
+            ScanSlot::Training => CalibrationJobSlot::Primary,
+            ScanSlot::Validation => CalibrationJobSlot::Validation,
+        };
+        self.accepts_job_result(
+            run_id,
+            validation_generation,
+            job_slot,
+            physical_sheet_attempt,
+        ) && self.scan_request_generations[Self::scan_slot_index(slot)] == scan_request_generation
+    }
+
+    fn clear_stale_candidate_evidence(&mut self) -> Option<u64> {
+        if self.validation_generation == self.wizard.validation_generation {
+            return None;
+        }
+        self.validation_generation = self.wizard.validation_generation;
+        self.candidate = None;
+        self.candidate_mapping = None;
+        self.validation_metrics = None;
+        self.validation_scan_report = None;
+        self.validation_scan_preview_png = None;
+        self.validation_scan_preview_sha1 = None;
+        self.image_sha1[2] = None;
+        self.plotter_sha1[2] = None;
+        self.plotter_commands[2].clear();
+        let mut stale_device_ids = std::mem::take(
+            &mut self.device_job_ids_by_slot[Self::slot_index(CalibrationJobSlot::Validation)],
+        );
+        stale_device_ids.append(&mut self.validation_device_job_ids);
+        self.device_job_ids
+            .retain(|id| !stale_device_ids.contains(id));
+        self.validation_device_job_ids.clear();
+        self.historical_queue_job_ids[Self::slot_index(CalibrationJobSlot::Validation)] = None;
+        self.validation_queue_job.take()
+    }
+
+    fn is_resumable(&self) -> bool {
+        if self.printer_id.trim().is_empty()
+            || self.printer_key.model.trim().is_empty()
+            || self.material.passes == 0
+            || self.material.passes > 4
+            || self.material.blade_pressure > 100
+            || self.material.perf_pressure > 100
+            || self.device_job_ids.len() > 32
+            || self.device_job_ids_by_slot.iter().any(|ids| ids.len() > 32)
+            || self
+                .device_job_ids_by_slot
+                .iter()
+                .flatten()
+                .any(|id| !self.device_job_ids.contains(id))
+            || self
+                .physical_sheet_attempts
+                .into_iter()
+                .any(|attempt| attempt > 1_000_000)
+            || self
+                .scan_request_generations
+                .into_iter()
+                .any(|generation| generation > 1_000_000)
+            || self
+                .baseline_mapping
+                .validate(TransformBounds::default())
+                .is_err()
+            || self
+                .candidate_mapping
+                .is_some_and(|mapping| mapping.validate(TransformBounds::default()).is_err())
+        {
+            return false;
+        }
+        let Ok(json) = serde_json::to_string(&self.wizard) else {
+            return false;
+        };
+        CalibrationWizard::resume_json(&json).is_ok()
+    }
+
+    fn queue_job(&self, slot: CalibrationJobSlot) -> Option<u64> {
+        match slot {
+            CalibrationJobSlot::Primary => self.primary_queue_job,
+            CalibrationJobSlot::Second => self.second_queue_job,
+            CalibrationJobSlot::Validation => self.validation_queue_job,
+        }
+    }
+
+    fn set_queue_job(&mut self, slot: CalibrationJobSlot, job_id: u64) {
+        self.historical_queue_job_ids[Self::slot_index(slot)] = Some(job_id);
+        *match slot {
+            CalibrationJobSlot::Primary => &mut self.primary_queue_job,
+            CalibrationJobSlot::Second => &mut self.second_queue_job,
+            CalibrationJobSlot::Validation => &mut self.validation_queue_job,
+        } = Some(job_id);
+    }
+
+    fn take_queue_job(&mut self, slot: CalibrationJobSlot) -> Option<u64> {
+        match slot {
+            CalibrationJobSlot::Primary => self.primary_queue_job.take(),
+            CalibrationJobSlot::Second => self.second_queue_job.take(),
+            CalibrationJobSlot::Validation => self.validation_queue_job.take(),
+        }
+    }
+
+    fn slot_index(slot: CalibrationJobSlot) -> usize {
+        match slot {
+            CalibrationJobSlot::Primary => 0,
+            CalibrationJobSlot::Second => 1,
+            CalibrationJobSlot::Validation => 2,
+        }
+    }
+
+    fn sanitize_after_load(mut self) -> Option<Self> {
+        if !self.is_resumable() {
+            return None;
+        }
+        let now = self.wizard.updated_at;
+        for slot in [
+            CalibrationJobSlot::Primary,
+            CalibrationJobSlot::Second,
+            CalibrationJobSlot::Validation,
+        ] {
+            let status = match slot {
+                CalibrationJobSlot::Primary => self.wizard.primary_job,
+                CalibrationJobSlot::Second => self.wizard.second_job,
+                CalibrationJobSlot::Validation => self.wizard.validation_job,
+            };
+            let slot_index = Self::slot_index(slot);
+            if status == crate::calibration::JobStatus::Completed
+                && self.historical_queue_job_ids[slot_index].is_none()
+            {
+                // Migrate sessions saved before audit IDs were split from
+                // process-local queue handles.
+                self.historical_queue_job_ids[slot_index] = self.queue_job(slot);
+            }
+            if matches!(
+                status,
+                crate::calibration::JobStatus::Queued | crate::calibration::JobStatus::InProgress
+            ) {
+                // Queue state is deliberately not persisted. Treat an
+                // interrupted dispatch as ambiguous rather than claiming the
+                // printer did or did not produce the sheet.
+                self.wizard
+                    .set_job_status(slot, crate::calibration::JobStatus::Failed, now);
+            }
+        }
+        self.primary_queue_job = None;
+        self.second_queue_job = None;
+        self.validation_queue_job = None;
+        Some(self)
+    }
+}
+
+const fn default_calibration_profile_version() -> u16 {
+    crate::calibration::CALIBRATION_SCHEMA_VERSION as u16
 }
 
 #[derive(Clone)]
@@ -661,6 +1026,29 @@ impl SapodillaApp {
             .filter(|profiles| !profiles.is_empty())
             .unwrap_or_else(MaterialProfile::built_ins);
         let selected_material = usize::from(material_profiles.len() > 1);
+        let calibration_store = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<CalibrationStore>(storage, CALIBRATION_STORAGE_KEY)
+            })
+            .and_then(|store| store.sanitize().ok())
+            .unwrap_or_default();
+        let calibration_session = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<CalibrationSession>(storage, CALIBRATION_SESSION_STORAGE_KEY)
+            })
+            .and_then(CalibrationSession::sanitize_after_load);
+        let printer_fallback_names = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<BTreeMap<String, String>>(
+                    storage,
+                    PRINTER_FALLBACK_NAMES_STORAGE_KEY,
+                )
+            })
+            .map(sanitize_printer_fallback_names)
+            .unwrap_or_default();
         let library_folders = cc
             .storage
             .and_then(|storage| {
@@ -725,6 +1113,11 @@ impl SapodillaApp {
             transport_manager: None,
             printer_connections: BTreeMap::new(),
             printer_statuses: BTreeMap::new(),
+            printer_identities: BTreeMap::new(),
+            printer_identity_errors: BTreeMap::new(),
+            printer_identity_loading: BTreeSet::new(),
+            printer_fallback_names,
+            printer_fallback_drafts: BTreeMap::new(),
 
             selected_device: 0,
             selected_mode: 0,
@@ -778,6 +1171,11 @@ impl SapodillaApp {
             canvas_transform_gesture: None,
             background_color: [255, 255, 255],
             material_profiles,
+            calibration_store,
+            calibration_session,
+            calibration_ui_state: calibration_ui::CalibrationUiState::default(),
+            show_calibration_profiles: false,
+            calibration_message: None,
             selected_material,
             perf_cut: false,
             perf_dash_mm: 1.5,
@@ -1004,6 +1402,38 @@ impl SapodillaApp {
                 }
             });
         }
+    }
+
+    fn request_printer_identity(&self, printer_id: String, manager: Rc<TransportManager>) {
+        let tx = self.tx.clone();
+        spawn(async move {
+            let result = async {
+                let id = manager.next_message_id();
+                let response = manager
+                    .wait_for_response(AvocadoPacket {
+                        version: 100,
+                        content_type: ContentType::Message,
+                        interaction_type: InteractionType::Request,
+                        encoding_type: EncodingType::Json,
+                        encryption_mode: EncryptionMode::None,
+                        terminal_id: id,
+                        msg_number: id,
+                        msg_package_total: 1,
+                        msg_package_num: 1,
+                        is_subpackage: false,
+                        data: serde_json::to_vec(&serde_json::json!({
+                            "id": id,
+                            "method": "get-prop",
+                            "params": ["model", "serial-number", "firmware-revision"]
+                        }))?,
+                    })
+                    .await?;
+                decode_printer_identity(&response)
+                    .ok_or_else(|| anyhow::anyhow!("printer returned an invalid identity response"))
+            }
+            .await;
+            let _ = tx.send(Action::PrinterIdentityLoaded { printer_id, result });
+        });
     }
 
     fn upload_image(&self, ctx: &egui::Context) {
@@ -1267,10 +1697,7 @@ impl SapodillaApp {
         let bytes = encode_plt(
             &self.cut_shapes,
             &self.cut_modes,
-            DEVICES[self.selected_device]
-                .cutter_calibration
-                .clone()
-                .unwrap_or_default(),
+            stock_plotter_mapping(self.selected_device, canvas_size),
             canvas_size,
             &self.material_profiles[self.selected_material],
             self.perf_cut,
@@ -2113,7 +2540,14 @@ impl SapodillaApp {
                 Action::TransportReady { printer_id, result } => match result {
                     Ok(manager) => {
                         self.transport_manager = Some(manager.clone());
-                        self.printer_connections.insert(printer_id, manager);
+                        self.printer_connections
+                            .insert(printer_id.clone(), manager.clone());
+                        if self.printer_statuses.get(&printer_id)
+                            == Some(&TransportStatus::Connected)
+                            && self.printer_identity_loading.insert(printer_id.clone())
+                        {
+                            self.request_printer_identity(printer_id, manager);
+                        }
                     }
                     Err(error) => {
                         self.transport_status = TransportStatus::Disconnected;
@@ -2137,7 +2571,11 @@ impl SapodillaApp {
                         self.transport_status = status;
                         self.printer_statuses.insert(printer_id.clone(), status);
                         if status == TransportStatus::Connected {
-                            let _ = self.job_queue.set_printer_online(&printer_id);
+                            if let Some(manager) = self.printer_connections.get(&printer_id)
+                                && self.printer_identity_loading.insert(printer_id.clone())
+                            {
+                                self.request_printer_identity(printer_id.clone(), manager.clone());
+                            }
                         } else if status == TransportStatus::Disconnected
                             && self
                                 .job_queue
@@ -2156,6 +2594,10 @@ impl SapodillaApp {
                         if status == TransportStatus::Disconnected
                             && let Some(manager) = self.printer_connections.remove(&printer_id)
                         {
+                            self.printer_identities.remove(&printer_id);
+                            self.printer_identity_errors.remove(&printer_id);
+                            self.printer_identity_loading.remove(&printer_id);
+                            self.printer_fallback_drafts.remove(&printer_id);
                             if self
                                 .transport_manager
                                 .as_ref()
@@ -2194,6 +2636,48 @@ impl SapodillaApp {
                             let _ = self.job_queue.fail(job_id, err.to_string());
                         }
                         self.error = Some(err);
+                    }
+                },
+
+                Action::PrinterIdentityLoaded { printer_id, result } => match result {
+                    Ok(identity) => {
+                        self.printer_identity_loading.remove(&printer_id);
+                        self.printer_identity_errors.remove(&printer_id);
+                        if identity.serial_number.is_some() {
+                            self.printer_identities.insert(printer_id.clone(), identity);
+                            let _ = self.job_queue.set_printer_online(&printer_id);
+                        } else {
+                            if self
+                                .printer_fallback_names
+                                .get(&printer_id)
+                                .is_some_and(|name| !name.trim().is_empty())
+                            {
+                                let _ = self.job_queue.set_printer_online(&printer_id);
+                            } else {
+                                if let Some(profile_name) = unique_named_fallback_for_identity(
+                                    &self.calibration_store,
+                                    &identity,
+                                ) {
+                                    // A changed transport route cannot prove this is the same
+                                    // physical serial-less printer. Suggest, but require the
+                                    // operator to confirm, the only plausible saved identity.
+                                    self.printer_fallback_drafts
+                                        .insert(printer_id.clone(), profile_name);
+                                }
+                                self.printer_identity_errors.insert(
+                                    printer_id.clone(),
+                                    "printer did not provide a serial number; select a named calibration fallback"
+                                        .into(),
+                                );
+                            }
+                            self.printer_identities.insert(printer_id.clone(), identity);
+                        }
+                    }
+                    Err(error) => {
+                        self.printer_identity_loading.remove(&printer_id);
+                        self.printer_identities.remove(&printer_id);
+                        self.printer_identity_errors
+                            .insert(printer_id, error.to_string());
                     }
                 },
 
@@ -2576,9 +3060,698 @@ impl SapodillaApp {
                         .enqueue(JobSpec::named("Sapodilla sheet").requiring(capabilities));
                     self.pending_print_jobs.insert(queue_id, job);
                 }
+                Action::PrintRouteEncoded {
+                    printer_id,
+                    job_id,
+                    payload,
+                } => {
+                    if let Some(session) = self.calibration_session.as_mut()
+                        && let Some(slot) = [
+                            CalibrationJobSlot::Primary,
+                            CalibrationJobSlot::Second,
+                            CalibrationJobSlot::Validation,
+                        ]
+                        .into_iter()
+                        .find(|slot| session.queue_job(*slot) == Some(job_id))
+                    {
+                        session.plotter_sha1[CalibrationSession::slot_index(slot)] =
+                            Some(hex::encode(sha1::Sha1::digest(&payload.plt)));
+                        session.plotter_commands[CalibrationSession::slot_index(slot)] =
+                            calibration_plotter_commands_from_plt(&payload.plt);
+                    }
+                    self.send_encoded_print_job(printer_id, job_id, payload)
+                }
+                Action::CalibrationJobPrepared {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    slot,
+                    spec,
+                    result,
+                } => {
+                    let Some(session) = self.calibration_session.as_mut().filter(|session| {
+                        session.accepts_job_result(
+                            &run_id,
+                            validation_generation,
+                            slot,
+                            physical_sheet_attempt,
+                        )
+                    }) else {
+                        continue;
+                    };
+                    match result {
+                        Ok(job) => {
+                            session.image_sha1[CalibrationSession::slot_index(slot)] =
+                                Some(job.image_hash.clone());
+                            let queue_id = self.job_queue.enqueue(spec);
+                            self.pending_print_jobs.insert(queue_id, job);
+                            session.set_queue_job(slot, queue_id);
+                            session.wizard.set_job_status(
+                                slot,
+                                crate::calibration::JobStatus::Queued,
+                                current_timestamp_millis(),
+                            );
+                        }
+                        Err(error) => {
+                            session.wizard.set_job_status(
+                                slot,
+                                crate::calibration::JobStatus::Failed,
+                                current_timestamp_millis(),
+                            );
+                            self.calibration_message = Some(error.to_string());
+                        }
+                    }
+                }
+                Action::CalibrationScanAnalyzed {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name,
+                    result,
+                } => {
+                    let Some(session) = self.calibration_session.as_mut().filter(|session| {
+                        session.accepts_scan_result(
+                            &run_id,
+                            validation_generation,
+                            slot,
+                            physical_sheet_attempt,
+                            scan_request_generation,
+                        )
+                    }) else {
+                        continue;
+                    };
+                    let now = current_timestamp_millis();
+                    match result {
+                        Ok(import) => {
+                            let report = import.report;
+                            let observations = scan_report_observations(
+                                &report,
+                                match slot {
+                                    ScanSlot::Training => &session.wizard.run_id,
+                                    ScanSlot::Validation => "validation",
+                                },
+                            );
+                            let all_quadrants = observations_cover_all_quadrants(&observations);
+                            session.wizard.complete_scan_import(
+                                slot,
+                                &file_name,
+                                all_quadrants,
+                                observations,
+                                now,
+                            );
+                            match slot {
+                                ScanSlot::Training => {
+                                    session.training_scan_report = Some(report);
+                                    session.training_scan_preview_png = Some(import.preview_png);
+                                    session.training_scan_preview_sha1 = Some(import.preview_sha1);
+                                }
+                                ScanSlot::Validation => {
+                                    session.validation_scan_report = Some(report);
+                                    session.validation_scan_preview_png = Some(import.preview_png);
+                                    session.validation_scan_preview_sha1 =
+                                        Some(import.preview_sha1);
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            session.wizard.fail_scan_import(slot, &message, now);
+                            self.calibration_message = Some(message);
+                        }
+                    }
+                }
+                Action::CalibrationCandidateSolved {
+                    run_id,
+                    validation_generation,
+                    result,
+                } => {
+                    let Some(session) = self.calibration_session.as_mut().filter(|session| {
+                        session.accepts_async_result(&run_id, validation_generation)
+                    }) else {
+                        continue;
+                    };
+                    let now = current_timestamp_millis();
+                    match result {
+                        Ok(solution) => match session.baseline_mapping.compensated_for_mm_response(
+                            solution.selected.forward_response,
+                            f64::from(DEVICES[0].dpi) / 25.4,
+                        ) {
+                            Ok(mapping) if mapping.validate(TransformBounds::default()).is_ok() => {
+                                session.wizard.mark_candidate_ready(
+                                    &format!("{:?}", solution.selected.model),
+                                    now,
+                                );
+                                session.candidate_mapping = Some(mapping);
+                                session.candidate = Some(solution);
+                            }
+                            Ok(_) | Err(_) => {
+                                session.wizard.mark_candidate_failed(
+                                    "candidate produced an invalid plotter transform",
+                                    now,
+                                );
+                            }
+                        },
+                        Err(message) => {
+                            session.wizard.mark_candidate_failed(&message, now);
+                            self.calibration_message = Some(message);
+                        }
+                    }
+                }
+                Action::CalibrationStoreImported { result } => match result {
+                    Ok(store) => {
+                        self.calibration_store = store;
+                        self.calibration_message = Some("Calibration profiles imported.".into());
+                    }
+                    Err(message) => self.calibration_message = Some(message),
+                },
+                Action::CalibrationDeviceJobStarted {
+                    queue_id,
+                    device_job_id,
+                } => {
+                    if let Some(session) = self.calibration_session.as_mut()
+                        && let Some(slot) = [
+                            session.primary_queue_job,
+                            session.second_queue_job,
+                            session.validation_queue_job,
+                        ]
+                        .into_iter()
+                        .position(|job_id| job_id == Some(queue_id))
+                    {
+                        if !session.device_job_ids.contains(&device_job_id) {
+                            session.device_job_ids.push(device_job_id);
+                        }
+                        if !session.device_job_ids_by_slot[slot].contains(&device_job_id) {
+                            session.device_job_ids_by_slot[slot].push(device_job_id);
+                        }
+                        if slot == CalibrationSession::slot_index(CalibrationJobSlot::Validation)
+                            && !session.validation_device_job_ids.contains(&device_job_id)
+                        {
+                            session.validation_device_job_ids.push(device_job_id);
+                        }
+                    }
+                }
             }
         }
+        self.synchronize_calibration_jobs();
         self.dispatch_queued_jobs();
+    }
+
+    fn start_calibration(&mut self, printer_id: String) {
+        let material = self.material_profiles[self.selected_material].clone();
+        if material.blade_pressure == 0
+            || material.blade_pressure > 100
+            || material.perf_pressure == 0
+            || material.perf_pressure > 100
+            || !(1..=4).contains(&material.passes)
+            || !(1..=10).contains(&material.speed)
+        {
+            self.calibration_message = Some(
+                "Configure valid kiss-cut and through-cut pressures, 1–4 passes, and speed 1–10 for the selected material before calibrating."
+                    .into(),
+            );
+            return;
+        }
+        let Some(printer_key) = calibration_key_for_printer(
+            &self.printer_identities,
+            &self.printer_fallback_names,
+            &printer_id,
+            &DEVICES[0].modes[1].canvas_sizes[0],
+        ) else {
+            self.calibration_message =
+                Some("Wait for printer identity, or choose a stable named fallback first.".into());
+            return;
+        };
+        let canvas = &DEVICES[0].modes[1].canvas_sizes[0];
+        let baseline = resolve_routed_canvas_to_plotter(
+            &self.calibration_store,
+            &self.printer_identities,
+            &self.printer_fallback_names,
+            &printer_id,
+            0,
+            canvas,
+        )
+        .direct;
+        let baseline_profile = self.calibration_store.active_profile(&printer_key);
+        let baseline_profile_id = baseline_profile.map(|profile| profile.profile_id.clone());
+        let baseline_profile_version = baseline_profile
+            .map(|profile| u16::from(profile.version))
+            .unwrap_or_else(default_calibration_profile_version);
+        let now = current_timestamp_millis();
+        let run_id = format!("cal-{}-{}", now, Uuid::new_v4().simple());
+        let Ok(wizard) = CalibrationWizard::new(run_id, now) else {
+            self.calibration_message = Some("Could not create a calibration run.".into());
+            return;
+        };
+        let printer_label = calibration_printer_label(&printer_key);
+        let media_label = calibration_media_label(&material);
+        self.calibration_session = Some(CalibrationSession {
+            printer_id: printer_id.clone(),
+            printer_key,
+            wizard,
+            baseline_profile_id,
+            baseline_profile_version,
+            baseline_mapping: baseline,
+            material,
+            candidate: None,
+            candidate_mapping: None,
+            validation_metrics: None,
+            training_scan_report: None,
+            validation_scan_report: None,
+            training_scan_preview_png: None,
+            validation_scan_preview_png: None,
+            training_scan_preview_sha1: None,
+            validation_scan_preview_sha1: None,
+            primary_queue_job: None,
+            second_queue_job: None,
+            validation_queue_job: None,
+            historical_queue_job_ids: [None; 3],
+            image_sha1: [None, None, None],
+            plotter_sha1: [None, None, None],
+            plotter_commands: std::array::from_fn(|_| Vec::new()),
+            validation_generation: 0,
+            device_job_ids: Vec::new(),
+            validation_device_job_ids: Vec::new(),
+            device_job_ids_by_slot: std::array::from_fn(|_| Vec::new()),
+            physical_sheet_attempts: [0; 3],
+            scan_request_generations: [0; 2],
+        });
+        self.calibration_ui_state = calibration_ui::CalibrationUiState::default();
+        self.calibration_ui_state.selected_printer = printer_label;
+        self.calibration_ui_state.selected_media = media_label;
+        self.calibration_message = None;
+    }
+
+    fn synchronize_calibration_jobs(&mut self) {
+        let stale_validation_job = self
+            .calibration_session
+            .as_mut()
+            .and_then(CalibrationSession::clear_stale_candidate_evidence);
+        if let Some(job_id) = stale_validation_job {
+            let _ = self.job_queue.cancel(job_id);
+            self.pending_print_jobs.remove(&job_id);
+            self.active_queue_jobs.retain(|_, active| *active != job_id);
+            if self.active_queue_job == Some(job_id) {
+                self.active_queue_job = None;
+            }
+        }
+        let Some(session) = self.calibration_session.as_mut() else {
+            return;
+        };
+        let now = current_timestamp_millis();
+        for slot in [
+            CalibrationJobSlot::Primary,
+            CalibrationJobSlot::Second,
+            CalibrationJobSlot::Validation,
+        ] {
+            let Some(job_id) = session.queue_job(slot) else {
+                continue;
+            };
+            let Some(job) = self.job_queue.job(job_id) else {
+                continue;
+            };
+            let status = match job.status {
+                QueueJobStatus::Queued => crate::calibration::JobStatus::Queued,
+                QueueJobStatus::Running => crate::calibration::JobStatus::InProgress,
+                QueueJobStatus::Done => crate::calibration::JobStatus::Completed,
+                QueueJobStatus::Error | QueueJobStatus::Cancelled => {
+                    crate::calibration::JobStatus::Failed
+                }
+            };
+            let current = match slot {
+                CalibrationJobSlot::Primary => session.wizard.primary_job,
+                CalibrationJobSlot::Second => session.wizard.second_job,
+                CalibrationJobSlot::Validation => session.wizard.validation_job,
+            };
+            if current != status {
+                session.wizard.set_job_status(slot, status, now);
+            }
+        }
+    }
+
+    fn prepare_calibration_job(&mut self, slot: CalibrationJobSlot) {
+        let Some(session) = self.calibration_session.as_ref() else {
+            return;
+        };
+        if session.queue_job(slot).is_some_and(|job_id| {
+            self.job_queue.job(job_id).is_some_and(|job| {
+                matches!(job.status, QueueJobStatus::Queued | QueueJobStatus::Running)
+            })
+        }) {
+            return;
+        }
+        if slot == CalibrationJobSlot::Validation && session.candidate_mapping.is_none() {
+            self.calibration_message = Some("Compute a valid candidate before validation.".into());
+            return;
+        }
+        if session.wizard.method.is_none() {
+            self.calibration_message = Some("Choose a calibration method first.".into());
+            return;
+        }
+
+        let now = current_timestamp_millis();
+        let session = self
+            .calibration_session
+            .as_mut()
+            .expect("calibration session was checked above");
+        let previous_status = match slot {
+            CalibrationJobSlot::Primary => session.wizard.primary_job,
+            CalibrationJobSlot::Second => session.wizard.second_job,
+            CalibrationJobSlot::Validation => session.wizard.validation_job,
+        };
+        let previous_second_status = session.wizard.second_job;
+        let index = CalibrationSession::slot_index(slot);
+        if previous_status != crate::calibration::JobStatus::NotStarted {
+            session.physical_sheet_attempts[index] =
+                session.physical_sheet_attempts[index].saturating_add(1);
+        }
+        if let Err(error) = session.wizard.begin_print_job(slot, now) {
+            self.calibration_message = Some(error.to_string());
+            return;
+        }
+        let mut reset_slots = vec![slot];
+        if slot == CalibrationJobSlot::Primary {
+            // A new primary sheet starts a new training dataset. Evidence from
+            // an optional second sheet belongs to the old dataset too.
+            reset_slots.push(CalibrationJobSlot::Second);
+            if previous_second_status != crate::calibration::JobStatus::NotStarted {
+                let second = CalibrationSession::slot_index(CalibrationJobSlot::Second);
+                session.physical_sheet_attempts[second] =
+                    session.physical_sheet_attempts[second].saturating_add(1);
+            }
+        }
+        let mut stale_queue_jobs = Vec::new();
+        for reset_slot in reset_slots {
+            let reset_index = CalibrationSession::slot_index(reset_slot);
+            stale_queue_jobs.extend(session.take_queue_job(reset_slot));
+            session.historical_queue_job_ids[reset_index] = None;
+            session.image_sha1[reset_index] = None;
+            session.plotter_sha1[reset_index] = None;
+            session.plotter_commands[reset_index].clear();
+            let stale_device_ids = std::mem::take(&mut session.device_job_ids_by_slot[reset_index]);
+            session
+                .device_job_ids
+                .retain(|id| !stale_device_ids.contains(id));
+        }
+        if slot == CalibrationJobSlot::Validation {
+            session.validation_device_job_ids.clear();
+            session.validation_scan_report = None;
+            session.validation_scan_preview_png = None;
+            session.validation_scan_preview_sha1 = None;
+        } else if slot == CalibrationJobSlot::Primary {
+            session.training_scan_report = None;
+            session.training_scan_preview_png = None;
+            session.training_scan_preview_sha1 = None;
+        }
+
+        let run_id = session.wizard.run_id.clone();
+        let validation_generation = session.wizard.validation_generation;
+        let physical_sheet_attempt = session.physical_sheet_attempts[index];
+        let manifest_identity = if slot == CalibrationJobSlot::Validation {
+            session.validation_manifest_identity()
+        } else {
+            session.manifest_identity_for_slot(slot)
+        };
+        let printer_id = session.printer_id.clone();
+        let method = session.wizard.method.expect("method was checked above");
+        let material = session.material.clone();
+        let mapping_override = match slot {
+            CalibrationJobSlot::Primary | CalibrationJobSlot::Second => {
+                Some(session.baseline_mapping)
+            }
+            CalibrationJobSlot::Validation => session.candidate_mapping,
+        };
+        for job_id in stale_queue_jobs {
+            let _ = self.job_queue.cancel(job_id);
+            self.pending_print_jobs.remove(&job_id);
+            self.active_queue_jobs
+                .retain(|_, active_job_id| *active_job_id != job_id);
+            if self.active_queue_job == Some(job_id) {
+                self.active_queue_job = None;
+            }
+        }
+        let tx = self.tx.clone();
+        spawn_blocking(move || {
+            let result = build_calibration_print_job(
+                manifest_identity,
+                method,
+                slot,
+                material,
+                mapping_override,
+            );
+            let name = match slot {
+                CalibrationJobSlot::Primary => "Calibration sheet",
+                CalibrationJobSlot::Second => "Calibration sheet 2",
+                CalibrationJobSlot::Validation => "Calibration validation sheet",
+            };
+            let spec = calibration_job_spec(name, printer_id);
+            let _ = tx.send(Action::CalibrationJobPrepared {
+                run_id,
+                validation_generation,
+                physical_sheet_attempt,
+                slot,
+                spec,
+                result,
+            });
+        });
+    }
+
+    fn import_calibration_scan(&mut self, slot: ScanSlot) {
+        let Some(session) = self.calibration_session.as_mut() else {
+            return;
+        };
+        let run_id = session.wizard.run_id.clone();
+        let manifest_identity = if slot == ScanSlot::Validation {
+            session.validation_manifest_identity()
+        } else {
+            session.manifest_identity_for_slot(CalibrationJobSlot::Primary)
+        };
+        let Some(method) = session.wizard.method else {
+            return;
+        };
+        if method != CalibrationMethod::FlatbedScanner {
+            return;
+        }
+        session
+            .wizard
+            .begin_scan_import(slot, "choosing file…", current_timestamp_millis());
+        let validation_generation = session.wizard.validation_generation;
+        let scan_index = CalibrationSession::scan_slot_index(slot);
+        session.scan_request_generations[scan_index] =
+            session.scan_request_generations[scan_index].saturating_add(1);
+        let scan_request_generation = session.scan_request_generations[scan_index];
+        let physical_sheet_attempt = session.physical_sheet_attempts
+            [CalibrationSession::slot_index(match slot {
+                ScanSlot::Training => CalibrationJobSlot::Primary,
+                ScanSlot::Validation => CalibrationJobSlot::Validation,
+            })];
+        match slot {
+            ScanSlot::Training => {
+                session.training_scan_report = None;
+                session.training_scan_preview_png = None;
+                session.training_scan_preview_sha1 = None;
+            }
+            ScanSlot::Validation => {
+                session.validation_scan_report = None;
+                session.validation_scan_preview_png = None;
+                session.validation_scan_preview_sha1 = None;
+            }
+        }
+        let tx = self.tx.clone();
+        spawn(async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .add_filter("600 DPI color scan", &["png", "jpg", "jpeg"])
+                .pick_file()
+                .await
+            else {
+                let _ = tx.send(Action::CalibrationScanAnalyzed {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name: "scan".into(),
+                    result: Err("Scan import was cancelled.".into()),
+                });
+                return;
+            };
+            let file_name = file.file_name();
+            let bytes = file.read().await;
+            let manifest =
+                calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
+            let result = manifest
+                .map_err(|error| error.to_string())
+                .and_then(|manifest| {
+                    analyze_flatbed_scan(&bytes, &manifest, ScanAnalysisConfig::default())
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|report| {
+                    calibration_scan_preview(&bytes)
+                        .map(|preview_png| CalibrationScanImport {
+                            report,
+                            preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
+                            preview_png: preview_png.into(),
+                        })
+                        .map_err(|error| error.to_string())
+                });
+            let _ = tx.send(Action::CalibrationScanAnalyzed {
+                run_id,
+                validation_generation,
+                physical_sheet_attempt,
+                scan_request_generation,
+                slot,
+                file_name,
+                result,
+            });
+        });
+    }
+
+    fn compute_calibration_candidate(&mut self) {
+        let Some(session) = self.calibration_session.as_mut() else {
+            return;
+        };
+        let Some(method) = session.wizard.method else {
+            return;
+        };
+        let observations = session.wizard.training_observations();
+        let run_id = session.wizard.run_id.clone();
+        session.candidate = None;
+        session.candidate_mapping = None;
+        session
+            .wizard
+            .mark_candidate_computing(current_timestamp_millis());
+        let validation_generation = session.wizard.validation_generation;
+        let tx = self.tx.clone();
+        spawn_blocking(move || {
+            let result =
+                solve_calibration(method, &observations, CalibrationPolicy::pixcut_s1_4x7())
+                    .map_err(|error| error.to_string());
+            let _ = tx.send(Action::CalibrationCandidateSolved {
+                run_id,
+                validation_generation,
+                result,
+            });
+        });
+    }
+
+    fn evaluate_calibration_validation(&mut self) {
+        let Some(session) = self.calibration_session.as_mut() else {
+            return;
+        };
+        let Some(method) = session.wizard.method else {
+            return;
+        };
+        let before = observation_error_metrics(&session.wizard.training_observations());
+        let validation = session.wizard.validation_observations_for_evaluation();
+        let after = observation_error_metrics(&validation);
+        let (Some(before), Some(after)) = (before, after) else {
+            session.wizard.set_validation_result(
+                false,
+                "not enough independent validation measurements",
+                current_timestamp_millis(),
+            );
+            return;
+        };
+        let required_coverage_passed = validation_coverage_passed(method, &validation);
+        let policy = CalibrationActivationPolicy::pixcut_s1_4x7();
+        let maximum_error_passed = after.maximum_mm
+            <= before.maximum_mm * policy.maximum_error_relative_factor
+                + policy.maximum_error_absolute_slack_mm;
+        let metrics = ValidationMetrics {
+            before,
+            after,
+            required_coverage_passed,
+            maximum_error_passed,
+            normal_kiss_cut_passed: None,
+        };
+        let improvement = metrics.before.rms_mm > f64::EPSILON
+            && (metrics.before.rms_mm - metrics.after.rms_mm) / metrics.before.rms_mm
+                >= policy.minimum_rms_improvement;
+        let p95_passed = metrics.after.p95_mm <= policy.maximum_p95_mm;
+        let passed = metrics.is_valid()
+            && required_coverage_passed
+            && maximum_error_passed
+            && improvement
+            && p95_passed;
+        let message = if passed {
+            "Independent validation passed"
+        } else if !improvement {
+            "validation did not improve RMS error by at least 25%"
+        } else if !required_coverage_passed {
+            "validation targets do not cover the sheet"
+        } else if !p95_passed {
+            "validation improved, but remains outside the 0.50 mm p95 goal"
+        } else {
+            "validation maximum error materially worsened"
+        };
+        session.validation_metrics = Some(metrics);
+        session
+            .wizard
+            .set_validation_result(passed, message, current_timestamp_millis());
+    }
+
+    fn activate_calibration_profile(&mut self) {
+        let Some(session) = self.calibration_session.as_mut() else {
+            return;
+        };
+        let (Some(solution), Some(mapping), Some(mut validation), Some(method)) = (
+            session.candidate.as_ref(),
+            session.candidate_mapping,
+            session.validation_metrics.clone(),
+            session.wizard.method,
+        ) else {
+            self.calibration_message = Some("Calibration result is incomplete.".into());
+            return;
+        };
+        validation.normal_kiss_cut_passed = session.wizard.normal_kiss_cut_passed;
+        let settings = calibration_cut_settings(&session.material, method, false);
+        let validation_settings = calibration_cut_settings(&session.material, method, true);
+        let profile = CalibrationProfile {
+            version: crate::calibration::CALIBRATION_SCHEMA_VERSION,
+            profile_id: format!("profile-{}", session.wizard.run_id),
+            key: session.printer_key.clone(),
+            method,
+            canvas_to_plotter: mapping,
+            baseline_mapping_id: session
+                .baseline_profile_id
+                .clone()
+                .unwrap_or_else(|| crate::calibration::LEGACY_PIXCUT_S1_MAPPING_ID.into()),
+            created_at: current_timestamp_millis(),
+            validation: validation.clone(),
+            measurement_settings: settings,
+            validation_settings,
+            selected_model: solution.selected.model,
+            previous_profile_id: session.baseline_profile_id.clone(),
+        };
+        let mut run = match persisted_calibration_run(session, solution, validation.clone()) {
+            Ok(run) => run,
+            Err(error) => {
+                self.calibration_message = Some(format!(
+                    "Calibration evidence is incomplete; profile was not activated: {error}"
+                ));
+                return;
+            }
+        };
+        if let Err(error) = run.validate_and_sanitize() {
+            self.calibration_message = Some(format!(
+                "Calibration evidence is invalid; profile was not activated: {error}"
+            ));
+            return;
+        }
+        match self.calibration_store.add_and_activate(profile) {
+            Ok(_) => {
+                self.calibration_store.runs.push(run);
+                self.calibration_store
+                    .runs
+                    .sort_by_key(|run| std::cmp::Reverse(run.updated_at));
+                self.calibration_store
+                    .runs
+                    .truncate(crate::calibration::MAX_CALIBRATION_RUNS);
+                self.calibration_message = Some("Calibration profile activated.".into());
+                self.calibration_session = None;
+            }
+            Err(error) => self.calibration_message = Some(error.to_string()),
+        }
     }
 
     fn print_canvas(&mut self) {
@@ -2593,15 +3766,9 @@ impl SapodillaApp {
         } else {
             vec!["print"]
         };
-        let mode = &DEVICES[self.selected_device].modes[self.selected_mode];
-        let canvas_size = mode.canvas_sizes[self.selected_canvas_size].clone();
         let snapshot = self.render_snapshot();
         let cut_shapes = self.cut_shapes.clone();
         let cut_modes = self.cut_modes.clone();
-        let calibration = DEVICES[self.selected_device]
-            .cutter_calibration
-            .clone()
-            .unwrap_or_default();
         let material = self.material_profiles[self.selected_material].clone();
         let perf_cut = self.perf_cut;
         let dpi = DEVICES[self.selected_device].dpi;
@@ -2616,33 +3783,25 @@ impl SapodillaApp {
         let tx = self.tx.clone();
         spawn_blocking(move || {
             let image = encode_image(&snapshot.render());
-            let plt = encode_plt(
-                &cut_shapes,
-                &cut_modes,
-                calibration,
-                &canvas_size,
-                &material,
-                perf_cut,
-                perf_dash,
-                perf_gap,
-                peel_tabs,
-                overcut,
-            );
-            let mut packet_data = Vec::with_capacity(image.len() + plt.len());
-            if mode_type.has_cutting() {
-                packet_data.extend_from_slice(&plt);
-            }
-            packet_data.extend_from_slice(&image);
             let job = PendingPrintJob {
                 encoded_image_len: image.len(),
-                plt,
-                packet_data,
                 image_hash: hex::encode(sha1::Sha1::digest(&image)),
+                encoded_image: image,
                 created_at: current_timestamp_millis(),
                 copies,
                 device_index,
                 mode_index,
                 canvas_index,
+                cut_shapes,
+                cut_modes,
+                material,
+                perf_cut,
+                perf_dash,
+                perf_gap,
+                peel_tabs,
+                overcut,
+                calibration_phases: None,
+                mapping_override: None,
             };
             let _ = tx.send(Action::PrintPrepared { capabilities, job });
         });
@@ -2656,22 +3815,88 @@ impl SapodillaApp {
                     .fail(route.job_id, "queued print payload is unavailable");
                 continue;
             };
-            let Some(manager) = self.printer_connections.get(&route.printer_id).cloned() else {
+            if !self.printer_connections.contains_key(&route.printer_id) {
                 let _ = self
                     .job_queue
                     .set_printer_offline(&route.printer_id, "connection unavailable");
                 continue;
-            };
+            }
+            let mode = &DEVICES[payload.device_index].modes[payload.mode_index];
+            let canvas_size = mode.canvas_sizes[payload.canvas_index].clone();
+            let plotter_mapping = payload
+                .mapping_override
+                .map(PlotterMapping::direct)
+                .unwrap_or_else(|| {
+                    self.routed_canvas_to_plotter(&route.printer_id, &payload, &canvas_size)
+                });
+            let has_cutting = mode.mode_type.has_cutting();
             self.active_queue_job = Some(route.job_id);
             self.active_queue_jobs
                 .insert(route.printer_id.clone(), route.job_id);
             self.send_progress = None;
             let tx = self.tx.clone();
             let queue_id = route.job_id;
-            spawn(async move {
-                let result = async {
-                    let mode = &DEVICES[payload.device_index].modes[payload.mode_index];
-                    let canvas_size = &mode.canvas_sizes[payload.canvas_index];
+            let printer_id = route.printer_id;
+            spawn_blocking(move || {
+                let plt = if has_cutting {
+                    if let Some(phases) = payload.calibration_phases.as_ref() {
+                        encode_calibration_plt(phases, plotter_mapping, payload.material.passes)
+                    } else {
+                        encode_plt(
+                            &payload.cut_shapes,
+                            &payload.cut_modes,
+                            plotter_mapping,
+                            &canvas_size,
+                            &payload.material,
+                            payload.perf_cut,
+                            payload.perf_dash,
+                            payload.perf_gap,
+                            payload.peel_tabs,
+                            payload.overcut,
+                        )
+                    }
+                } else {
+                    Vec::new()
+                };
+                let mut packet_data = Vec::with_capacity(payload.encoded_image.len() + plt.len());
+                packet_data.extend_from_slice(&plt);
+                packet_data.extend_from_slice(&payload.encoded_image);
+                let _ = tx.send(Action::PrintRouteEncoded {
+                    printer_id,
+                    job_id: queue_id,
+                    payload: EncodedPrintJob {
+                        source: payload,
+                        plt,
+                        packet_data,
+                    },
+                });
+            });
+        }
+    }
+
+    fn send_encoded_print_job(
+        &mut self,
+        printer_id: String,
+        queue_id: u64,
+        payload: EncodedPrintJob,
+    ) {
+        if self.active_queue_jobs.get(&printer_id) != Some(&queue_id) {
+            return;
+        }
+        let Some(manager) = self.printer_connections.get(&printer_id).cloned() else {
+            let _ = self
+                .job_queue
+                .set_printer_offline(&printer_id, "connection unavailable after encoding");
+            self.active_queue_jobs.remove(&printer_id);
+            self.active_queue_job = None;
+            return;
+        };
+        let tx = self.tx.clone();
+        spawn(async move {
+            let result = async {
+                    let source = payload.source;
+                    let mode = &DEVICES[source.device_index].modes[source.mode_index];
+                    let canvas_size = &mode.canvas_sizes[source.canvas_index];
                     let id = manager.next_message_id();
                     let data = if mode.mode_type.has_cutting() {
                         serde_json::json!({
@@ -2679,19 +3904,19 @@ impl SapodillaApp {
                                 { "method": "print-job", "params": {
                                     "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
                                     "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
-                                    "file-size": payload.encoded_image_len, "document-format": 9,
-                                    "document-name": format!("{}.jpeg", payload.created_at),
-                                    "hash-method": 1, "hash-value": payload.image_hash,
+                                    "file-size": source.encoded_image_len, "document-format": 9,
+                                    "document-name": format!("{}.jpeg", source.created_at),
+                                    "hash-method": 1, "hash-value": source.image_hash,
                                     "user-account": "000000.00000000000000000000000000000000.0000",
-                                    "job-send-time": payload.created_at / 1000,
-                                    "link-type": mode.mode_type.link_type(), "copies": payload.copies
+                                    "job-send-time": source.created_at / 1000,
+                                    "link-type": mode.mode_type.link_type(), "copies": source.copies
                                 }},
                                 { "method": "cut-job", "params": {
-                                    "copies": payload.copies, "media-size": canvas_size.media_size,
-                                    "document-name": format!("{}.plt", payload.created_at),
+                                    "copies": source.copies, "media-size": canvas_size.media_size,
+                                    "document-name": format!("{}.plt", source.created_at),
                                     "file-size": payload.plt.len(), "channel": mode.mode_type.channel(),
                                     "media-type": canvas_size.media_type, "job-type": mode.mode_type.job_type(),
-                                    "document-format": 18, "job-send-time": payload.created_at / 1000
+                                    "document-format": 18, "job-send-time": source.created_at / 1000
                                 }}
                             ]
                         })
@@ -2699,12 +3924,12 @@ impl SapodillaApp {
                         serde_json::json!({ "id": id, "method": "print-job", "params": {
                             "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
                             "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
-                            "file-size": payload.encoded_image_len, "document-format": 9,
-                            "document-name": format!("{}.jpeg", payload.created_at),
-                            "hash-method": 1, "hash-value": payload.image_hash,
+                            "file-size": source.encoded_image_len, "document-format": 9,
+                            "document-name": format!("{}.jpeg", source.created_at),
+                            "hash-method": 1, "hash-value": source.image_hash,
                             "user-account": "000000.00000000000000000000000000000000.0000",
-                            "link-type": mode.mode_type.link_type(), "job-send-time": payload.created_at / 1000,
-                            "copies": payload.copies
+                            "link-type": mode.mode_type.link_type(), "job-send-time": source.created_at / 1000,
+                            "copies": source.copies
                         }})
                     };
                     let response = manager.wait_for_response(AvocadoPacket {
@@ -2720,6 +3945,10 @@ impl SapodillaApp {
                     let device_job_id = response.as_json::<AvocadoResult<JobResult>>()
                         .ok_or_else(|| anyhow::anyhow!("printer returned an invalid job response"))?
                         .result.job_id;
+                    let _ = tx.send(Action::CalibrationDeviceJobStarted {
+                        queue_id,
+                        device_job_id,
+                    });
                     manager.send_data(device_job_id, &payload.packet_data, |total, sent| {
                         let _ = tx.send(Action::SendProgress {
                             job_id: queue_id, progress: sent as f32 / total as f32,
@@ -2727,15 +3956,30 @@ impl SapodillaApp {
                     }).await?;
                     manager.poll_job(device_job_id).await?;
                     Ok::<(), anyhow::Error>(())
-                }.await;
-                if let Err(error) = result {
-                    let _ = tx.send(Action::PrinterJobError {
-                        job_id: queue_id,
-                        error,
-                    });
-                }
-            });
-        }
+            }.await;
+            if let Err(error) = result {
+                let _ = tx.send(Action::PrinterJobError {
+                    job_id: queue_id,
+                    error,
+                });
+            }
+        });
+    }
+
+    fn routed_canvas_to_plotter(
+        &self,
+        printer_id: &str,
+        payload: &PendingPrintJob,
+        canvas_size: &CanvasSize,
+    ) -> PlotterMapping {
+        resolve_routed_canvas_to_plotter(
+            &self.calibration_store,
+            &self.printer_identities,
+            &self.printer_fallback_names,
+            printer_id,
+            payload.device_index,
+            canvas_size,
+        )
     }
 
     fn start_new_sheet(&mut self) {
@@ -2901,6 +4145,173 @@ impl SapodillaApp {
         }
     }
 
+    fn calibration_profile_manager(&mut self, ctx: &egui::Context) {
+        if !self.show_calibration_profiles {
+            return;
+        }
+        let mut open = self.show_calibration_profiles;
+        let mut activate = None;
+        let mut reset = None;
+        let mut rollback = None;
+        let mut import = false;
+        let mut export = false;
+        let mut export_run = None;
+        egui::Window::new("Calibration profiles")
+            .open(&mut open)
+            .default_width(620.0)
+            .min_width(360.0)
+            .show(ctx, |ui| {
+                ui.heading("Print-to-cut calibration profiles");
+                theme::muted(
+                    ui,
+                    "Profiles are isolated by printer identity, firmware, and media.",
+                );
+                if let Some(message) = &self.calibration_message {
+                    ui.label(message);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Import JSON…").clicked() {
+                        import = true;
+                    }
+                    if ui.button("Export JSON…").clicked() {
+                        export = true;
+                    }
+                    if ui.button("Copy JSON").clicked()
+                        && let Ok(json) = serde_json::to_string_pretty(&self.calibration_store)
+                    {
+                        ui.ctx().copy_text(json);
+                    }
+                });
+                ui.separator();
+                if self.calibration_store.profiles.is_empty() {
+                    ui.label("No completed calibration profiles yet.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height((ctx.content_rect().height() - 240.0).max(220.0))
+                    .show(ui, |ui| {
+                        for profile in self.calibration_store.profiles.clone() {
+                            let active = self
+                                .calibration_store
+                                .active_profile(&profile.key)
+                                .is_some_and(|value| value.profile_id == profile.profile_id);
+                            ui.group(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong(&profile.profile_id);
+                                    if active {
+                                        ui.label("Active");
+                                    }
+                                });
+                                ui.small(format!(
+                                    "{} · firmware {} · {:?}",
+                                    profile.key.model,
+                                    profile.key.firmware_revision,
+                                    profile.method
+                                ));
+                                ui.small(format!(
+                                    "Validation RMS {:.3} → {:.3} mm · p95 {:.3} mm",
+                                    profile.validation.before.rms_mm,
+                                    profile.validation.after.rms_mm,
+                                    profile.validation.after.p95_mm
+                                ));
+                                ui.horizontal_wrapped(|ui| {
+                                    if !active && ui.small_button("Activate").clicked() {
+                                        activate = Some(profile.profile_id.clone());
+                                    }
+                                    if active && ui.small_button("Revert to previous").clicked() {
+                                        rollback = Some(profile.key.clone());
+                                    }
+                                    if active && ui.small_button("Use stock mapping").clicked() {
+                                        reset = Some(profile.key.clone());
+                                    }
+                                });
+                            });
+                        }
+                    });
+                if !self.calibration_store.runs.is_empty() {
+                    ui.separator();
+                    ui.strong("Run reports");
+                    for run in self.calibration_store.runs.iter().take(10) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!(
+                                "{} · {:?} · {:?}",
+                                run.run_id, run.method, run.state
+                            ));
+                            if ui.small_button("Export report…").clicked() {
+                                export_run = Some(run.clone());
+                            }
+                        });
+                    }
+                }
+            });
+        self.show_calibration_profiles = open;
+
+        if let Some(profile_id) = activate {
+            self.calibration_message = self
+                .calibration_store
+                .activate(&profile_id)
+                .err()
+                .map(|error| error.to_string())
+                .or_else(|| Some("Calibration profile activated.".into()));
+        }
+        if let Some(key) = rollback {
+            self.calibration_message = match self.calibration_store.rollback(&key) {
+                Ok(Some(_)) => Some("Previous calibration restored.".into()),
+                Ok(None) => Some("No active calibration to revert.".into()),
+                Err(error) => Some(error.to_string()),
+            };
+        }
+        if let Some(key) = reset {
+            self.calibration_store.reset(&key);
+            self.calibration_message = Some("Stock mapping restored.".into());
+        }
+        if export {
+            let store = self.calibration_store.clone();
+            spawn(async move {
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .set_file_name("sapodilla-calibration-profiles.json")
+                    .save_file()
+                    .await
+                else {
+                    return;
+                };
+                if let Ok(json) = serde_json::to_vec_pretty(&store) {
+                    let _ = file.write(&json).await;
+                }
+            });
+        }
+        if let Some(run) = export_run {
+            spawn(async move {
+                let file_name = format!("sapodilla-calibration-{}.json", run.run_id);
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .set_file_name(&file_name)
+                    .save_file()
+                    .await
+                else {
+                    return;
+                };
+                if let Ok(json) = serde_json::to_vec_pretty(&run) {
+                    let _ = file.write(&json).await;
+                }
+            });
+        }
+        if import {
+            let tx = self.tx.clone();
+            spawn(async move {
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .add_filter("Calibration profiles", &["json"])
+                    .pick_file()
+                    .await
+                else {
+                    return;
+                };
+                let result = serde_json::from_slice::<CalibrationStore>(&file.read().await)
+                    .map_err(|error| error.to_string())
+                    .and_then(|store| store.sanitize().map_err(|error| error.to_string()));
+                let _ = tx.send(Action::CalibrationStoreImported { result });
+            });
+        }
+    }
+
     fn menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let previous_theme = ctx.options(|options| options.theme_preference);
         egui::widgets::global_theme_preference_switch(ui);
@@ -2987,6 +4398,27 @@ impl SapodillaApp {
             {
                 self.custom_accent_rgb = self.appearance.accent.rgb();
                 self.show_settings = true;
+                ui.close();
+            }
+            if ui.button("Calibration…").clicked() {
+                if self.calibration_session.is_some() {
+                    self.calibration_ui_state.open = true;
+                } else if let Some(printer_id) = self
+                    .job_queue
+                    .printers()
+                    .iter()
+                    .find(|printer| self.printer_connections.contains_key(&printer.id))
+                    .map(|printer| printer.id.clone())
+                {
+                    self.start_calibration(printer_id);
+                } else {
+                    self.calibration_message =
+                        Some("Connect a PixCut S1 before starting calibration.".into());
+                }
+                ui.close();
+            }
+            if ui.button("Calibration profiles…").clicked() {
+                self.show_calibration_profiles = true;
                 ui.close();
             }
         });
@@ -3641,16 +5073,74 @@ impl SapodillaApp {
             self.printer_connections.len()
         ));
         let mut disconnect = None;
-        for printer in self.job_queue.printers() {
+        let mut accept_fallback = None;
+        let mut calibrate = None;
+        for printer in self.job_queue.printers().to_vec() {
             ui.horizontal(|ui| {
                 ui.label(&printer.name);
                 ui.small(format!("{:?}", printer.status));
+                let has_stable_identity = self
+                    .printer_identities
+                    .get(&printer.id)
+                    .is_some_and(|identity| identity.serial_number.is_some())
+                    || self.printer_fallback_names.contains_key(&printer.id);
+                if self.printer_connections.contains_key(&printer.id)
+                    && has_stable_identity
+                    && ui.small_button("Calibration profile…").clicked()
+                {
+                    calibrate = Some(printer.id.clone());
+                }
                 if self.printer_connections.contains_key(&printer.id)
                     && ui.small_button("Disconnect").clicked()
                 {
                     disconnect = Some(printer.id.clone());
                 }
             });
+            if self.printer_identity_loading.contains(&printer.id) {
+                ui.small("Reading calibration identity…");
+            } else if let Some(identity) = self.printer_identities.get(&printer.id) {
+                if let Some(serial) = &identity.serial_number {
+                    ui.small(format!(
+                        "{} · serial {} · firmware {}",
+                        identity.model, serial, identity.firmware_revision
+                    ));
+                } else {
+                    ui.small("This connection did not provide a stable serial number.");
+                    ui.horizontal(|ui| {
+                        let draft = self
+                            .printer_fallback_drafts
+                            .entry(printer.id.clone())
+                            .or_insert_with(|| printer.name.clone());
+                        ui.text_edit_singleline(draft).on_hover_text(
+                            "Stable name used to select calibration for this printer",
+                        );
+                        if ui
+                            .add_enabled(
+                                !draft.trim().is_empty(),
+                                egui::Button::new("Use named fallback"),
+                            )
+                            .clicked()
+                        {
+                            accept_fallback = Some((printer.id.clone(), draft.trim().to_owned()));
+                        }
+                    });
+                }
+            } else if let Some(error) = self.printer_identity_errors.get(&printer.id) {
+                ui.small(format!("Calibration identity unavailable: {error}"));
+            }
+        }
+        if let Some((printer_id, profile_name)) = accept_fallback {
+            self.printer_fallback_names
+                .insert(printer_id.clone(), profile_name);
+            self.printer_identity_errors.remove(&printer_id);
+            let _ = self.job_queue.set_printer_online(&printer_id);
+        }
+        if let Some(printer_id) = calibrate {
+            if self.calibration_session.is_some() {
+                self.calibration_ui_state.open = true;
+            } else {
+                self.start_calibration(printer_id);
+            }
         }
         if let Some(printer_id) = disconnect
             && let Some(manager) = self.printer_connections.remove(&printer_id)
@@ -5243,6 +6733,7 @@ impl eframe::App for SapodillaApp {
             }
 
             self.appearance_settings(ctx);
+            self.calibration_profile_manager(ctx);
 
             if let Some(err) = &self.error {
                 let modal = Modal::new(Id::new("error_modal")).show(ui.ctx(), |ui| {
@@ -5261,6 +6752,79 @@ impl eframe::App for SapodillaApp {
                 }
             }
         });
+
+        let calibration_events = if let Some(session) = self.calibration_session.as_mut() {
+            if self.calibration_ui_state.selected_printer.is_empty() {
+                self.calibration_ui_state.selected_printer =
+                    calibration_printer_label(&session.printer_key);
+                self.calibration_ui_state.selected_media =
+                    calibration_media_label(&session.material);
+            }
+            let manifest_identity = match session.wizard.step {
+                crate::calibration::WizardStep::PrintValidation => {
+                    session.validation_manifest_identity()
+                }
+                crate::calibration::WizardStep::PrintSecondCalibration => {
+                    session.manifest_identity_for_slot(CalibrationJobSlot::Second)
+                }
+                _ => session.manifest_identity_for_slot(CalibrationJobSlot::Primary),
+            };
+            calibration_ui::show_calibration_wizard(
+                ctx,
+                &mut session.wizard,
+                &manifest_identity,
+                &mut self.calibration_ui_state,
+                current_timestamp_millis(),
+                calibration_ui::CalibrationUiDiagnostics {
+                    training_scan: session.training_scan_report.as_ref(),
+                    validation_scan: session.validation_scan_report.as_ref(),
+                    training_scan_preview_png: session.training_scan_preview_png.as_ref(),
+                    validation_scan_preview_png: session.validation_scan_preview_png.as_ref(),
+                    training_scan_preview_sha1: session.training_scan_preview_sha1.as_deref(),
+                    validation_scan_preview_sha1: session.validation_scan_preview_sha1.as_deref(),
+                    candidate: session.candidate.as_ref(),
+                    validation: session.validation_metrics.as_ref(),
+                },
+            )
+        } else {
+            Vec::new()
+        };
+        for event in calibration_events {
+            match event {
+                calibration_ui::CalibrationUiEvent::PrintPrimary => {
+                    self.prepare_calibration_job(CalibrationJobSlot::Primary)
+                }
+                calibration_ui::CalibrationUiEvent::PrintSecond => {
+                    self.prepare_calibration_job(CalibrationJobSlot::Second)
+                }
+                calibration_ui::CalibrationUiEvent::PrintValidation => {
+                    self.prepare_calibration_job(CalibrationJobSlot::Validation)
+                }
+                calibration_ui::CalibrationUiEvent::ImportTrainingScan => {
+                    self.import_calibration_scan(ScanSlot::Training)
+                }
+                calibration_ui::CalibrationUiEvent::ImportValidationScan => {
+                    self.import_calibration_scan(ScanSlot::Validation)
+                }
+                calibration_ui::CalibrationUiEvent::ComputeCandidate => {
+                    self.compute_calibration_candidate()
+                }
+                calibration_ui::CalibrationUiEvent::EvaluateValidation => {
+                    self.evaluate_calibration_validation()
+                }
+                calibration_ui::CalibrationUiEvent::ActivateProfile => {
+                    self.activate_calibration_profile()
+                }
+                calibration_ui::CalibrationUiEvent::SaveAndExit => {
+                    if let Some(session) = self.calibration_session.as_mut() {
+                        let _ = session.wizard.save_json(current_timestamp_millis());
+                    }
+                }
+                calibration_ui::CalibrationUiEvent::Discard => {
+                    self.calibration_session = None;
+                }
+            }
+        }
 
         egui::Window::new("Packet Log")
             .open(&mut self.showing_packet_log)
@@ -5301,6 +6865,370 @@ impl eframe::App for SapodillaApp {
             },
         );
         eframe::set_value(storage, APPEARANCE_STORAGE_KEY, &self.appearance);
+        eframe::set_value(storage, CALIBRATION_STORAGE_KEY, &self.calibration_store);
+        eframe::set_value(
+            storage,
+            PRINTER_FALLBACK_NAMES_STORAGE_KEY,
+            &sanitize_printer_fallback_names(self.printer_fallback_names.clone()),
+        );
+        if let Some(session) = self
+            .calibration_session
+            .as_ref()
+            .filter(|session| session.is_resumable())
+        {
+            eframe::set_value(storage, CALIBRATION_SESSION_STORAGE_KEY, session);
+        } else {
+            storage.set_string(CALIBRATION_SESSION_STORAGE_KEY, "null".into());
+        }
+    }
+}
+
+fn calibration_manifest(
+    mut identity: ManifestIdentity,
+    method: CalibrationMethod,
+    validation: bool,
+) -> Result<TargetManifest, crate::calibration::LayoutError> {
+    if validation {
+        identity.run_id.push_str("-validation");
+    }
+    match (method, validation) {
+        (CalibrationMethod::FlatbedScanner, false) => flatbed_calibration(identity),
+        (CalibrationMethod::FlatbedScanner, true) => flatbed_validation(identity),
+        (CalibrationMethod::ManualEastBay, false) => manual_calibration(identity),
+        (CalibrationMethod::ManualEastBay, true) => manual_validation(identity),
+    }
+}
+
+fn calibration_job_spec(name: &str, printer_id: String) -> JobSpec {
+    JobSpec::named(name)
+        .requiring(["print", "cut"])
+        .restricted_to([printer_id])
+}
+
+fn build_calibration_print_job(
+    identity: ManifestIdentity,
+    method: CalibrationMethod,
+    slot: CalibrationJobSlot,
+    material: MaterialProfile,
+    mapping_override: Option<CanvasToPlotter>,
+) -> anyhow::Result<PendingPrintJob> {
+    let validation = slot == CalibrationJobSlot::Validation;
+    let manifest = calibration_manifest(identity, method, validation)?;
+    let raster = render_print_raster(&manifest)?;
+    let encoded_image = encode_image(&image::DynamicImage::ImageRgb8(raster));
+    let pixels_per_mm = f64::from(DEVICES[0].dpi) / 25.4;
+    let mut kiss_paths = Vec::new();
+    let mut through_paths = Vec::new();
+    for cut in &manifest.cuts {
+        let destination = match cut.mode {
+            TargetCutMode::Kiss => &mut kiss_paths,
+            TargetCutMode::Through => &mut through_paths,
+        };
+        for segment in &cut.pen_down_segments_mm {
+            let points = segment
+                .iter()
+                .map(|point| Coord {
+                    x: (point.x * pixels_per_mm) as f32,
+                    y: (point.y * pixels_per_mm) as f32,
+                })
+                .collect::<Vec<_>>();
+            if points.len() >= 2 {
+                destination.push(LineString::new(points));
+            }
+        }
+    }
+    let mut calibration_phases = Vec::new();
+    if !kiss_paths.is_empty() {
+        calibration_phases.push(CutPhase {
+            mode: CutMode::Kiss,
+            pressure: material.blade_pressure,
+            paths: kiss_paths,
+        });
+    }
+    if !through_paths.is_empty() {
+        calibration_phases.push(CutPhase {
+            mode: CutMode::Perforation,
+            pressure: material.perf_pressure,
+            paths: through_paths,
+        });
+    }
+    if calibration_phases.is_empty() {
+        anyhow::bail!("calibration target did not contain cut geometry");
+    }
+    Ok(PendingPrintJob {
+        encoded_image_len: encoded_image.len(),
+        image_hash: hex::encode(sha1::Sha1::digest(&encoded_image)),
+        encoded_image,
+        created_at: current_timestamp_millis(),
+        copies: 1,
+        device_index: 0,
+        mode_index: 1,
+        canvas_index: 0,
+        cut_shapes: Vec::new(),
+        cut_modes: Vec::new(),
+        material,
+        perf_cut: false,
+        perf_dash: 0.0,
+        perf_gap: 0.0,
+        peel_tabs: false,
+        overcut: OvercutSettings::default(),
+        calibration_phases: Some(calibration_phases),
+        mapping_override,
+    })
+}
+
+fn calibration_slot_run_id(run_id: &str, slot: CalibrationJobSlot) -> String {
+    match slot {
+        CalibrationJobSlot::Primary => run_id.to_owned(),
+        CalibrationJobSlot::Second => format!("{run_id}-sheet-2"),
+        CalibrationJobSlot::Validation => run_id.to_owned(),
+    }
+}
+
+fn calibration_plotter_commands_from_plt(plt: &[u8]) -> Vec<CalibrationPlotterCommand> {
+    let mut commands = String::from_utf8_lossy(plt)
+        .split_ascii_whitespace()
+        .filter_map(|token| {
+            let (prefix, coordinates) = token.split_at_checked(1)?;
+            let kind = match prefix {
+                "U" => CalibrationPlotterCommandKind::Move,
+                "D" => CalibrationPlotterCommandKind::Draw,
+                _ => return None,
+            };
+            let (x, y) = coordinates.split_once(',')?;
+            Some(CalibrationPlotterCommand {
+                kind,
+                plotter_units: [x.parse().ok()?, y.parse().ok()?],
+            })
+        })
+        .collect::<Vec<_>>();
+    if commands.last().is_some_and(|command| {
+        command.kind == CalibrationPlotterCommandKind::Move && command.plotter_units == [6476, 0]
+    }) {
+        commands.pop();
+    }
+    commands
+}
+
+fn persisted_calibration_run(
+    session: &CalibrationSession,
+    solution: &CalibrationSolution,
+    validation: ValidationMetrics,
+) -> anyhow::Result<CalibrationRun> {
+    let method = session
+        .wizard
+        .method
+        .ok_or_else(|| anyhow::anyhow!("calibration method is missing"))?;
+    let target_manifest = calibration_manifest(
+        session.manifest_identity_for_slot(CalibrationJobSlot::Primary),
+        method,
+        false,
+    )?;
+    let target_ids = target_manifest
+        .targets
+        .iter()
+        .map(|target| target.id.clone())
+        .collect::<Vec<_>>();
+    let nominal_print_mm = target_manifest
+        .targets
+        .iter()
+        .map(|target| [target.center_mm.x, target.center_mm.y])
+        .collect::<Vec<_>>();
+    let mut observations = session.wizard.training_observations();
+    observations.extend(session.wizard.validation_observations_for_evaluation());
+    let excluded_target_ids = observations
+        .iter()
+        .filter(|observation| !observation.included)
+        .map(|observation| observation.target_id.clone())
+        .collect();
+    let second_required = session.wizard.method == Some(CalibrationMethod::ManualEastBay)
+        && session.wizard.second_sheet_choice
+            == Some(crate::calibration::SecondSheetChoice::MeasureAnotherSheet);
+    let payload_hashes = ["primary", "second", "validation"]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, slot)| -> anyhow::Result<Option<CalibrationPayloadHashes>> {
+                let (Some(jpeg_sha1), Some(plt_sha1)) = (
+                    session.image_sha1[index].clone(),
+                    session.plotter_sha1[index].clone(),
+                ) else {
+                    if matches!(slot, "primary" | "validation")
+                        || (slot == "second" && second_required)
+                    {
+                        anyhow::bail!("{slot} payload hashes were not captured");
+                    }
+                    return Ok(None);
+                };
+                let plotter_commands = session.plotter_commands[index].clone();
+                if plotter_commands.is_empty() {
+                    anyhow::bail!("{slot} payload is missing its dispatched plotter commands");
+                }
+                Ok(Some(CalibrationPayloadHashes {
+                    slot: slot.into(),
+                    jpeg_sha1,
+                    plt_sha1,
+                    plotter_commands,
+                }))
+            },
+        )
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(CalibrationRun {
+        version: crate::calibration::CALIBRATION_SCHEMA_VERSION,
+        run_id: session.wizard.run_id.clone(),
+        key: session.printer_key.clone(),
+        method,
+        baseline_profile_id: session.baseline_profile_id.clone(),
+        baseline_profile_version: session.baseline_profile_version,
+        validation_generation: session.wizard.validation_generation,
+        baseline_mapping: session.baseline_mapping,
+        manifest: CalibrationTargetManifest {
+            revision: target_manifest.schema_version,
+            canvas_mm: [
+                target_manifest.canvas.width_mm,
+                target_manifest.canvas.height_mm,
+            ],
+            target_ids,
+            nominal_print_mm,
+            jpeg_sha1: session.image_sha1[0].clone(),
+            plt_sha1: session.plotter_sha1[0].clone(),
+        },
+        queue_job_ids: [
+            session.historical_queue_job_ids[0],
+            session.historical_queue_job_ids[1],
+            session.historical_queue_job_ids[2],
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        device_job_ids: session.device_job_ids.clone(),
+        payload_hashes,
+        observations,
+        excluded_target_ids,
+        printability_insets_mm: session.wizard.printability_insets_mm,
+        fit_candidates: solution.candidates.clone(),
+        selected_model: Some(solution.selected.model),
+        validation: Some(validation),
+        state: CalibrationRunState::Passed,
+        created_at: session.wizard.created_at,
+        updated_at: current_timestamp_millis(),
+    })
+}
+
+fn scan_report_observations(
+    report: &ScanAnalysisReport,
+    sheet_id: &str,
+) -> Vec<CalibrationObservation> {
+    report
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let observed_cut_mm = target.observed_center_mm?;
+            let uncertainty_x = target
+                .covariance
+                .map(|value| value.xx_mm2.max(0.0).sqrt())
+                .unwrap_or(0.15)
+                .clamp(0.02, 10.0);
+            let uncertainty_y = target
+                .covariance
+                .map(|value| value.yy_mm2.max(0.0).sqrt())
+                .unwrap_or(0.15)
+                .clamp(0.02, 10.0);
+            Some(CalibrationObservation {
+                target_id: target.target_id.clone(),
+                sheet_id: sheet_id.to_owned(),
+                nominal_print_mm: target.expected_center_mm,
+                observed_cut_mm,
+                uncertainty_mm: [uncertainty_x, uncertainty_y],
+                confidence: target.confidence.clamp(0.0, 1.0),
+                included: target.status == crate::calibration::ScanTargetStatus::Accepted,
+            })
+        })
+        .collect()
+}
+
+fn calibration_scan_preview(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
+    const MAX_PREVIEW_SIDE: u32 = 1_200;
+    let preview = image::load_from_memory(encoded)?
+        .thumbnail(MAX_PREVIEW_SIDE, MAX_PREVIEW_SIDE)
+        .to_rgba8();
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png).write_image(
+        preview.as_bytes(),
+        preview.width(),
+        preview.height(),
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(png)
+}
+
+fn observations_cover_all_quadrants(observations: &[CalibrationObservation]) -> bool {
+    let mut quadrants = 0u8;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.included)
+    {
+        let right = observation.nominal_print_mm[0] >= 101.6 / 2.0;
+        let bottom = observation.nominal_print_mm[1] >= 177.8 / 2.0;
+        quadrants |= 1 << (usize::from(bottom) * 2 + usize::from(right));
+    }
+    quadrants == 0b1111
+}
+
+fn validation_coverage_passed(
+    method: CalibrationMethod,
+    observations: &[CalibrationObservation],
+) -> bool {
+    let accepted = observations
+        .iter()
+        .filter(|observation| observation.included && observation.is_valid())
+        .collect::<Vec<_>>();
+    let required = match method {
+        CalibrationMethod::FlatbedScanner => 6,
+        CalibrationMethod::ManualEastBay => 4,
+    };
+    accepted.len() >= required
+        && accepted
+            .iter()
+            .any(|value| value.nominal_print_mm[0] <= 101.6 * 0.4)
+        && accepted
+            .iter()
+            .any(|value| value.nominal_print_mm[0] >= 101.6 * 0.6)
+        && accepted
+            .iter()
+            .any(|value| value.nominal_print_mm[1] <= 177.8 * 0.4)
+        && accepted
+            .iter()
+            .any(|value| value.nominal_print_mm[1] >= 177.8 * 0.6)
+}
+
+fn calibration_cut_settings(
+    material: &MaterialProfile,
+    method: CalibrationMethod,
+    validation: bool,
+) -> crate::calibration::CutSettingsProvenance {
+    crate::calibration::CutSettingsProvenance {
+        mode: if method == CalibrationMethod::FlatbedScanner {
+            CalibrationCutMode::ThroughCut
+        } else {
+            CalibrationCutMode::Kiss
+        },
+        pressure: if method == CalibrationMethod::FlatbedScanner {
+            material.perf_pressure
+        } else {
+            material.blade_pressure
+        },
+        passes: material.passes.clamp(1, 4),
+        configured_speed: (1..=10).contains(&material.speed).then_some(material.speed),
+        path_direction: CutPathDirection::Mixed,
+        path_order_id: if validation {
+            "sapodilla-calibration-validation-v1".into()
+        } else {
+            "sapodilla-calibration-training-v1".into()
+        },
     }
 }
 
@@ -5574,10 +7502,45 @@ fn encode_image(im: &image::DynamicImage) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlotterMapping {
+    direct: CanvasToPlotter,
+    legacy_f32: Option<LegacyF32Mapping>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LegacyF32Mapping {
+    canvas_height: f32,
+    scale: f32,
+    offset: Vec2,
+}
+
+impl PlotterMapping {
+    fn direct(mapping: CanvasToPlotter) -> Self {
+        Self {
+            direct: mapping,
+            legacy_f32: None,
+        }
+    }
+
+    fn apply(self, point: Coord<f32>) -> [f64; 2] {
+        if let Some(legacy) = self.legacy_f32 {
+            // Preserve the historical f32 operation order for the stock
+            // mapping. Calibrated profiles use the direct f64 affine path.
+            return [
+                f64::from((legacy.canvas_height - point.y + legacy.offset.y) * legacy.scale),
+                f64::from((point.x + legacy.offset.x) * legacy.scale),
+            ];
+        }
+        self.direct.apply([f64::from(point.x), f64::from(point.y)])
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_plt(
     cut_shapes: &[LineString<f32>],
     cut_modes: &[CutMode],
-    cutter_calibration: CutterCalibration,
+    plotter_mapping: PlotterMapping,
     canvas_size: &CanvasSize,
     material: &MaterialProfile,
     perf_cut_enabled: bool,
@@ -5632,25 +7595,46 @@ fn encode_plt(
     let mut buf = b"IN VER0.1.0".to_vec();
     for phase in phases {
         write!(buf, " KP{}", phase.pressure).unwrap();
-        let mut flipped =
-            CutGenerator::mirror_cuts(&phase.paths, canvas_size.size).collect::<Vec<_>>();
-        flipped.sort_by(|a, b| {
+        let mut ordered = phase.paths;
+        ordered.sort_by(|a, b| {
             let a_start = *a.0.first().unwrap();
             let b_start = *b.0.first().unwrap();
-            a_start
-                .y
-                .total_cmp(&b_start.y)
+            (canvas_size.size.y - a_start.y)
+                .total_cmp(&(canvas_size.size.y - b_start.y))
                 .then(a_start.x.total_cmp(&b_start.x))
         });
         for _ in 0..material.passes {
-            for line in &flipped {
-                write_line_string(&cutter_calibration, &mut buf, line);
+            for line in &ordered {
+                write_line_string(plotter_mapping, &mut buf, line);
             }
         }
     }
 
     write!(buf, " U6476,0  @ ").unwrap();
 
+    buf
+}
+
+fn encode_calibration_plt(
+    phases: &[CutPhase],
+    plotter_mapping: PlotterMapping,
+    passes: u8,
+) -> Vec<u8> {
+    let mut buf = b"IN VER0.1.0".to_vec();
+    for phase in phases {
+        if phase.paths.is_empty() {
+            continue;
+        }
+        write!(buf, " KP{}", phase.pressure).unwrap();
+        for _ in 0..passes.max(1) {
+            for path in &phase.paths {
+                if !path.0.is_empty() {
+                    write_line_string(plotter_mapping, &mut buf, path);
+                }
+            }
+        }
+    }
+    write!(buf, " U6476,0  @ ").unwrap();
     buf
 }
 
@@ -5671,27 +7655,158 @@ pub(crate) fn peel_tab_unmirrored(path: &LineString<f32>) -> Option<LineString<f
 }
 
 fn write_line_string(
-    cutter_calibration: &CutterCalibration,
+    plotter_mapping: PlotterMapping,
     buf: &mut Vec<u8>,
     line_shape: &geo::LineString<f32>,
 ) {
-    write!(
-        buf,
-        " U{:.0},{:.0}",
-        (line_shape.0[0].y + cutter_calibration.offset.y) * cutter_calibration.scale_factor,
-        (line_shape.0[0].x + cutter_calibration.offset.x) * cutter_calibration.scale_factor
-    )
-    .unwrap();
+    let first = plotter_mapping.apply(line_shape.0[0]);
+    write!(buf, " U{:.0},{:.0}", first[0], first[1]).unwrap();
 
     for point in line_shape.coords() {
-        write!(
-            buf,
-            " D{:.0},{:.0}",
-            (point.y + cutter_calibration.offset.y) * cutter_calibration.scale_factor,
-            (point.x + cutter_calibration.offset.x) * cutter_calibration.scale_factor
-        )
-        .unwrap();
+        let mapped = plotter_mapping.apply(*point);
+        write!(buf, " D{:.0},{:.0}", mapped[0], mapped[1]).unwrap();
     }
+}
+
+fn stock_plotter_mapping(device_index: usize, canvas_size: &CanvasSize) -> PlotterMapping {
+    let calibration = DEVICES[device_index]
+        .cutter_calibration
+        .clone()
+        .unwrap_or_default();
+    let direct = CanvasToPlotter::from_legacy_components(
+        f64::from(canvas_size.size.y),
+        f64::from(calibration.scale_factor),
+        [
+            f64::from(calibration.offset.x),
+            f64::from(calibration.offset.y),
+        ],
+    );
+    PlotterMapping {
+        direct,
+        legacy_f32: Some(LegacyF32Mapping {
+            canvas_height: canvas_size.size.y,
+            scale: calibration.scale_factor,
+            offset: calibration.offset,
+        }),
+    }
+}
+
+fn resolve_routed_canvas_to_plotter(
+    store: &CalibrationStore,
+    identities: &BTreeMap<String, PrinterIdentityInfo>,
+    fallback_names: &BTreeMap<String, String>,
+    printer_id: &str,
+    device_index: usize,
+    canvas_size: &CanvasSize,
+) -> PlotterMapping {
+    let stock = stock_plotter_mapping(device_index, canvas_size);
+    let Some(key) =
+        calibration_key_for_printer(identities, fallback_names, printer_id, canvas_size)
+    else {
+        return stock;
+    };
+    store
+        .active_profile(&key)
+        .map(|profile| PlotterMapping::direct(profile.canvas_to_plotter))
+        .unwrap_or(stock)
+}
+
+fn calibration_key_for_printer(
+    identities: &BTreeMap<String, PrinterIdentityInfo>,
+    fallback_names: &BTreeMap<String, String>,
+    printer_id: &str,
+    canvas_size: &CanvasSize,
+) -> Option<PrinterCalibrationKey> {
+    let identity = identities.get(printer_id)?;
+    let stable_identity = if let Some(serial_number) = identity.serial_number.as_ref() {
+        StablePrinterIdentity::SerialNumber {
+            serial_number: serial_number.clone(),
+        }
+    } else {
+        // A transient transport identifier must never select a persisted profile.
+        let profile_name = fallback_names.get(printer_id)?;
+        StablePrinterIdentity::NamedFallback {
+            profile_name: profile_name.clone(),
+        }
+    };
+    Some(PrinterCalibrationKey {
+        identity: stable_identity,
+        model: identity.model.clone(),
+        firmware_revision: identity.firmware_revision.clone(),
+        media_size: canvas_size.media_size,
+        media_type: canvas_size.media_type,
+    })
+}
+
+fn calibration_printer_label(key: &PrinterCalibrationKey) -> String {
+    let identity = match &key.identity {
+        StablePrinterIdentity::SerialNumber { serial_number } => {
+            format!("serial {serial_number}")
+        }
+        StablePrinterIdentity::NamedFallback { profile_name } => {
+            format!("named {profile_name}")
+        }
+    };
+    format!(
+        "{} · {} · firmware {}",
+        key.model, identity, key.firmware_revision
+    )
+}
+
+fn unique_named_fallback_for_identity(
+    store: &CalibrationStore,
+    identity: &PrinterIdentityInfo,
+) -> Option<String> {
+    let names = store
+        .active_profiles
+        .iter()
+        .filter_map(|active| {
+            let profile = store.profiles.iter().find(|profile| {
+                profile.profile_id == active.profile_id && profile.key == active.key
+            })?;
+            if profile.key.model != identity.model
+                || profile.key.firmware_revision != identity.firmware_revision
+            {
+                return None;
+            }
+            match &profile.key.identity {
+                StablePrinterIdentity::NamedFallback { profile_name } => Some(profile_name.clone()),
+                StablePrinterIdentity::SerialNumber { .. } => None,
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    (names.len() == 1)
+        .then(|| names.into_iter().next())
+        .flatten()
+}
+
+fn calibration_media_label(material: &MaterialProfile) -> String {
+    format!(
+        "PixCut S1 · 4×7 sticker paper · {} · kiss {} · through {} · {} pass{}",
+        material.name,
+        material.blade_pressure,
+        material.perf_pressure,
+        material.passes,
+        if material.passes == 1 { "" } else { "es" }
+    )
+}
+
+fn sanitize_printer_fallback_names(names: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    names
+        .into_iter()
+        .filter_map(|(printer_id, profile_name)| {
+            let printer_id = printer_id.trim();
+            let profile_name = profile_name.trim();
+            if printer_id.is_empty() || profile_name.is_empty() {
+                return None;
+            }
+            Some((
+                printer_id.chars().take(128).collect(),
+                profile_name.chars().take(128).collect(),
+            ))
+        })
+        .take(32)
+        .collect()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6077,6 +8192,14 @@ mod tests {
         }
     }
 
+    fn unscaled_test_mapping(canvas: &CanvasSize) -> PlotterMapping {
+        PlotterMapping::direct(CanvasToPlotter::from_legacy_components(
+            f64::from(canvas.size.y),
+            1.0,
+            [0.0, 0.0],
+        ))
+    }
+
     #[test]
     fn new_artwork_normalization_handles_small_and_oversized_sources() {
         let context = egui::Context::default();
@@ -6310,6 +8433,7 @@ mod tests {
     #[test]
     fn plt_uses_material_pressure_and_valid_terminator() {
         let path = LineString::from(vec![(10.0, 10.0), (20.0, 10.0), (10.0, 10.0)]);
+        let canvas = canvas();
         let material = MaterialProfile {
             name: "test".into(),
             blade_pressure: 53,
@@ -6320,8 +8444,8 @@ mod tests {
         let data = encode_plt(
             &[path],
             &[],
-            CutterCalibration::default(),
-            &canvas(),
+            unscaled_test_mapping(&canvas),
+            &canvas,
             &material,
             false,
             2.0,
@@ -6341,6 +8465,7 @@ mod tests {
     #[test]
     fn perf_output_has_multiple_blade_up_moves() {
         let path = LineString::from(vec![(0.0, 0.0), (30.0, 0.0)]);
+        let canvas = canvas();
         let material = MaterialProfile {
             name: "test".into(),
             blade_pressure: 53,
@@ -6351,8 +8476,8 @@ mod tests {
         let data = encode_plt(
             &[path],
             &[],
-            CutterCalibration::default(),
-            &canvas(),
+            unscaled_test_mapping(&canvas),
+            &canvas,
             &material,
             true,
             5.0,
@@ -6382,11 +8507,12 @@ mod tests {
             passes: 1,
             speed: 5,
         };
+        let canvas = canvas();
         let text = String::from_utf8(encode_plt(
             &paths,
             &[CutMode::Kiss, CutMode::Perforation, CutMode::Disabled],
-            CutterCalibration::default(),
-            &canvas(),
+            unscaled_test_mapping(&canvas),
+            &canvas,
             &material,
             false,
             5.0,
@@ -6405,6 +8531,7 @@ mod tests {
     #[test]
     fn peel_tabs_do_not_reenable_disabled_paths() {
         let path = LineString::from(vec![(10.0, 10.0), (30.0, 10.0), (30.0, 30.0), (10.0, 10.0)]);
+        let canvas = canvas();
         let material = MaterialProfile {
             name: "test".into(),
             blade_pressure: 42,
@@ -6415,8 +8542,8 @@ mod tests {
         let text = String::from_utf8(encode_plt(
             &[path],
             &[CutMode::Disabled],
-            CutterCalibration::default(),
-            &canvas(),
+            unscaled_test_mapping(&canvas),
+            &canvas,
             &material,
             false,
             5.0,
@@ -6431,6 +8558,7 @@ mod tests {
     #[test]
     fn global_perforation_does_not_reenable_a_disabled_path() {
         let path = LineString::from(vec![(10.0, 10.0), (30.0, 10.0)]);
+        let canvas = canvas();
         let material = MaterialProfile {
             name: "test".into(),
             blade_pressure: 42,
@@ -6441,8 +8569,8 @@ mod tests {
         let text = String::from_utf8(encode_plt(
             &[path],
             &[CutMode::Disabled],
-            CutterCalibration::default(),
-            &canvas(),
+            unscaled_test_mapping(&canvas),
+            &canvas,
             &material,
             true,
             5.0,
@@ -6475,7 +8603,7 @@ mod tests {
         let actual = encode_plt(
             &[path],
             &[CutMode::Kiss],
-            CutterCalibration::default(),
+            unscaled_test_mapping(&fixture_canvas),
             &fixture_canvas,
             &material,
             false,
@@ -6491,6 +8619,37 @@ mod tests {
             actual.as_slice(),
             include_bytes!("../tests/fixtures/honeymaro-pixcut/square-exact.plt")
         );
+    }
+
+    #[test]
+    fn stock_mapping_preserves_legacy_f32_quantization_for_subpixel_paths() {
+        let canvas = canvas();
+        let mapping = stock_plotter_mapping(0, &canvas);
+        let calibration = DEVICES[0].cutter_calibration.clone().unwrap();
+        for point in [
+            Coord { x: 0.0, y: 0.0 },
+            Coord {
+                x: 669.729_2,
+                y: 1_011.375_4,
+            },
+            Coord {
+                x: 1_199.999_9,
+                y: 2_099.5,
+            },
+        ] {
+            let expected = [
+                f64::from(
+                    (canvas.size.y - point.y + calibration.offset.y) * calibration.scale_factor,
+                ),
+                f64::from((point.x + calibration.offset.x) * calibration.scale_factor),
+            ];
+            let actual = mapping.apply(point);
+            assert_eq!(actual, expected);
+            assert_eq!(
+                [format!("{:.0}", actual[0]), format!("{:.0}", actual[1])],
+                [format!("{:.0}", expected[0]), format!("{:.0}", expected[1])]
+            );
+        }
     }
 
     #[test]
@@ -6553,6 +8712,624 @@ mod tests {
             }
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn routed_printers_resolve_isolated_active_calibration_profiles() {
+        use crate::calibration::{
+            CALIBRATION_SCHEMA_VERSION, CalibrationCutMode, CalibrationMethod, CalibrationModel,
+            CalibrationProfile, CutPathDirection, CutSettingsProvenance, ErrorMetrics,
+            ValidationMetrics,
+        };
+
+        let mut canvas = canvas();
+        canvas.media_size = 5013;
+        canvas.media_type = 2030;
+        let stock = stock_plotter_mapping(0, &canvas);
+        let before_metrics = ErrorMetrics {
+            sample_count: 5,
+            rms_mm: 0.8,
+            p95_mm: 0.9,
+            maximum_mm: 1.0,
+            mean_xy_mm: [0.0, 0.0],
+        };
+        let after_metrics = ErrorMetrics {
+            sample_count: 5,
+            rms_mm: 0.2,
+            p95_mm: 0.3,
+            maximum_mm: 0.35,
+            mean_xy_mm: [0.0, 0.0],
+        };
+        let settings = CutSettingsProvenance {
+            mode: CalibrationCutMode::Kiss,
+            pressure: 30,
+            passes: 1,
+            configured_speed: Some(5),
+            path_direction: CutPathDirection::Mixed,
+            path_order_id: "manual-v1".into(),
+        };
+        let make_key = |serial_number: &str| PrinterCalibrationKey {
+            identity: StablePrinterIdentity::SerialNumber {
+                serial_number: serial_number.into(),
+            },
+            model: "DHP700".into(),
+            firmware_revision: "1.0".into(),
+            media_size: canvas.media_size,
+            media_type: canvas.media_type,
+        };
+        let mut store = CalibrationStore::default();
+        for (id, serial, x_shift) in [("profile-a", "A", 7.0), ("profile-b", "B", -11.0)] {
+            let mut mapping = stock.direct;
+            mapping.translation[0] += x_shift;
+            store.profiles.push(CalibrationProfile {
+                version: CALIBRATION_SCHEMA_VERSION,
+                profile_id: id.into(),
+                key: make_key(serial),
+                method: CalibrationMethod::ManualEastBay,
+                canvas_to_plotter: mapping,
+                baseline_mapping_id: "pixcut-s1-stock-v1".into(),
+                created_at: 1,
+                validation: ValidationMetrics {
+                    before: before_metrics.clone(),
+                    after: after_metrics.clone(),
+                    required_coverage_passed: true,
+                    maximum_error_passed: true,
+                    normal_kiss_cut_passed: Some(true),
+                },
+                measurement_settings: settings.clone(),
+                validation_settings: settings.clone(),
+                selected_model: CalibrationModel::Translation,
+                previous_profile_id: None,
+            });
+            store.activate(id).unwrap();
+        }
+        let identities = BTreeMap::from([
+            (
+                "route-a".into(),
+                PrinterIdentityInfo {
+                    model: "DHP700".into(),
+                    serial_number: Some("A".into()),
+                    firmware_revision: "1.0".into(),
+                },
+            ),
+            (
+                "route-b".into(),
+                PrinterIdentityInfo {
+                    model: "DHP700".into(),
+                    serial_number: Some("B".into()),
+                    firmware_revision: "1.0".into(),
+                },
+            ),
+        ]);
+
+        let mut fallback_profile = store.profiles[0].clone();
+        fallback_profile.profile_id = "named-profile".into();
+        fallback_profile.key.identity = StablePrinterIdentity::NamedFallback {
+            profile_name: "Bench cutter".into(),
+        };
+        fallback_profile.canvas_to_plotter.translation[1] += 13.0;
+        store.profiles.push(fallback_profile);
+        store.activate("named-profile").unwrap();
+        let mut identities = identities;
+        identities.insert(
+            "route-fallback".into(),
+            PrinterIdentityInfo {
+                model: "DHP700".into(),
+                serial_number: None,
+                firmware_revision: "1.0".into(),
+            },
+        );
+        let fallback_names = BTreeMap::from([("route-fallback".into(), "Bench cutter".into())]);
+        let a = resolve_routed_canvas_to_plotter(
+            &store,
+            &identities,
+            &fallback_names,
+            "route-a",
+            0,
+            &canvas,
+        );
+        let b = resolve_routed_canvas_to_plotter(
+            &store,
+            &identities,
+            &fallback_names,
+            "route-b",
+            0,
+            &canvas,
+        );
+        assert_eq!(a.direct.translation[0], stock.direct.translation[0] + 7.0);
+        assert_eq!(b.direct.translation[0], stock.direct.translation[0] - 11.0);
+        assert_ne!(
+            a.direct.apply([500.0, 800.0]),
+            b.direct.apply([500.0, 800.0])
+        );
+        assert_eq!(
+            resolve_routed_canvas_to_plotter(
+                &store,
+                &identities,
+                &fallback_names,
+                "route-fallback",
+                0,
+                &canvas,
+            )
+            .direct
+            .translation[1],
+            store
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == "named-profile")
+                .unwrap()
+                .canvas_to_plotter
+                .translation[1]
+        );
+        assert_eq!(
+            unique_named_fallback_for_identity(&store, identities.get("route-fallback").unwrap(),)
+                .as_deref(),
+            Some("Bench cutter")
+        );
+
+        let mut stale = identities;
+        stale.get_mut("route-a").unwrap().firmware_revision = "2.0".into();
+        assert_eq!(
+            resolve_routed_canvas_to_plotter(
+                &store,
+                &stale,
+                &fallback_names,
+                "route-a",
+                0,
+                &canvas,
+            ),
+            stock
+        );
+    }
+
+    #[test]
+    fn named_printer_fallbacks_are_bounded_and_persistence_safe() {
+        let mut names = BTreeMap::from([
+            (" printer-a ".into(), " Bench cutter ".into()),
+            ("empty".into(), "   ".into()),
+        ]);
+        for index in 0..40 {
+            names.insert(format!("printer-{index:02}"), "x".repeat(200));
+        }
+        let sanitized = sanitize_printer_fallback_names(names);
+        assert_eq!(sanitized.len(), 32);
+        assert_eq!(
+            sanitized.get("printer-a").map(String::as_str),
+            Some("Bench cutter")
+        );
+        assert!(sanitized.values().all(|value| value.chars().count() <= 128));
+        assert!(!sanitized.contains_key("empty"));
+    }
+
+    #[test]
+    fn flatbed_calibration_job_preserves_explicit_bridges_and_phase_order() {
+        let material = MaterialProfile {
+            name: "test".into(),
+            blade_pressure: 40,
+            perf_pressure: 88,
+            passes: 1,
+            speed: 5,
+        };
+        let job = build_calibration_print_job(
+            ManifestIdentity::stock("job-test"),
+            CalibrationMethod::FlatbedScanner,
+            CalibrationJobSlot::Primary,
+            material,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (job.device_index, job.mode_index, job.canvas_index),
+            (0, 1, 0)
+        );
+        assert!(!job.encoded_image.is_empty());
+        let phases = job.calibration_phases.as_ref().unwrap();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].mode, CutMode::Perforation);
+        assert_eq!(phases[0].pressure, 88);
+        // Twelve measured apertures plus the backing-control aperture are
+        // represented as four explicit arcs each; no perf dashes are added.
+        assert_eq!(phases[0].paths.len(), 52);
+        let plt = encode_calibration_plt(
+            phases,
+            stock_plotter_mapping(0, &DEVICES[0].modes[1].canvas_sizes[0]),
+            1,
+        );
+        assert_eq!(plt.windows(2).filter(|window| *window == b" U").count(), 53);
+        assert!(plt.windows(5).any(|window| window == b" KP88"));
+        let spec = calibration_job_spec("Calibration sheet", "printer-b".into());
+        assert_eq!(spec.eligible_printers.len(), 1);
+        assert!(spec.eligible_printers.contains("printer-b"));
+        assert_eq!(
+            spec.required_capabilities,
+            BTreeSet::from(["cut".into(), "print".into()])
+        );
+    }
+
+    #[test]
+    fn validation_job_uses_candidate_override_without_activating_store() {
+        let override_mapping = CanvasToPlotter::legacy_pixcut_s1(2100.0).compose(CanvasToPlotter {
+            matrix: [[1.0, 0.0], [0.0, 1.0]],
+            translation: [2.0, -3.0],
+        });
+        let job = build_calibration_print_job(
+            ManifestIdentity::stock("validation-test"),
+            CalibrationMethod::ManualEastBay,
+            CalibrationJobSlot::Validation,
+            MaterialProfile::built_ins().remove(0),
+            Some(override_mapping),
+        )
+        .unwrap();
+        assert_eq!(job.mapping_override, Some(override_mapping));
+        assert!(
+            job.calibration_phases
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|phase| phase.mode == CutMode::Kiss)
+        );
+    }
+
+    #[test]
+    fn dispatched_command_evidence_uses_final_mapping_and_integer_quantization() {
+        let material = MaterialProfile::built_ins().remove(0);
+        let job = build_calibration_print_job(
+            ManifestIdentity::stock("command-evidence"),
+            CalibrationMethod::ManualEastBay,
+            CalibrationJobSlot::Validation,
+            material.clone(),
+            None,
+        )
+        .unwrap();
+        let phases = job.calibration_phases.as_ref().unwrap();
+        let baseline = PlotterMapping::direct(CanvasToPlotter {
+            matrix: [[2.37, 0.04], [-0.03, 2.41]],
+            translation: [19.4, -7.6],
+        });
+        let candidate = PlotterMapping::direct(CanvasToPlotter {
+            matrix: [[2.39, 0.02], [-0.01, 2.38]],
+            translation: [31.2, 6.4],
+        });
+        let baseline_plt = encode_calibration_plt(phases, baseline, material.passes);
+        let candidate_plt = encode_calibration_plt(phases, candidate, material.passes);
+        let baseline_commands = calibration_plotter_commands_from_plt(&baseline_plt);
+        let candidate_commands = calibration_plotter_commands_from_plt(&candidate_plt);
+        assert!(!baseline_commands.is_empty());
+        assert_eq!(baseline_commands.len(), candidate_commands.len());
+        assert_ne!(baseline_commands, candidate_commands);
+        assert!(
+            baseline_commands
+                .iter()
+                .all(|command| { command.plotter_units != [6476, 0] })
+        );
+
+        let first_canvas_point = phases[0].paths[0].0[0];
+        let first_mapped = baseline.apply(first_canvas_point);
+        let expected = [
+            format!("{:.0}", first_mapped[0]).parse::<i64>().unwrap(),
+            format!("{:.0}", first_mapped[1]).parse::<i64>().unwrap(),
+        ];
+        assert_eq!(
+            baseline_commands[0].kind,
+            CalibrationPlotterCommandKind::Move
+        );
+        assert_eq!(baseline_commands[0].plotter_units, expected);
+        assert_eq!(
+            baseline_commands[1].kind,
+            CalibrationPlotterCommandKind::Draw
+        );
+        assert_eq!(baseline_commands[1].plotter_units, expected);
+    }
+
+    #[test]
+    fn validation_coverage_requires_opposite_sheet_regions() {
+        let make = |id: &str, x: f64, y: f64| CalibrationObservation {
+            target_id: id.into(),
+            sheet_id: "validation".into(),
+            nominal_print_mm: [x, y],
+            observed_cut_mm: [x, y],
+            uncertainty_mm: [0.1, 0.1],
+            confidence: 1.0,
+            included: true,
+        };
+        let covered = vec![
+            make("1", 10.0, 10.0),
+            make("2", 90.0, 10.0),
+            make("3", 10.0, 160.0),
+            make("4", 90.0, 160.0),
+        ];
+        assert!(validation_coverage_passed(
+            CalibrationMethod::ManualEastBay,
+            &covered
+        ));
+        let clustered = (0..6)
+            .map(|index| make(&index.to_string(), 10.0 + f64::from(index), 10.0))
+            .collect::<Vec<_>>();
+        assert!(!validation_coverage_passed(
+            CalibrationMethod::FlatbedScanner,
+            &clustered
+        ));
+    }
+
+    #[test]
+    fn completed_calibration_run_persists_evidence_and_rejects_stale_async_results() {
+        use crate::calibration::{ErrorMetrics, ManualEdgeDraft, ManualSheetSlot};
+
+        let mut wizard = CalibrationWizard::new("persisted-run", 10).unwrap();
+        wizard
+            .select_method(CalibrationMethod::ManualEastBay, 11)
+            .unwrap();
+        wizard
+            .set_print_scale(ManualSheetSlot::Primary, None, 12)
+            .unwrap();
+        for id in ["C1", "C2", "C6", "C7"] {
+            wizard
+                .set_manual_target(
+                    ManualSheetSlot::Primary,
+                    id,
+                    ManualEdgeDraft {
+                        left_mm: Some(6.5),
+                        right_mm: Some(7.5),
+                        top_mm: Some(6.75),
+                        bottom_mm: Some(7.25),
+                    },
+                    false,
+                    13,
+                )
+                .unwrap();
+        }
+        let solution = solve_calibration(
+            CalibrationMethod::ManualEastBay,
+            &wizard.training_observations(),
+            CalibrationPolicy::pixcut_s1_4x7(),
+        )
+        .unwrap();
+        let metrics = ValidationMetrics {
+            before: ErrorMetrics {
+                sample_count: 4,
+                rms_mm: 1.0,
+                p95_mm: 1.0,
+                maximum_mm: 1.0,
+                mean_xy_mm: [0.5, 0.25],
+            },
+            after: ErrorMetrics {
+                sample_count: 4,
+                rms_mm: 0.2,
+                p95_mm: 0.25,
+                maximum_mm: 0.3,
+                mean_xy_mm: [0.05, 0.02],
+            },
+            required_coverage_passed: true,
+            maximum_error_passed: true,
+            normal_kiss_cut_passed: None,
+        };
+        let baseline_mapping = CanvasToPlotter::legacy_pixcut_s1(2100.0).compose(CanvasToPlotter {
+            matrix: [[1.0, 0.0], [0.0, 1.0]],
+            translation: [23.0, -17.0],
+        });
+        let candidate_mapping = baseline_mapping.compose(CanvasToPlotter {
+            matrix: [[1.0, 0.0], [0.0, 1.0]],
+            translation: [9.0, 11.0],
+        });
+        let session = CalibrationSession {
+            printer_id: "printer-a".into(),
+            printer_key: PrinterCalibrationKey {
+                identity: StablePrinterIdentity::SerialNumber {
+                    serial_number: "SERIAL-A".into(),
+                },
+                model: "DHP700".into(),
+                firmware_revision: "1.0".into(),
+                media_size: 5013,
+                media_type: 2030,
+            },
+            wizard,
+            baseline_profile_id: Some("active-baseline-profile".into()),
+            baseline_profile_version: 7,
+            baseline_mapping,
+            material: MaterialProfile::built_ins().remove(0),
+            candidate: Some(solution.clone()),
+            candidate_mapping: Some(candidate_mapping),
+            validation_metrics: Some(metrics.clone()),
+            training_scan_report: None,
+            validation_scan_report: None,
+            training_scan_preview_png: None,
+            validation_scan_preview_png: None,
+            training_scan_preview_sha1: None,
+            validation_scan_preview_sha1: None,
+            primary_queue_job: Some(7),
+            second_queue_job: None,
+            validation_queue_job: Some(8),
+            historical_queue_job_ids: [Some(7), None, Some(8)],
+            image_sha1: [Some("a".repeat(40)), None, Some("b".repeat(40))],
+            plotter_sha1: [Some("c".repeat(40)), None, Some("d".repeat(40))],
+            plotter_commands: [
+                vec![CalibrationPlotterCommand {
+                    kind: CalibrationPlotterCommandKind::Move,
+                    plotter_units: [101, 202],
+                }],
+                vec![],
+                vec![CalibrationPlotterCommand {
+                    kind: CalibrationPlotterCommandKind::Move,
+                    plotter_units: [303, 404],
+                }],
+            ],
+            validation_generation: 0,
+            device_job_ids: vec![70, 80],
+            validation_device_job_ids: vec![80],
+            device_job_ids_by_slot: [vec![70], vec![], vec![80]],
+            physical_sheet_attempts: [0; 3],
+            scan_request_generations: [0; 2],
+        };
+        let active_manifest = calibration_manifest(
+            session.manifest_identity_for_slot(CalibrationJobSlot::Primary),
+            CalibrationMethod::ManualEastBay,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            active_manifest.identity.baseline_mapping_id,
+            "active-baseline-profile"
+        );
+        assert_eq!(active_manifest.identity.profile_version, 7);
+        let stock_manifest = manual_calibration(ManifestIdentity::stock("persisted-run")).unwrap();
+        let binding_digest = |manifest: &TargetManifest| {
+            manifest.diagnostics.iter().find_map(|diagnostic| {
+                if let crate::calibration::TargetDiagnostic::RunBinding { digest_hex, .. } =
+                    diagnostic
+                {
+                    Some(digest_hex.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        assert_ne!(
+            binding_digest(&active_manifest),
+            binding_digest(&stock_manifest)
+        );
+        let mut replacement_sheet = session.clone();
+        replacement_sheet.physical_sheet_attempts
+            [CalibrationSession::slot_index(CalibrationJobSlot::Primary)] = 1;
+        let replacement_manifest = calibration_manifest(
+            replacement_sheet.manifest_identity_for_slot(CalibrationJobSlot::Primary),
+            CalibrationMethod::ManualEastBay,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            binding_digest(&active_manifest),
+            binding_digest(&replacement_manifest),
+            "a reprinted physical sheet must reject scans from the prior attempt"
+        );
+        let current_generation = session.wizard.validation_generation;
+        assert!(session.accepts_job_result(
+            "persisted-run",
+            current_generation,
+            CalibrationJobSlot::Primary,
+            0,
+        ));
+        assert!(!replacement_sheet.accepts_job_result(
+            "persisted-run",
+            current_generation,
+            CalibrationJobSlot::Primary,
+            0,
+        ));
+        assert!(session.accepts_scan_result(
+            "persisted-run",
+            current_generation,
+            ScanSlot::Training,
+            0,
+            0,
+        ));
+        let mut newer_scan_request = session.clone();
+        newer_scan_request.scan_request_generations[0] = 1;
+        assert!(!newer_scan_request.accepts_scan_result(
+            "persisted-run",
+            current_generation,
+            ScanSlot::Training,
+            0,
+            0,
+        ));
+        let mut run = persisted_calibration_run(&session, &solution, metrics).unwrap();
+        run.validate_and_sanitize().unwrap();
+        assert_eq!(run.queue_job_ids, [7, 8]);
+        assert_eq!(run.device_job_ids, [70, 80]);
+        assert_eq!(run.baseline_profile_version, 7);
+        assert_eq!(
+            run.validation_generation,
+            session.wizard.validation_generation
+        );
+        assert_eq!(run.payload_hashes.len(), 2);
+        assert_eq!(run.payload_hashes[1].slot, "validation");
+        assert!(!run.payload_hashes[0].plotter_commands.is_empty());
+        assert!(!run.payload_hashes[1].plotter_commands.is_empty());
+        assert_ne!(
+            run.payload_hashes[0].plotter_commands[0].plotter_units,
+            run.payload_hashes[1].plotter_commands[0].plotter_units
+        );
+        assert_eq!(
+            run.payload_hashes[0].plotter_commands[0].plotter_units,
+            [101, 202]
+        );
+        assert_eq!(
+            run.payload_hashes[1].plotter_commands[0].plotter_units,
+            [303, 404]
+        );
+        assert_eq!(run.manifest.target_ids.len(), 7);
+        assert_eq!(
+            run.manifest.jpeg_sha1.as_deref(),
+            Some("a".repeat(40).as_str())
+        );
+        assert_eq!(
+            run.manifest.plt_sha1.as_deref(),
+            Some("c".repeat(40).as_str())
+        );
+
+        let mut saved_session = session.clone();
+        saved_session.material.blade_pressure = 30;
+        saved_session.material.perf_pressure = 80;
+        saved_session.material.passes = 1;
+        let resumed = saved_session.sanitize_after_load().unwrap();
+        assert!(resumed.primary_queue_job.is_none());
+        assert!(resumed.validation_queue_job.is_none());
+        assert_eq!(resumed.historical_queue_job_ids, [Some(7), None, Some(8)]);
+
+        let mut missing_validation_evidence = session.clone();
+        missing_validation_evidence.image_sha1[2] = None;
+        assert!(
+            persisted_calibration_run(
+                &missing_validation_evidence,
+                &solution,
+                ValidationMetrics {
+                    before: run.validation.as_ref().unwrap().before.clone(),
+                    after: run.validation.as_ref().unwrap().after.clone(),
+                    required_coverage_passed: true,
+                    maximum_error_passed: true,
+                    normal_kiss_cut_passed: None,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("validation payload hashes")
+        );
+
+        let mut stale = session.clone();
+        stale.validation_generation = stale.wizard.validation_generation;
+        let delayed_generation = stale.wizard.validation_generation;
+        let old_validation_identity = stale.validation_manifest_identity();
+        stale
+            .wizard
+            .set_manual_target(
+                crate::calibration::ManualSheetSlot::Primary,
+                "C1",
+                crate::calibration::ManualEdgeDraft {
+                    left_mm: Some(6.4),
+                    right_mm: Some(7.6),
+                    top_mm: Some(6.7),
+                    bottom_mm: Some(7.3),
+                },
+                false,
+                100,
+            )
+            .unwrap();
+        assert!(!stale.accepts_async_result("persisted-run", delayed_generation));
+        assert!(stale.accepts_async_result("persisted-run", stale.wizard.validation_generation));
+        assert_eq!(stale.clear_stale_candidate_evidence(), Some(8));
+        assert!(stale.candidate.is_none());
+        assert!(stale.candidate_mapping.is_none());
+        assert!(stale.validation_metrics.is_none());
+        assert!(stale.validation_queue_job.is_none());
+        assert!(stale.image_sha1[2].is_none());
+        assert!(stale.plotter_sha1[2].is_none());
+        assert!(stale.plotter_commands[2].is_empty());
+        assert_eq!(stale.device_job_ids, [70]);
+        assert!(stale.validation_device_job_ids.is_empty());
+        assert_eq!(stale.device_job_ids_by_slot[0], [70]);
+        assert!(stale.device_job_ids_by_slot[2].is_empty());
+        assert_ne!(
+            old_validation_identity.candidate_generation,
+            stale.validation_manifest_identity().candidate_generation
+        );
     }
 
     #[test]

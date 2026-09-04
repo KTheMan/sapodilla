@@ -1,5 +1,6 @@
 mod app;
 pub mod background_ml;
+pub mod calibration;
 mod cut;
 pub mod export;
 mod icons;

@@ -472,6 +472,52 @@ pub struct AvocadoResult<T> {
     pub result: T,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrinterIdentityInfo {
+    pub model: String,
+    pub serial_number: Option<String>,
+    pub firmware_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PrinterIdentityResultShape {
+    Ordered((String, Option<String>, String)),
+    Named {
+        model: String,
+        #[serde(default, rename = "serial-number", alias = "serial_number")]
+        serial_number: Option<String>,
+        #[serde(rename = "firmware-revision", alias = "firmware_revision")]
+        firmware_revision: String,
+    },
+}
+
+/// Decode the response to a `get-prop` request whose parameters were ordered
+/// as model, serial-number, and firmware-revision.
+pub fn decode_printer_identity(packet: &AvocadoPacket) -> Option<PrinterIdentityInfo> {
+    let result = packet.as_json::<AvocadoResult<PrinterIdentityResultShape>>()?;
+    let (model, serial_number, firmware_revision) = match result.result {
+        PrinterIdentityResultShape::Ordered((model, serial_number, firmware_revision)) => {
+            (model, serial_number, firmware_revision)
+        }
+        PrinterIdentityResultShape::Named {
+            model,
+            serial_number,
+            firmware_revision,
+        } => (model, serial_number, firmware_revision),
+    };
+    let model = model.trim().to_owned();
+    let firmware_revision = firmware_revision.trim().to_owned();
+    let serial_number = serial_number
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    (!model.is_empty() && !firmware_revision.is_empty()).then_some(PrinterIdentityInfo {
+        model,
+        serial_number,
+        firmware_revision,
+    })
+}
+
 /// Firmware revisions have returned `get-job-info.result` as either a status
 /// object or a one-element array. Keep that wire variation out of queue logic.
 #[derive(Debug, Deserialize)]
@@ -724,6 +770,70 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "result": [] }))
                 .expect("empty arrays are a valid, temporarily missing result");
         assert!(response.result.into_for_job(9).is_none());
+    }
+
+    #[test]
+    fn printer_identity_accepts_ordered_and_named_firmware_shapes() {
+        let packet = |result: serde_json::Value| AvocadoPacket {
+            version: 100,
+            content_type: ContentType::Message,
+            interaction_type: InteractionType::Response,
+            encoding_type: EncodingType::Json,
+            encryption_mode: EncryptionMode::None,
+            terminal_id: 7,
+            msg_number: 7,
+            msg_package_total: 1,
+            msg_package_num: 1,
+            is_subpackage: false,
+            data: serde_json::to_vec(&serde_json::json!({ "id": 7, "result": result })).unwrap(),
+        };
+
+        assert_eq!(
+            decode_printer_identity(&packet(serde_json::json!(["DHP700", "SN-1", "1.2.3"]))),
+            Some(PrinterIdentityInfo {
+                model: "DHP700".into(),
+                serial_number: Some("SN-1".into()),
+                firmware_revision: "1.2.3".into(),
+            })
+        );
+        assert_eq!(
+            decode_printer_identity(&packet(serde_json::json!({
+                "model": "DHP700",
+                "serial-number": "SN-2",
+                "firmware-revision": "2.0"
+            }))),
+            Some(PrinterIdentityInfo {
+                model: "DHP700".into(),
+                serial_number: Some("SN-2".into()),
+                firmware_revision: "2.0".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn printer_identity_requires_model_and_firmware_but_allows_missing_serial() {
+        let make = |result: serde_json::Value| AvocadoPacket {
+            version: 100,
+            content_type: ContentType::Message,
+            interaction_type: InteractionType::Response,
+            encoding_type: EncodingType::Json,
+            encryption_mode: EncryptionMode::None,
+            terminal_id: 8,
+            msg_number: 8,
+            msg_package_total: 1,
+            msg_package_num: 1,
+            is_subpackage: false,
+            data: serde_json::to_vec(&serde_json::json!({ "id": 8, "result": result })).unwrap(),
+        };
+        assert_eq!(
+            decode_printer_identity(&make(serde_json::json!(["DHP700", null, "2.0"]))),
+            Some(PrinterIdentityInfo {
+                model: "DHP700".into(),
+                serial_number: None,
+                firmware_revision: "2.0".into(),
+            })
+        );
+        assert!(decode_printer_identity(&make(serde_json::json!(["", "SN", "2.0"]))).is_none());
     }
 
     #[test]
