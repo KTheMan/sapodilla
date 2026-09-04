@@ -251,6 +251,7 @@ pub struct SapodillaApp {
     pub show_safe_area: bool,
     pub show_grid: bool,
     pub show_rulers: bool,
+    pub(crate) ruler_unit: CanvasUnit,
     pub grid_spacing_mm: f32,
     pub snap_to_guides: bool,
     pub edit_cutlines: bool,
@@ -305,10 +306,100 @@ fn sanitize_appearance(preferences: AppearancePreferences) -> AppearancePreferen
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CanvasUnit {
+    Px,
+    Pt,
+    #[default]
+    Mm,
+    Cm,
+    In,
+}
+
+impl CanvasUnit {
+    pub(crate) const ALL: [Self; 5] = [Self::Px, Self::Pt, Self::Mm, Self::Cm, Self::In];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Px => "px",
+            Self::Pt => "pt",
+            Self::Mm => "mm",
+            Self::Cm => "cm",
+            Self::In => "in",
+        }
+    }
+
+    pub(crate) fn from_mm(self, millimetres: f32, dpi: f32) -> f32 {
+        millimetres * self.units_per_mm(dpi)
+    }
+
+    pub(crate) fn to_mm(self, value: f32, dpi: f32) -> f32 {
+        value / self.units_per_mm(dpi)
+    }
+
+    pub(crate) fn pixels_per_unit(self, dpi: f32) -> f32 {
+        (dpi / 25.4) / self.units_per_mm(dpi)
+    }
+
+    fn units_per_mm(self, dpi: f32) -> f32 {
+        match self {
+            Self::Px => dpi / 25.4,
+            Self::Pt => 72.0 / 25.4,
+            Self::Mm => 1.0,
+            Self::Cm => 0.1,
+            Self::In => 1.0 / 25.4,
+        }
+    }
+}
+
+fn canvas_measurement_controls(
+    ui: &mut egui::Ui,
+    unit: &mut CanvasUnit,
+    grid_spacing_mm: &mut f32,
+    dpi: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Units");
+        egui::ComboBox::from_id_salt("canvas-ruler-unit")
+            .selected_text(unit.label())
+            .show_ui(ui, |ui| {
+                for option in CanvasUnit::ALL {
+                    ui.selectable_value(unit, option, option.label());
+                }
+            });
+    });
+
+    let mut displayed_spacing = unit.from_mm(*grid_spacing_mm, dpi);
+    let minimum = unit.from_mm(0.5, dpi);
+    let maximum = unit.from_mm(100.0, dpi);
+    if ui
+        .add(
+            egui::Slider::new(&mut displayed_spacing, minimum..=maximum)
+                .logarithmic(true)
+                .suffix(format!(" {}", unit.label()))
+                .text("Grid spacing"),
+        )
+        .changed()
+    {
+        *grid_spacing_mm = sanitize_grid_spacing_mm(unit.to_mm(displayed_spacing, dpi));
+    }
+}
+
+fn sanitize_grid_spacing_mm(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.5, 100.0)
+    } else {
+        CanvasViewPreferences::default().grid_spacing_mm
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct CanvasViewPreferences {
     show_grid: bool,
     show_rulers: bool,
+    #[serde(default)]
+    ruler_unit: CanvasUnit,
     grid_spacing_mm: f32,
 }
 
@@ -317,6 +408,7 @@ impl Default for CanvasViewPreferences {
         Self {
             show_grid: true,
             show_rulers: true,
+            ruler_unit: CanvasUnit::Mm,
             grid_spacing_mm: 10.0,
         }
     }
@@ -591,7 +683,7 @@ impl SapodillaApp {
                 eframe::get_value::<CanvasViewPreferences>(storage, CANVAS_VIEW_STORAGE_KEY)
             })
             .map(|mut view| {
-                view.grid_spacing_mm = view.grid_spacing_mm.clamp(0.5, 100.0);
+                view.grid_spacing_mm = sanitize_grid_spacing_mm(view.grid_spacing_mm);
                 view
             })
             .unwrap_or_default();
@@ -701,6 +793,7 @@ impl SapodillaApp {
             show_safe_area: true,
             show_grid: canvas_view.show_grid,
             show_rulers: canvas_view.show_rulers,
+            ruler_unit: canvas_view.ruler_unit,
             grid_spacing_mm: canvas_view.grid_spacing_mm,
             snap_to_guides: true,
             edit_cutlines: false,
@@ -4967,11 +5060,11 @@ impl eframe::App for SapodillaApp {
                             ui.checkbox(&mut self.show_grid, "Grid");
                             ui.checkbox(&mut self.show_rulers, "Rulers");
                         });
-                        ui.add(
-                            egui::Slider::new(&mut self.grid_spacing_mm, 0.5..=100.0)
-                                .logarithmic(true)
-                                .suffix(" mm")
-                                .text("Grid spacing"),
+                        canvas_measurement_controls(
+                            ui,
+                            &mut self.ruler_unit,
+                            &mut self.grid_spacing_mm,
+                            DEVICES[self.selected_device].dpi,
                         );
                         ui.add(
                             egui::Slider::new(&mut self.pack_gap_mm, 0.0..=10.0)
@@ -5203,7 +5296,8 @@ impl eframe::App for SapodillaApp {
             &CanvasViewPreferences {
                 show_grid: self.show_grid,
                 show_rulers: self.show_rulers,
-                grid_spacing_mm: self.grid_spacing_mm.clamp(0.5, 100.0),
+                ruler_unit: self.ruler_unit,
+                grid_spacing_mm: sanitize_grid_spacing_mm(self.grid_spacing_mm),
             },
         );
         eframe::set_value(storage, APPEARANCE_STORAGE_KEY, &self.appearance);
@@ -5638,6 +5732,33 @@ mod tests {
             }),
             AppearancePreferences::default()
         );
+    }
+
+    #[test]
+    fn canvas_units_convert_using_the_selected_device_dpi() {
+        let dpi = 254.0;
+        assert!((CanvasUnit::Px.from_mm(25.4, dpi) - 254.0).abs() < 0.001);
+        assert!((CanvasUnit::Pt.from_mm(25.4, dpi) - 72.0).abs() < 0.001);
+        assert!((CanvasUnit::Mm.from_mm(25.4, dpi) - 25.4).abs() < 0.001);
+        assert!((CanvasUnit::Cm.from_mm(25.4, dpi) - 2.54).abs() < 0.001);
+        assert!((CanvasUnit::In.from_mm(25.4, dpi) - 1.0).abs() < 0.001);
+
+        for unit in CanvasUnit::ALL {
+            let displayed = unit.from_mm(12.7, dpi);
+            assert!((unit.to_mm(displayed, dpi) - 12.7).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn legacy_canvas_preferences_default_to_millimetres() {
+        let preferences: CanvasViewPreferences =
+            serde_json::from_str(r#"{"show_grid":true,"show_rulers":true,"grid_spacing_mm":10.0}"#)
+                .unwrap();
+        assert_eq!(preferences.ruler_unit, CanvasUnit::Mm);
+        assert_eq!(sanitize_grid_spacing_mm(f32::NAN), 10.0);
+        assert_eq!(sanitize_grid_spacing_mm(f32::INFINITY), 10.0);
+        assert_eq!(sanitize_grid_spacing_mm(0.1), 0.5);
+        assert_eq!(sanitize_grid_spacing_mm(200.0), 100.0);
     }
 
     fn cut_geometry(offset_x: f32) -> CutGeometrySnapshot {
