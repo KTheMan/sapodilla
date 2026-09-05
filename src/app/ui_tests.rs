@@ -216,6 +216,85 @@ fn compact_workspace_keeps_panels_and_cut_discovery_reachable() {
 }
 
 #[test]
+fn peel_tab_handle_can_be_dragged_around_the_cutline() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    let path = LineString::from(vec![
+        (400.0, 250.0),
+        (800.0, 250.0),
+        (800.0, 500.0),
+        (400.0, 500.0),
+        (400.0, 250.0),
+    ]);
+    state.cut_shapes = vec![path.clone()];
+    state.manual_cut_shapes = vec![path];
+    state.cut_modes = vec![CutMode::Kiss];
+    state.cutline_owners = vec![None];
+    state.cutline_locked = vec![false];
+    state.peel_tab_positions = vec![None];
+    state.peel_tabs = true;
+    harness.run();
+    harness.run();
+
+    let handle = harness.get_by_label("Peel tab for path 1");
+    // AccessKit reports the handle in the Scene's local coordinates, while
+    // pointer events use global coordinates.
+    let scene_to_global = harness
+        .ctx
+        .memory(|memory| {
+            memory
+                .layer_ids()
+                .filter_map(|layer| harness.ctx.layer_transform_to_global(layer))
+                .find(|transform| transform.scaling != 1.0)
+        })
+        .expect("canvas Scene should publish its global transform");
+    let local_start = handle.rect().center();
+    let start = scene_to_global * local_start;
+    let target = scene_to_global * (local_start + Vec2::new(100.0, 0.0));
+
+    harness.hover_at(start);
+    harness.run();
+    harness.drag_at(start);
+    harness.run();
+    harness.hover_at(target);
+    harness.run();
+    harness.drop_at(target);
+    harness.run();
+
+    assert!(
+        harness.state().peel_tab_positions[0].is_some(),
+        "dragging the named handle should store a perimeter placement"
+    );
+    let placed = harness.state().peel_tab_positions[0];
+
+    harness.state_mut().cutline_locked[0] = true;
+    harness.run();
+    let locked_handle = harness.get_by_label("Peel tab for path 1");
+    let local_start = locked_handle.rect().center();
+    let start = scene_to_global * local_start;
+    let target = scene_to_global * (local_start - Vec2::new(100.0, 0.0));
+    harness.hover_at(start);
+    harness.run();
+    harness.drag_at(start);
+    harness.run();
+    harness.hover_at(target);
+    harness.run();
+    harness.drop_at(target);
+    harness.run();
+
+    assert_eq!(
+        harness.state().peel_tab_positions[0],
+        placed,
+        "a locked template cutline must not allow its tab to move"
+    );
+}
+
+#[test]
 fn topbar_icon_toggles_have_clear_names_states_and_targets() {
     let mut harness = app_harness(Vec2::new(1440.0, 800.0));
 

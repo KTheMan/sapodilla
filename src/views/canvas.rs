@@ -5,7 +5,7 @@ use std::{
 
 use egui::{
     Align2, Color32, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut, Modifiers, Painter,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, Ui, Vec2, WidgetInfo, WidgetType,
+    Pos2, Rect, Response, Scene, Sense, Shape, Stroke, Ui, Vec2, WidgetInfo, WidgetType,
     emath::{self, RectTransform},
 };
 use geo::LineString;
@@ -13,9 +13,10 @@ use tracing::instrument;
 
 use crate::{
     SapodillaApp,
-    app::{CanvasUnit, peel_tab_unmirrored},
+    app::CanvasUnit,
     cut::apply_overcut,
     export::toolpath_stats_iter,
+    peel_tab::{PeelTab, nearest_perimeter_position, peel_tabs as build_peel_tabs},
     protocol::DEVICES,
     toolpath::{CutMode, CutPhase, effective_cut_modes, plan_cut_phases},
 };
@@ -149,6 +150,11 @@ pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
     state.perf_dash_mm.to_bits().hash(&mut hasher);
     state.perf_gap_mm.to_bits().hash(&mut hasher);
     state.peel_tabs.hash(&mut hasher);
+    if state.peel_tabs {
+        for position in &state.peel_tab_positions {
+            position.map(f32::to_bits).hash(&mut hasher);
+        }
+    }
     state.overcut.enabled.hash(&mut hasher);
     state.overcut.steps.hash(&mut hasher);
     state
@@ -164,6 +170,16 @@ pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
     }
 
     let dpi = DEVICES[state.selected_device].dpi;
+    let modes = effective_cut_modes(state.cut_shapes.len(), &state.cut_modes, state.perf_cut);
+    let enabled = modes
+        .iter()
+        .map(|mode| *mode != CutMode::Disabled)
+        .collect::<Vec<_>>();
+    let tabs = if state.peel_tabs {
+        build_peel_tabs(&state.cut_shapes, &enabled, &state.peel_tab_positions)
+    } else {
+        Vec::new()
+    };
     let phases = preview_cut_phases(
         &state.cut_shapes,
         &state.cut_modes,
@@ -171,11 +187,12 @@ pub(crate) fn synchronize_cut_preview(state: &mut SapodillaApp) {
         state.perf_dash_mm * dpi / 25.4,
         state.perf_gap_mm * dpi / 25.4,
         state.overcut,
-        state.peel_tabs,
+        &tabs,
     );
     state.cut_preview_stats =
         toolpath_stats_iter(phases.iter().flat_map(|phase| phase.paths.iter()));
     state.cut_preview_cache = phases;
+    state.cut_preview_tabs = tabs;
     state.cut_preview_cache_key = Some(key);
 }
 
@@ -462,6 +479,62 @@ fn frame(
             paint_polygons(&to_screen, &painter, &phase.paths, stroke);
         }
     }
+    if state.peel_tabs && state.show_cutlines {
+        for (path_index, tab) in &state.cut_preview_tabs {
+            let path_index = *path_index;
+            let path = &state.cut_shapes[path_index];
+            let locked = state
+                .cutline_locked
+                .get(path_index)
+                .copied()
+                .unwrap_or(false);
+            let handle_position = to_screen.transform_pos(Pos2::new(tab.handle.x, tab.handle.y));
+            let (handle, dragged_position) = interact_peel_tab_handle(
+                ui,
+                response.id.with(("peel-tab", path_index)),
+                handle_position,
+                24.0 / scene_scale.max(0.1),
+                path,
+                &to_screen,
+                !locked,
+            );
+            let handle = if locked {
+                handle.on_hover_text("This cutline is locked")
+            } else {
+                handle
+                    .on_hover_cursor(CursorIcon::Grab)
+                    .on_hover_text("Drag around the cutline to place the peel tab")
+            };
+            handle.widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::DragValue,
+                    !locked,
+                    format!("Peel tab for path {}", path_index + 1),
+                )
+            });
+            if !locked && (handle.clicked() || handle.drag_started()) {
+                state.selected_cut_path = Some(path_index);
+                state.selected_cut_node = None;
+            }
+            if !locked
+                && let Some(position) = dragged_position
+                && let Some(stored) = state.peel_tab_positions.get_mut(path_index)
+            {
+                *stored = Some(position);
+                state.cut_preview_cache_key = None;
+            }
+            painter.circle_filled(
+                handle_position,
+                6.0 / scene_scale.max(0.1),
+                Color32::from_rgb(255, 196, 64),
+            );
+            painter.circle_stroke(
+                handle_position,
+                6.0 / scene_scale.max(0.1),
+                Stroke::new(1.5 / scene_scale.max(0.1), Color32::BLACK),
+            );
+        }
+    }
     if state.edit_cutlines
         && let Some(path_index) = state.selected_cut_path
         && !state
@@ -547,6 +620,34 @@ fn frame(
         menu_action = Some(context.action(super::ArtworkMenuCommand::Remove));
     }
     (menu_action, ruler_bounds, response.rect)
+}
+
+fn interact_peel_tab_handle(
+    ui: &mut Ui,
+    id: Id,
+    handle_position: Pos2,
+    hit_size: f32,
+    path: &LineString<f32>,
+    to_screen: &RectTransform,
+    enabled: bool,
+) -> (Response, Option<f32>) {
+    let response = ui.interact(
+        Rect::from_center_size(handle_position, Vec2::splat(hit_size)),
+        id,
+        if enabled {
+            Sense::drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let position = response
+        .dragged()
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .and_then(|pointer| {
+            nearest_perimeter_position(path, to_screen.inverse().transform_pos(pointer))
+        });
+    (response, position)
 }
 
 fn transform_gesture_image_id(gesture: &TransformGesture) -> &str {
@@ -1449,6 +1550,7 @@ fn paint_polygons(
     cut_shapes: &[LineString<f32>],
     stroke: Stroke,
 ) {
+    let mut shapes = Vec::with_capacity(cut_shapes.len());
     for line_string in cut_shapes {
         if line_string.0.len() < 2 {
             continue;
@@ -1461,8 +1563,10 @@ fn paint_polygons(
             .iter()
             .map(|point| to_screen.transform_pos(Pos2::new(point.x, point.y)))
             .collect();
-        painter.add(Shape::line(points, stroke));
+        shapes.push(Shape::line(points, stroke));
     }
+    // Extending once avoids locking the painter for every perforation dash.
+    painter.extend(shapes);
 }
 
 fn preview_cut_phases(
@@ -1472,7 +1576,7 @@ fn preview_cut_phases(
     dash: f32,
     gap: f32,
     overcut: crate::cut::OvercutSettings,
-    peel_tabs: bool,
+    peel_tabs: &[(usize, PeelTab)],
 ) -> Vec<CutPhase> {
     let modes = effective_cut_modes(paths.len(), modes, all_perforation);
     let prepared = paths
@@ -1487,12 +1591,10 @@ fn preview_cut_phases(
         })
         .collect::<Vec<_>>();
     let mut phases = plan_cut_phases(&prepared, &modes, 1, 1, dash, gap);
-    if peel_tabs {
-        let tabs = paths
+    if !peel_tabs.is_empty() {
+        let tabs = peel_tabs
             .iter()
-            .zip(&modes)
-            .filter(|(_, mode)| **mode != CutMode::Disabled)
-            .filter_map(|(path, _)| peel_tab_unmirrored(path))
+            .map(|(_, tab)| tab.path.clone())
             .collect::<Vec<_>>();
         if !tabs.is_empty() {
             if let Some(kiss) = phases.iter_mut().find(|phase| phase.mode == CutMode::Kiss) {
@@ -1895,6 +1997,64 @@ mod tests {
     }
 
     #[test]
+    fn peel_tab_drag_interaction_projects_pointer_onto_the_perimeter() {
+        fn run_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Option<f32> {
+            let path = LineString::from(vec![
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 100.0),
+                (0.0, 100.0),
+                (0.0, 0.0),
+            ]);
+            let mut dragged_position = None;
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let to_screen = RectTransform::identity(Rect::from_min_max(
+                        Pos2::ZERO,
+                        Pos2::new(100.0, 100.0),
+                    ));
+                    let (_, position) = interact_peel_tab_handle(
+                        ui,
+                        Id::new("peel-tab-drag-test"),
+                        Pos2::new(50.0, 50.0),
+                        24.0,
+                        &path,
+                        &to_screen,
+                        true,
+                    );
+                    dragged_position = position;
+                });
+            });
+            dragged_position
+        }
+
+        let context = egui::Context::default();
+        run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(50.0, 50.0))],
+        );
+        run_frame(
+            &context,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(50.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let position = run_frame(
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(100.0, 50.0))],
+        )
+        .expect("dragging the handle should produce a perimeter position");
+        assert!((position - 0.375).abs() < 0.001);
+    }
+
+    #[test]
     fn preview_omits_disabled_geometry_and_preserves_modes() {
         let line = |y| LineString::from(vec![(0.0, y), (20.0, y)]);
         let phases = preview_cut_phases(
@@ -1904,7 +2064,7 @@ mod tests {
             5.0,
             2.0,
             crate::cut::OvercutSettings::default(),
-            false,
+            &[],
         );
         assert_eq!(phases.len(), 2);
         assert_eq!(phases[0].mode, CutMode::Kiss);

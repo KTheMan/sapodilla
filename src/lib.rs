@@ -6,6 +6,7 @@ pub mod export;
 mod icons;
 pub mod jobs;
 pub mod path_edit;
+mod peel_tab;
 mod protocol;
 pub mod raw_usb;
 pub mod shapes;

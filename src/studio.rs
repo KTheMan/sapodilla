@@ -114,7 +114,7 @@ pub enum CutlineOwner {
 }
 
 /// Document metadata associated with one legacy `cut_paths` entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CutlineMetadata {
     pub id: String,
     pub cut_path_index: usize,
@@ -125,6 +125,9 @@ pub struct CutlineMetadata {
     /// Template-owned cut geometry can be used for production but not edited.
     #[serde(default)]
     pub locked: bool,
+    /// Optional user-selected peel-tab location as normalized contour length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peel_tab_position: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +297,9 @@ impl StudioDocument {
                 || !relationship_ids.insert(metadata.id.as_str())
                 || !relationship_indexes.insert(metadata.cut_path_index)
                 || metadata.cut_path_index >= document.cut_paths.len()
+                || metadata.peel_tab_position.is_some_and(|position| {
+                    !position.is_finite() || !(0.0..=1.0).contains(&position)
+                })
         }) {
             bail!("studio document contains invalid cutline metadata");
         }
@@ -445,6 +451,7 @@ impl StudioDocument {
                 owner,
                 cut_mode: CutMode::Kiss,
                 locked: false,
+                peel_tab_position: None,
             });
         }
         Ok(())
@@ -1909,6 +1916,7 @@ mod tests {
             .set_cutline_owner(0, Some(CutlineOwner::TemplatePlaceholder("hero".into())))
             .unwrap();
         document.cutline_metadata[0].locked = true;
+        document.cutline_metadata[0].peel_tab_position = Some(0.375);
         document
             .assign_placeholder_image("hero", Some(&image_id))
             .unwrap();
@@ -1922,6 +1930,7 @@ mod tests {
             Some(image_id.as_str())
         );
         assert!(decoded.cutline_metadata[0].locked);
+        assert_eq!(decoded.cutline_metadata[0].peel_tab_position, Some(0.375));
     }
 
     #[test]
