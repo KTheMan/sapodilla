@@ -33,6 +33,7 @@ use crate::{
     export::{ToolpathStats, cut_svg, jpeg_pdf, toolpath_debug_svg},
     jobs::{JobQueue, JobSpec, JobStatus as QueueJobStatus, Printer as QueuePrinter},
     path_edit::{smooth_path, union_paths},
+    peel_tab::{PeelTab, peel_tabs as build_peel_tabs},
     protocol::*,
     shapes::{self, ProceduralShape},
     spawn, spawn_blocking,
@@ -291,6 +292,7 @@ pub struct SapodillaApp {
     pub cut_progress: Option<(usize, usize)>,
     pub(crate) cut_preview_cache_key: Option<u64>,
     pub(crate) cut_preview_cache: Vec<CutPhase>,
+    pub(crate) cut_preview_tabs: Vec<(usize, PeelTab)>,
     pub(crate) cut_preview_stats: ToolpathStats,
 
     pub showing_packet_log: bool,
@@ -303,6 +305,7 @@ pub struct SapodillaApp {
     pub template_placeholders: Vec<TemplatePlaceholder>,
     pub cutline_owners: Vec<Option<CutlineOwner>>,
     pub cutline_locked: Vec<bool>,
+    pub(crate) peel_tab_positions: Vec<Option<f32>>,
     pub library: Vec<LoadedImage>,
     pub library_folders: Vec<String>,
     pub library_disk_paths: Vec<std::path::PathBuf>,
@@ -562,6 +565,7 @@ pub struct PendingPrintJob {
     perf_dash: f32,
     perf_gap: f32,
     peel_tabs: bool,
+    peel_tab_positions: Vec<Option<f32>>,
     overcut: OvercutSettings,
     /// Calibration targets already contain explicit blade-up bridge segments;
     /// these phases bypass production perforation dashing.
@@ -1150,6 +1154,7 @@ impl SapodillaApp {
             cut_progress: None,
             cut_preview_cache_key: None,
             cut_preview_cache: Vec::new(),
+            cut_preview_tabs: Vec::new(),
             cut_preview_stats: ToolpathStats::default(),
 
             showing_packet_log: false,
@@ -1162,6 +1167,7 @@ impl SapodillaApp {
             template_placeholders: Vec::new(),
             cutline_owners: Vec::new(),
             cutline_locked: Vec::new(),
+            peel_tab_positions: Vec::new(),
             library,
             library_folders,
             library_disk_paths,
@@ -1273,6 +1279,8 @@ impl SapodillaApp {
             .drain(..count.min(self.cutline_owners.len()));
         self.cutline_locked
             .drain(..count.min(self.cutline_locked.len()));
+        self.peel_tab_positions
+            .drain(..count.min(self.peel_tab_positions.len()));
         self.auto_cut_count = 0;
         self.selected_cut_path = None;
         self.selected_cut_node = None;
@@ -1680,12 +1688,14 @@ impl SapodillaApp {
         .flat_map(|phase| phase.paths)
         .collect::<Vec<_>>();
         if self.peel_tabs {
+            let enabled = modes
+                .iter()
+                .map(|mode| *mode != CutMode::Disabled)
+                .collect::<Vec<_>>();
             prepared.extend(
-                self.cut_shapes
-                    .iter()
-                    .zip(&modes)
-                    .filter(|(_, mode)| **mode != CutMode::Disabled)
-                    .filter_map(|(path, _)| peel_tab_unmirrored(path)),
+                build_peel_tabs(&self.cut_shapes, &enabled, &self.peel_tab_positions)
+                    .into_iter()
+                    .map(|(_, tab)| tab.path),
             );
         }
         prepared
@@ -1704,6 +1714,7 @@ impl SapodillaApp {
             self.perf_dash_mm * DEVICES[self.selected_device].dpi / 25.4,
             self.perf_gap_mm * DEVICES[self.selected_device].dpi / 25.4,
             self.peel_tabs,
+            &self.peel_tab_positions,
             self.overcut,
         );
         save_export(
@@ -1903,6 +1914,11 @@ impl SapodillaApp {
                         .get(*source_cut_path_index)
                         .copied()
                         .unwrap_or(false);
+                metadata.peel_tab_position = self
+                    .peel_tab_positions
+                    .get(*source_cut_path_index)
+                    .copied()
+                    .flatten();
             }
         }
         Ok(document)
@@ -2261,6 +2277,9 @@ impl SapodillaApp {
                     self.cutline_owners.remove(index);
                     if index < self.cutline_locked.len() {
                         self.cutline_locked.remove(index);
+                    }
+                    if index < self.peel_tab_positions.len() {
+                        self.peel_tab_positions.remove(index);
                     }
                 }
             }
@@ -2896,6 +2915,7 @@ impl SapodillaApp {
                         self.cut_modes = vec![CutMode::Kiss; self.cut_shapes.len()];
                         self.cutline_owners = vec![None; self.cut_shapes.len()];
                         self.cutline_locked = vec![false; self.cut_shapes.len()];
+                        self.peel_tab_positions = vec![None; self.cut_shapes.len()];
                         for metadata in cutline_metadata {
                             if let Some(mode) = self.cut_modes.get_mut(metadata.cut_path_index) {
                                 *mode = metadata.cut_mode;
@@ -2909,6 +2929,11 @@ impl SapodillaApp {
                                 self.cutline_locked.get_mut(metadata.cut_path_index)
                             {
                                 *locked = metadata.locked;
+                            }
+                            if let Some(position) =
+                                self.peel_tab_positions.get_mut(metadata.cut_path_index)
+                            {
+                                *position = metadata.peel_tab_position;
                             }
                         }
                         self.manual_cut_shapes = self.cut_shapes.clone();
@@ -2980,6 +3005,8 @@ impl SapodillaApp {
                             self.cutline_owners.extend(std::iter::repeat_n(None, added));
                             self.cutline_locked
                                 .extend(std::iter::repeat_n(false, added));
+                            self.peel_tab_positions
+                                .extend(std::iter::repeat_n(None, added));
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -3030,6 +3057,14 @@ impl SapodillaApp {
                                         .unwrap_or(false)
                                 })
                                 .collect::<Vec<_>>();
+                            let manual_tab_positions = (0..self.manual_cut_shapes.len())
+                                .map(|index| {
+                                    self.peel_tab_positions
+                                        .get(self.auto_cut_count + index)
+                                        .copied()
+                                        .flatten()
+                                })
+                                .collect::<Vec<_>>();
                             let next_modes = modes_after_regeneration(
                                 &self.cut_modes,
                                 self.auto_cut_count,
@@ -3042,9 +3077,11 @@ impl SapodillaApp {
                             self.cut_modes = next_modes;
                             self.cutline_owners = vec![None; self.auto_cut_count];
                             self.cutline_locked = vec![false; self.auto_cut_count];
+                            self.peel_tab_positions = vec![None; self.auto_cut_count];
                             self.cut_shapes.extend(self.manual_cut_shapes.clone());
                             self.cutline_owners.extend(manual_owners);
                             self.cutline_locked.extend(manual_locks);
+                            self.peel_tab_positions.extend(manual_tab_positions);
                             self.cut_progress = None;
                             self.off_canvas = result.off_canvas;
                             self.cut_validation_snapshot = None;
@@ -3775,6 +3812,7 @@ impl SapodillaApp {
         let perf_dash = self.perf_dash_mm * dpi / 25.4;
         let perf_gap = self.perf_gap_mm * dpi / 25.4;
         let peel_tabs = self.peel_tabs;
+        let peel_tab_positions = self.peel_tab_positions.clone();
         let overcut = self.overcut;
         let copies = self.copies;
         let device_index = self.selected_device;
@@ -3799,6 +3837,7 @@ impl SapodillaApp {
                 perf_dash,
                 perf_gap,
                 peel_tabs,
+                peel_tab_positions,
                 overcut,
                 calibration_phases: None,
                 mapping_override: None,
@@ -3852,6 +3891,7 @@ impl SapodillaApp {
                             payload.perf_dash,
                             payload.perf_gap,
                             payload.peel_tabs,
+                            &payload.peel_tab_positions,
                             payload.overcut,
                         )
                     }
@@ -3988,6 +4028,7 @@ impl SapodillaApp {
         self.template_placeholders.clear();
         self.cutline_owners.clear();
         self.cutline_locked.clear();
+        self.peel_tab_positions.clear();
         self.cut_shapes.clear();
         self.manual_cut_shapes.clear();
         self.cut_modes.clear();
@@ -5372,7 +5413,7 @@ struct CutValidationSnapshot {
 fn cut_validation_snapshot(
     cut_shapes: &[LineString<f32>],
     cut_modes: &[CutMode],
-    all_perforation: bool,
+    _all_perforation: bool,
     canvas_size: Vec2,
     safe_area: Vec2,
 ) -> CutValidationSnapshot {
@@ -5385,20 +5426,42 @@ fn cut_validation_snapshot(
             point.y.to_bits().hash(&mut hasher);
         }
     }
-    for mode in cut_modes {
-        match mode {
-            CutMode::Kiss => 0u8,
-            CutMode::Perforation => 1,
-            CutMode::Disabled => 2,
-        }
-        .hash(&mut hasher);
+    for index in 0..cut_shapes.len() {
+        (cut_modes.get(index) == Some(&CutMode::Disabled)).hash(&mut hasher);
     }
-    all_perforation.hash(&mut hasher);
     CutValidationSnapshot {
         geometry_hash: hasher.finish(),
         canvas_size: [canvas_size.x.to_bits(), canvas_size.y.to_bits()],
         safe_area: [safe_area.x.to_bits(), safe_area.y.to_bits()],
     }
+}
+
+fn cut_validation_snapshot_with_tabs(
+    cut_shapes: &[LineString<f32>],
+    cut_modes: &[CutMode],
+    all_perforation: bool,
+    canvas_size: Vec2,
+    safe_area: Vec2,
+    peel_tabs_enabled: bool,
+    peel_tab_positions: &[Option<f32>],
+) -> CutValidationSnapshot {
+    let mut snapshot = cut_validation_snapshot(
+        cut_shapes,
+        cut_modes,
+        all_perforation,
+        canvas_size,
+        safe_area,
+    );
+    let mut hasher = DefaultHasher::new();
+    snapshot.geometry_hash.hash(&mut hasher);
+    peel_tabs_enabled.hash(&mut hasher);
+    if peel_tabs_enabled {
+        for position in peel_tab_positions.iter().take(cut_shapes.len()) {
+            position.map(f32::to_bits).hash(&mut hasher);
+        }
+    }
+    snapshot.geometry_hash = hasher.finish();
+    snapshot
 }
 
 fn validate_current_cut_paths(
@@ -5428,17 +5491,21 @@ fn validate_current_cut_paths(
         .iter()
         .map(|path| path.bounding_rect())
         .collect::<Vec<_>>();
+    let mut order = bounds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bounds)| bounds.map(|bounds| (index, bounds)))
+        .collect::<Vec<_>>();
+    order.sort_by(|(_, left), (_, right)| left.min().x.total_cmp(&right.min().x));
     let mut has_intersections = false;
-    'intersection: for left in 0..effective_paths.len() {
-        let Some(left_bounds) = bounds[left] else {
-            continue;
-        };
-        for right in left + 1..effective_paths.len() {
-            let Some(right_bounds) = bounds[right] else {
-                continue;
-            };
+    'intersection: for left in 0..order.len() {
+        let (left_index, left_bounds) = order[left];
+        for &(right_index, right_bounds) in &order[left + 1..] {
+            if right_bounds.min().x > left_bounds.max().x {
+                break;
+            }
             if left_bounds.intersects(&right_bounds)
-                && effective_paths[left].intersects(effective_paths[right])
+                && effective_paths[left_index].intersects(effective_paths[right_index])
             {
                 has_intersections = true;
                 break 'intersection;
@@ -5467,6 +5534,60 @@ fn validate_current_cut_paths(
     }
 }
 
+fn validate_current_cut_paths_with_tabs(
+    cut_shapes: &[LineString<f32>],
+    cut_modes: &[CutMode],
+    all_perforation: bool,
+    canvas_size: Vec2,
+    safe_area: Vec2,
+    peel_tabs_enabled: bool,
+    peel_tab_positions: &[Option<f32>],
+) -> CutPathValidation {
+    let mut validation = validate_current_cut_paths(
+        cut_shapes,
+        cut_modes,
+        all_perforation,
+        canvas_size,
+        safe_area,
+    );
+    if !peel_tabs_enabled {
+        return validation;
+    }
+    let enabled = (0..cut_shapes.len())
+        .map(|index| cut_modes.get(index) != Some(&CutMode::Disabled))
+        .collect::<Vec<_>>();
+    let tabs = build_peel_tabs(cut_shapes, &enabled, peel_tab_positions);
+    let offset = (canvas_size - safe_area) / 2.0;
+    let safe_canvas = GeoRect::new(
+        Coord {
+            x: offset.x,
+            y: offset.y,
+        },
+        Coord {
+            x: canvas_size.x - offset.x,
+            y: canvas_size.y - offset.y,
+        },
+    )
+    .to_polygon();
+    validation.off_canvas |= tabs.iter().any(|(_, tab)| !safe_canvas.contains(&tab.path));
+    if !validation.has_intersections {
+        validation.has_intersections = tabs.iter().any(|(owner, tab)| {
+            cut_shapes
+                .iter()
+                .enumerate()
+                .any(|(index, path)| index != *owner && enabled[index] && tab.path.intersects(path))
+        });
+    }
+    if !validation.has_intersections {
+        validation.has_intersections = tabs.iter().enumerate().any(|(left, (_, tab))| {
+            tabs[left + 1..]
+                .iter()
+                .any(|(_, other)| tab.path.intersects(&other.path))
+        });
+    }
+    validation
+}
+
 impl eframe::App for SapodillaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let accent = self.accent_color();
@@ -5478,22 +5599,28 @@ impl eframe::App for SapodillaApp {
         self.cutline_owners.truncate(self.cut_shapes.len());
         self.cutline_locked.resize(self.cut_shapes.len(), false);
         self.cutline_locked.truncate(self.cut_shapes.len());
+        self.peel_tab_positions.resize(self.cut_shapes.len(), None);
+        self.peel_tab_positions.truncate(self.cut_shapes.len());
         views::synchronize_cut_preview(self);
         let canvas = self.get_canvas();
-        let current_validation_snapshot = cut_validation_snapshot(
+        let current_validation_snapshot = cut_validation_snapshot_with_tabs(
             &self.cut_shapes,
             &self.cut_modes,
             self.perf_cut,
             canvas.size,
             canvas.safe_area,
+            self.peel_tabs,
+            &self.peel_tab_positions,
         );
         if self.cut_validation_snapshot.as_ref() != Some(&current_validation_snapshot) {
-            let cut_validation = validate_current_cut_paths(
+            let cut_validation = validate_current_cut_paths_with_tabs(
                 &self.cut_shapes,
                 &self.cut_modes,
                 self.perf_cut,
                 canvas.size,
                 canvas.safe_area,
+                self.peel_tabs,
+                &self.peel_tab_positions,
             );
             self.has_intersections = cut_validation.has_intersections;
             self.off_canvas = cut_validation.off_canvas;
@@ -6165,8 +6292,13 @@ impl eframe::App for SapodillaApp {
                                         CutMode::Kiss
                                     });
                                 }
-                                ui.checkbox(&mut self.peel_tabs, "Peel tabs");
+                                ui.checkbox(&mut self.peel_tabs, "Peel tabs").on_hover_text(
+                                    "Drag the gold tab handles around each cut preview to reposition them",
+                                );
                             });
+                            if self.peel_tabs {
+                                theme::muted(ui, "Drag the gold handles to reposition peel tabs.");
+                            }
                             if self.perf_cut {
                                 ui.add(
                                     egui::Slider::new(&mut self.perf_dash_mm, 0.25..=8.0)
@@ -6271,6 +6403,7 @@ impl eframe::App for SapodillaApp {
                                     self.cut_modes.push(CutMode::Kiss);
                                     self.cutline_owners.push(None);
                                     self.cutline_locked.push(false);
+                                    self.peel_tab_positions.push(None);
                                 }
                             });
                             if !self.cut_shapes.is_empty() {
@@ -6330,6 +6463,8 @@ impl eframe::App for SapodillaApp {
                                             self.cutline_owners = vec![None; self.cut_shapes.len()];
                                             self.cutline_locked =
                                                 vec![false; self.cut_shapes.len()];
+                                            self.peel_tab_positions =
+                                                vec![None; self.cut_shapes.len()];
                                             self.selected_cut_path = None;
                                             self.selected_cut_node = None;
                                         }
@@ -6460,6 +6595,7 @@ impl eframe::App for SapodillaApp {
                                     self.cut_modes.remove(path_index);
                                     self.cutline_owners.remove(path_index);
                                     self.cutline_locked.remove(path_index);
+                                    self.peel_tab_positions.remove(path_index);
                                     if path_index >= self.auto_cut_count {
                                         let manual_index = path_index - self.auto_cut_count;
                                         if manual_index < self.manual_cut_shapes.len() {
@@ -6971,6 +7107,7 @@ fn build_calibration_print_job(
         perf_dash: 0.0,
         perf_gap: 0.0,
         peel_tabs: false,
+        peel_tab_positions: Vec::new(),
         overcut: OvercutSettings::default(),
         calibration_phases: Some(calibration_phases),
         mapping_override,
@@ -7547,6 +7684,7 @@ fn encode_plt(
     perf_dash: f32,
     perf_gap: f32,
     peel_tabs: bool,
+    peel_tab_positions: &[Option<f32>],
     overcut: OvercutSettings,
 ) -> Vec<u8> {
     let modes = effective_cut_modes(cut_shapes.len(), cut_modes, perf_cut_enabled);
@@ -7570,11 +7708,13 @@ fn encode_plt(
         perf_gap,
     );
     if peel_tabs {
-        let tabs = cut_shapes
+        let enabled = modes
             .iter()
-            .zip(&modes)
-            .filter(|(_, mode)| **mode != CutMode::Disabled)
-            .filter_map(|(path, _)| peel_tab_unmirrored(path))
+            .map(|mode| *mode != CutMode::Disabled)
+            .collect::<Vec<_>>();
+        let tabs = build_peel_tabs(cut_shapes, &enabled, peel_tab_positions)
+            .into_iter()
+            .map(|(_, tab)| tab.path)
             .collect::<Vec<_>>();
         if !tabs.is_empty() {
             if let Some(kiss) = phases.iter_mut().find(|phase| phase.mode == CutMode::Kiss) {
@@ -7636,22 +7776,6 @@ fn encode_calibration_plt(
     }
     write!(buf, " U6476,0  @ ").unwrap();
     buf
-}
-
-pub(crate) fn peel_tab_unmirrored(path: &LineString<f32>) -> Option<LineString<f32>> {
-    let bounds = path.bounding_rect()?;
-    let width = (bounds.width() * 0.25).clamp(30.0, 120.0);
-    let depth = (width * 0.35).clamp(12.0, 42.0);
-    let center_x = (bounds.min().x + bounds.max().x) / 2.0;
-    let y = bounds.max().y;
-    let points = (0..=12)
-        .map(|index| {
-            let t = index as f32 / 12.0;
-            let angle = std::f32::consts::PI * t;
-            (center_x - width / 2.0 + width * t, y - depth * angle.sin())
-        })
-        .collect::<Vec<_>>();
-    Some(LineString::from(points))
 }
 
 fn write_line_string(
@@ -8075,6 +8199,25 @@ mod tests {
             Vec2::new(80.0, 80.0),
         );
         assert_eq!(before, identical);
+        let perforation = cut_validation_snapshot(
+            std::slice::from_ref(&path),
+            &[CutMode::Perforation],
+            true,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(80.0, 80.0),
+        );
+        assert_eq!(
+            before, perforation,
+            "changing cut pressure mode does not affect geometric preflight"
+        );
+        let disabled = cut_validation_snapshot(
+            std::slice::from_ref(&path),
+            &[CutMode::Disabled],
+            false,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(80.0, 80.0),
+        );
+        assert_ne!(before, disabled);
 
         path.0[0].x = 5.0;
         let after_manual_edit = cut_validation_snapshot(
@@ -8085,6 +8228,57 @@ mod tests {
             Vec2::new(80.0, 80.0),
         );
         assert_ne!(before, after_manual_edit);
+    }
+
+    #[test]
+    fn peel_tabs_participate_in_safe_area_validation_and_cache_keys() {
+        let path = LineString::from(vec![
+            (20.0, 60.0),
+            (80.0, 60.0),
+            (80.0, 90.0),
+            (20.0, 90.0),
+            (20.0, 60.0),
+        ]);
+        let without_tab = validate_current_cut_paths_with_tabs(
+            std::slice::from_ref(&path),
+            &[CutMode::Kiss],
+            false,
+            Vec2::splat(100.0),
+            Vec2::splat(100.0),
+            false,
+            &[],
+        );
+        assert!(!without_tab.off_canvas);
+        let with_tab = validate_current_cut_paths_with_tabs(
+            std::slice::from_ref(&path),
+            &[CutMode::Kiss],
+            false,
+            Vec2::splat(100.0),
+            Vec2::splat(100.0),
+            true,
+            &[None],
+        );
+        assert!(with_tab.off_canvas);
+
+        let default_key = cut_validation_snapshot_with_tabs(
+            std::slice::from_ref(&path),
+            &[CutMode::Kiss],
+            false,
+            Vec2::splat(100.0),
+            Vec2::splat(100.0),
+            true,
+            &[None],
+        );
+        let moved_key = cut_validation_snapshot_with_tabs(
+            &[path],
+            &[CutMode::Kiss],
+            false,
+            Vec2::splat(100.0),
+            Vec2::splat(100.0),
+            true,
+            &[Some(0.125)],
+        );
+        assert_ne!(default_key, moved_key);
     }
 
     #[test]
@@ -8451,6 +8645,7 @@ mod tests {
             2.0,
             1.0,
             false,
+            &[],
             OvercutSettings {
                 enabled: false,
                 ..OvercutSettings::default()
@@ -8483,6 +8678,7 @@ mod tests {
             5.0,
             5.0,
             false,
+            &[],
             OvercutSettings {
                 enabled: false,
                 ..OvercutSettings::default()
@@ -8518,6 +8714,7 @@ mod tests {
             5.0,
             2.0,
             false,
+            &[],
             OvercutSettings {
                 enabled: false,
                 ..OvercutSettings::default()
@@ -8549,10 +8746,50 @@ mod tests {
             5.0,
             2.0,
             true,
+            &[],
             OvercutSettings::default(),
         ))
         .unwrap();
         assert_eq!(text, "IN VER0.1.0 U6476,0  @ ");
+    }
+
+    #[test]
+    fn peel_tab_position_reaches_plt_and_kiss_tab_precedes_perforation() {
+        let path = LineString::from(vec![
+            (100.0, 100.0),
+            (300.0, 100.0),
+            (300.0, 300.0),
+            (100.0, 300.0),
+            (100.0, 100.0),
+        ]);
+        let canvas = canvas();
+        let material = MaterialProfile {
+            name: "test".into(),
+            blade_pressure: 42,
+            perf_pressure: 53,
+            passes: 1,
+            speed: 5,
+        };
+        let encode = |position| {
+            String::from_utf8(encode_plt(
+                std::slice::from_ref(&path),
+                &[CutMode::Perforation],
+                unscaled_test_mapping(&canvas),
+                &canvas,
+                &material,
+                false,
+                25.0,
+                5.0,
+                true,
+                &[Some(position)],
+                OvercutSettings::default(),
+            ))
+            .unwrap()
+        };
+        let top = encode(0.125);
+        let bottom = encode(0.625);
+        assert_ne!(top, bottom);
+        assert!(top.find("KP42").unwrap() < top.find("KP53").unwrap());
     }
 
     #[test]
@@ -8576,6 +8813,7 @@ mod tests {
             5.0,
             2.0,
             false,
+            &[],
             OvercutSettings::default(),
         ))
         .unwrap();
@@ -8610,6 +8848,7 @@ mod tests {
             5.0,
             2.0,
             false,
+            &[],
             OvercutSettings {
                 enabled: false,
                 ..OvercutSettings::default()

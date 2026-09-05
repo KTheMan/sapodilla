@@ -114,7 +114,7 @@ pub enum CutlineOwner {
 }
 
 /// Document metadata associated with one legacy `cut_paths` entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CutlineMetadata {
     pub id: String,
     pub cut_path_index: usize,
@@ -125,6 +125,9 @@ pub struct CutlineMetadata {
     /// Template-owned cut geometry can be used for production but not edited.
     #[serde(default)]
     pub locked: bool,
+    /// Optional user-selected peel-tab location as normalized contour length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peel_tab_position: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +297,9 @@ impl StudioDocument {
                 || !relationship_ids.insert(metadata.id.as_str())
                 || !relationship_indexes.insert(metadata.cut_path_index)
                 || metadata.cut_path_index >= document.cut_paths.len()
+                || metadata.peel_tab_position.is_some_and(|position| {
+                    !position.is_finite() || !(0.0..=1.0).contains(&position)
+                })
         }) {
             bail!("studio document contains invalid cutline metadata");
         }
@@ -445,6 +451,7 @@ impl StudioDocument {
                 owner,
                 cut_mode: CutMode::Kiss,
                 locked: false,
+                peel_tab_position: None,
             });
         }
         Ok(())
@@ -1744,42 +1751,73 @@ fn absolute(abs: bool, current: Coord<f32>, x: f64, y: f64) -> Coord<f32> {
 /// Split a contour into alternating cut dashes for perf-cut output.
 pub fn perf_cut(path: &LineString<f32>, dash: f32, gap: f32) -> Vec<LineString<f32>> {
     let mut output = Vec::new();
-    if dash <= 0.0 || path.0.len() < 2 {
+    if !dash.is_finite() || dash <= 0.0 || !gap.is_finite() || path.0.len() < 2 {
         return output;
     }
-    let period = dash + gap.max(0.0);
-    let mut distance_on_path: f32 = 0.0;
+    let gap = gap.max(0.0);
+    if gap <= f32::EPSILON {
+        return vec![path.clone()];
+    }
+
+    // Keep a dash open across source vertices. Contours extracted from rasters
+    // commonly contain thousands of one-pixel edges; emitting a separate
+    // LineString for every edge multiplied preview and plotter overhead even
+    // though the blade was meant to stay down for the whole dash.
+    let mut cutting = true;
+    let mut remaining = dash;
+    let mut current_dash = Vec::new();
     for segment in path.lines() {
         let dx = segment.end.x - segment.start.x;
         let dy = segment.end.y - segment.start.y;
         let length = dx.hypot(dy);
-        if length == 0.0 {
+        if !length.is_finite() || length <= f32::EPSILON {
             continue;
         }
         let mut local = 0.0;
         while local < length {
-            let phase = distance_on_path.rem_euclid(period);
-            let cutting = phase < dash;
-            let until_change = if cutting {
-                dash - phase
-            } else {
-                period - phase
-            };
-            let end = (local + until_change).min(length);
+            let end = (local + remaining).min(length);
+            if end <= local {
+                // At very large coordinates f32 addition can stop advancing.
+                // Transitioning here prevents malformed contours from hanging
+                // the worker indefinitely.
+                if cutting && current_dash.len() >= 2 {
+                    output.push(LineString::new(std::mem::take(&mut current_dash)));
+                }
+                cutting = !cutting;
+                remaining = if cutting { dash } else { gap };
+                if local + remaining <= local {
+                    break;
+                }
+                continue;
+            }
             if cutting && end > local {
                 let point = |at: f32| Coord {
                     x: segment.start.x + dx * at / length,
                     y: segment.start.y + dy * at / length,
                 };
-                output.push(LineString::new(vec![point(local), point(end)]));
+                let start = point(local);
+                if current_dash.last().copied() != Some(start) {
+                    current_dash.push(start);
+                }
+                let end = point(end);
+                if current_dash.last().copied() != Some(end) {
+                    current_dash.push(end);
+                }
             }
             let consumed = end - local;
             local = end;
-            distance_on_path += consumed;
-            if consumed <= f32::EPSILON {
-                break;
+            remaining -= consumed;
+            if remaining <= f32::EPSILON {
+                if cutting && current_dash.len() >= 2 {
+                    output.push(LineString::new(std::mem::take(&mut current_dash)));
+                }
+                cutting = !cutting;
+                remaining = if cutting { dash } else { gap };
             }
         }
+    }
+    if current_dash.len() >= 2 {
+        output.push(LineString::new(current_dash));
     }
     output
 }
@@ -1878,6 +1916,7 @@ mod tests {
             .set_cutline_owner(0, Some(CutlineOwner::TemplatePlaceholder("hero".into())))
             .unwrap();
         document.cutline_metadata[0].locked = true;
+        document.cutline_metadata[0].peel_tab_position = Some(0.375);
         document
             .assign_placeholder_image("hero", Some(&image_id))
             .unwrap();
@@ -1891,6 +1930,7 @@ mod tests {
             Some(image_id.as_str())
         );
         assert!(decoded.cutline_metadata[0].locked);
+        assert_eq!(decoded.cutline_metadata[0].peel_tab_position, Some(0.375));
     }
 
     #[test]
@@ -2120,6 +2160,57 @@ mod tests {
         let segments = perf_cut(&path, 5.0, 5.0);
         assert_eq!(segments.len(), 3);
         assert!((segments.iter().map(|p| p.0[1].x - p.0[0].x).sum::<f32>() - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn perf_cut_keeps_each_dash_connected_across_dense_vertices() {
+        let path = LineString::from((0..=1_000).map(|x| (x as f32, 0.0)).collect::<Vec<_>>());
+        let segments = perf_cut(&path, 25.0, 5.0);
+        assert_eq!(segments.len(), 34);
+        assert_eq!(segments[0].0.len(), 26);
+        assert_eq!(segments[0].0.first().unwrap().x, 0.0);
+        assert_eq!(segments[0].0.last().unwrap().x, 25.0);
+        assert!(segments.iter().all(|segment| segment.0.len() >= 2));
+    }
+
+    #[test]
+    fn zero_gap_preserves_the_original_contour_as_one_toolpath() {
+        let path = LineString::from(vec![(0.0, 0.0), (5.0, 0.0), (5.0, 5.0)]);
+        assert_eq!(perf_cut(&path, 2.0, 0.0), vec![path]);
+    }
+
+    #[test]
+    fn perforation_dash_traverses_contour_vertices_instead_of_chording() {
+        let path = LineString::from(vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)]);
+        let dashes = perf_cut(&path, 6.0, 2.0);
+        assert_eq!(
+            dashes,
+            vec![LineString::from(vec![(0.0, 0.0), (4.0, 0.0), (4.0, 2.0)])]
+        );
+    }
+
+    /// Repeatable opt-in latency probe for dense raster-derived contours.
+    #[test]
+    #[ignore = "performance probe; run with --release -- --ignored --nocapture"]
+    fn perf_dense_perforation_split() {
+        use std::{hint::black_box, time::Instant};
+
+        let path = LineString::from(
+            (0..=100_000)
+                .map(|x| (x as f32, (x % 2) as f32))
+                .collect::<Vec<_>>(),
+        );
+        let started = Instant::now();
+        let dashes = perf_cut(black_box(&path), 25.0, 5.0);
+        println!(
+            "dense perforation: {:?}, {} source nodes -> {} dash paths / {} output nodes",
+            started.elapsed(),
+            path.0.len(),
+            dashes.len(),
+            dashes.iter().map(|dash| dash.0.len()).sum::<usize>()
+        );
+        assert!(dashes.len() < 5_000);
+        black_box(dashes);
     }
 
     #[test]

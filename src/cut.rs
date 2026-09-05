@@ -236,7 +236,7 @@ impl CutGenerator {
 
         for (index, image) in self.images.iter().enumerate() {
             let paths = self.image(image);
-            line_strings.extend_from_slice(&paths);
+            line_strings.extend(paths);
 
             self.tx.unbounded_send(CutAction::Progress {
                 completed: index + 1,
@@ -463,16 +463,20 @@ fn has_any_intersections(line_strings: &[LineString<f32>]) -> bool {
         .iter()
         .map(LineString::bounding_rect)
         .collect::<Vec<_>>();
-    for left in 0..line_strings.len() {
-        let Some(left_bounds) = bounds[left] else {
-            continue;
-        };
-        for right in left + 1..line_strings.len() {
-            let Some(right_bounds) = bounds[right] else {
-                continue;
-            };
+    let mut order = bounds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bounds)| bounds.map(|bounds| (index, bounds)))
+        .collect::<Vec<_>>();
+    order.sort_by(|(_, left), (_, right)| left.min().x.total_cmp(&right.min().x));
+    for left in 0..order.len() {
+        let (left_index, left_bounds) = order[left];
+        for &(right_index, right_bounds) in &order[left + 1..] {
+            if right_bounds.min().x > left_bounds.max().x {
+                break;
+            }
             if left_bounds.intersects(&right_bounds)
-                && line_strings[left].intersects(&line_strings[right])
+                && line_strings[left_index].intersects(&line_strings[right_index])
             {
                 return true;
             }
