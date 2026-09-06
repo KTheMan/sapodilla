@@ -553,7 +553,10 @@ pub struct JobStatusInfo {
     #[serde(default, alias = "user_account")]
     pub user_account: Option<String>,
     #[serde(default)]
-    pub channel: Option<u32>,
+    /// USB firmware reports `-1` while a combo job is not associated with a
+    /// normal application channel. Keep this diagnostic signed so optional
+    /// telemetry cannot invalidate the entire job-status response.
+    pub channel: Option<i32>,
     #[serde(default, alias = "media_size")]
     pub media_size: Option<u32>,
     #[serde(default, alias = "media_type")]
@@ -720,6 +723,21 @@ mod tests {
         assert_eq!(status.job_id, 7);
         assert_eq!(status.cutting_progress, Some(serde_json::json!(75)));
         assert_eq!(status.file_size, None);
+    }
+
+    #[test]
+    fn job_status_accepts_negative_usb_channel_diagnostic() {
+        let status: JobStatusInfo = serde_json::from_value(serde_json::json!({
+            "job-id": 15,
+            "job-state": 3,
+            "job-sub-state": 3004,
+            "channel": -1,
+            "transfer-status": 3
+        }))
+        .unwrap();
+        assert_eq!(status.job_id, 15);
+        assert_eq!(status.channel, Some(-1));
+        assert_eq!(status.job_state, JobState::Processing);
     }
 
     #[test]

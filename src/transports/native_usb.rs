@@ -12,11 +12,14 @@ use tracing::{debug, info, trace};
 use crate::{
     protocol::{AvocadoPacket, ContentType, EncodingType, EncryptionMode, InteractionType},
     raw_usb::{
-        COMMAND_IN_ENDPOINT, COMMAND_INTERFACE, COMMAND_OUT_ENDPOINT, DATA_IN_ENDPOINT,
-        DATA_INTERFACE, DATA_OUT_ENDPOINT, JsonResponseDecoder, PIXCUT_USB_PID, PIXCUT_USB_VID,
-        encode_data_frame, write_slices,
+        COMMAND_IN_ENDPOINT, COMMAND_INTERFACE, COMMAND_OUT_ENDPOINT, DATA_ACK_DELAY,
+        DATA_IN_ENDPOINT, DATA_INTERFACE, DATA_OUT_ENDPOINT, JsonResponseDecoder,
+        MAX_TRANSPORT_DATA_SIZE, PIXCUT_USB_PID, PIXCUT_USB_VID, encode_data_frame,
+        validate_data_ack, write_slices,
     },
-    transports::{DiscoveredDevice, TransportControl, TransportEvent, TransportStatus},
+    transports::{
+        DiscoveredDevice, JobCommandProfile, TransportControl, TransportEvent, TransportStatus,
+    },
 };
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,6 +48,14 @@ impl TransportControl for NativeUsbTransport {
 
     fn supports_discovery(&self) -> bool {
         true
+    }
+
+    fn max_data_size(&self) -> usize {
+        MAX_TRANSPORT_DATA_SIZE
+    }
+
+    fn job_command_profile(&self) -> JobCommandProfile {
+        JobCommandProfile::PixCutUsb
     }
 
     async fn discover_devices(&mut self) -> anyhow::Result<Vec<DiscoveredDevice>> {
@@ -307,15 +318,22 @@ fn send_data_packet(
     }
     let job_id = u32::from_le_bytes(request.data[..4].try_into().expect("four-byte slice"));
     let frame = encode_data_frame(job_id, &request.data[4..])?;
-    write_frame(output, &frame)?;
+    // Unlike command frames, each data header/body pair is one USB transfer.
+    // Splitting this 4096-byte frame into endpoint writes causes some firmware
+    // revisions to accept every chunk and then abort the completed upload.
+    output
+        .transfer_blocking(frame.into(), WRITE_TIMEOUT)
+        .into_result()
+        .context("native USB data-frame write failed")?;
     let ack = read_response(input)?;
-    if ack.is_empty() {
-        bail!("native USB data endpoint returned an empty acknowledgement");
-    }
+    validate_data_ack(&ack).context("native USB data endpoint rejected the frame")?;
     trace!(
         bytes = ack.len(),
         "received native USB data acknowledgement"
     );
+    // An ACK confirms receipt of this frame, but the device SDK still leaves
+    // a short settling interval before beginning the next EXTLEN frame.
+    thread::sleep(DATA_ACK_DELAY);
     Ok(())
 }
 
@@ -363,6 +381,19 @@ mod tests {
         let (tx, _rx) = std_mpsc::channel();
         transport.tx = Some(tx);
         assert!(transport.select_device("bus:3").is_err());
+    }
+
+    #[test]
+    fn raw_usb_transport_uses_sdk_data_frame_capacity() {
+        let transport = NativeUsbTransport::default();
+        assert_eq!(transport.max_data_size(), 4_075);
+        assert_eq!(
+            transport.job_command_profile(),
+            JobCommandProfile::PixCutUsb
+        );
+        let wrapped = crate::transports::Transport::NativeUsbTransport(transport);
+        assert_eq!(wrapped.max_data_size(), 4_075);
+        assert_eq!(wrapped.job_command_profile(), JobCommandProfile::PixCutUsb);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, mpsc},
 };
 
+use anyhow::Context as _;
 use egui::{Color32, Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
 use geo::{BoundingRect, Contains, Coord, Intersects, LineString, Rect as GeoRect};
@@ -186,6 +187,37 @@ pub enum Action {
         queue_id: u64,
         device_job_id: u32,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeviceJobTerminalDisposition {
+    Completed,
+    Aborted(String),
+    Cancelled,
+}
+
+fn device_job_terminal_disposition(status: &JobStatusInfo) -> Option<DeviceJobTerminalDisposition> {
+    match status.job_state {
+        JobState::Completed => Some(DeviceJobTerminalDisposition::Completed),
+        JobState::Cancelled => Some(DeviceJobTerminalDisposition::Cancelled),
+        JobState::Aborted => {
+            let detail = status
+                .job_state_reason
+                .as_ref()
+                .filter(|reason| !reason.is_null())
+                .map(|reason| match reason {
+                    serde_json::Value::String(reason) => reason.trim().to_owned(),
+                    reason => reason.to_string(),
+                })
+                .filter(|reason| !reason.is_empty());
+            let message = match detail {
+                Some(reason) => format!("printer aborted job (reason {reason})"),
+                None => "printer aborted job".into(),
+            };
+            Some(DeviceJobTerminalDisposition::Aborted(message))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -578,7 +610,6 @@ pub struct PendingPrintJob {
 pub struct EncodedPrintJob {
     source: PendingPrintJob,
     plt: Vec<u8>,
-    packet_data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2522,6 +2553,7 @@ impl SapodillaApp {
                     if let Some(job_id) = self.active_queue_job.take() {
                         let _ = self.job_queue.fail(job_id, err.to_string());
                     }
+                    self.send_progress = None;
                     self.error = Some(err);
 
                     if let Some(manager) = self.transport_manager.take() {
@@ -2633,19 +2665,25 @@ impl SapodillaApp {
                         self.device_status = Some(status);
                     }
                     TransportEvent::JobStatus(status) => {
-                        if let Some(job_id) = self.active_queue_jobs.get(&printer_id).copied() {
-                            if matches!(status.job_state, JobState::Completed) {
-                                let _ = self.job_queue.complete(job_id);
-                                self.pending_print_jobs.remove(&job_id);
-                                self.active_queue_jobs.remove(&printer_id);
+                        if let Some(job_id) = self.active_queue_jobs.get(&printer_id).copied()
+                            && let Some(disposition) = device_job_terminal_disposition(&status)
+                        {
+                            match disposition {
+                                DeviceJobTerminalDisposition::Completed => {
+                                    let _ = self.job_queue.complete(job_id);
+                                    self.pending_print_jobs.remove(&job_id);
+                                }
+                                DeviceJobTerminalDisposition::Aborted(message) => {
+                                    let _ = self.job_queue.fail(job_id, message);
+                                }
+                                DeviceJobTerminalDisposition::Cancelled => {
+                                    let _ = self.job_queue.cancel(job_id);
+                                }
+                            }
+                            self.active_queue_jobs.remove(&printer_id);
+                            if self.active_queue_job == Some(job_id) {
                                 self.active_queue_job = None;
-                            } else if matches!(
-                                status.job_state,
-                                JobState::Aborted | JobState::Cancelled
-                            ) {
-                                let _ = self.job_queue.cancel(job_id);
-                                self.active_queue_jobs.remove(&printer_id);
-                                self.active_queue_job = None;
+                                self.send_progress = None;
                             }
                         }
                         self.job_status = Some(status);
@@ -2653,6 +2691,10 @@ impl SapodillaApp {
                     TransportEvent::Error(err) => {
                         if let Some(job_id) = self.active_queue_jobs.remove(&printer_id) {
                             let _ = self.job_queue.fail(job_id, err.to_string());
+                            if self.active_queue_job == Some(job_id) {
+                                self.active_queue_job = None;
+                                self.send_progress = None;
+                            }
                         }
                         self.error = Some(err);
                     }
@@ -3018,8 +3060,23 @@ impl SapodillaApp {
                         .update_progress(job_id, (progress * 100.0).round().clamp(0.0, 99.0) as u8);
                 }
                 Action::PrinterJobError { job_id, error } => {
+                    // A transport-level error may already have failed and
+                    // detached this job. In that case the request future is
+                    // cancelled afterward; do not replace the useful root
+                    // cause with a secondary "oneshot canceled" modal.
+                    if !self
+                        .active_queue_jobs
+                        .values()
+                        .any(|active| *active == job_id)
+                    {
+                        continue;
+                    }
                     let _ = self.job_queue.fail(job_id, error.to_string());
                     self.active_queue_jobs.retain(|_, active| *active != job_id);
+                    if self.active_queue_job == Some(job_id) {
+                        self.active_queue_job = None;
+                        self.send_progress = None;
+                    }
                     self.error = Some(error);
                 }
                 Action::Cut {
@@ -3873,6 +3930,7 @@ impl SapodillaApp {
             self.active_queue_jobs
                 .insert(route.printer_id.clone(), route.job_id);
             self.send_progress = None;
+            self.job_status = None;
             let tx = self.tx.clone();
             let queue_id = route.job_id;
             let printer_id = route.printer_id;
@@ -3898,16 +3956,12 @@ impl SapodillaApp {
                 } else {
                     Vec::new()
                 };
-                let mut packet_data = Vec::with_capacity(payload.encoded_image.len() + plt.len());
-                packet_data.extend_from_slice(&plt);
-                packet_data.extend_from_slice(&payload.encoded_image);
                 let _ = tx.send(Action::PrintRouteEncoded {
                     printer_id,
                     job_id: queue_id,
                     payload: EncodedPrintJob {
                         source: payload,
                         plt,
-                        packet_data,
                     },
                 });
             });
@@ -3934,69 +3988,91 @@ impl SapodillaApp {
         let tx = self.tx.clone();
         spawn(async move {
             let result = async {
-                    let source = payload.source;
-                    let mode = &DEVICES[source.device_index].modes[source.mode_index];
-                    let canvas_size = &mode.canvas_sizes[source.canvas_index];
-                    let id = manager.next_message_id();
-                    let data = if mode.mode_type.has_cutting() {
-                        serde_json::json!({
-                            "id": id, "method": "combo-job", "params": [
-                                { "method": "print-job", "params": {
-                                    "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
-                                    "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
-                                    "file-size": source.encoded_image_len, "document-format": 9,
-                                    "document-name": format!("{}.jpeg", source.created_at),
-                                    "hash-method": 1, "hash-value": source.image_hash,
-                                    "user-account": "000000.00000000000000000000000000000000.0000",
-                                    "job-send-time": source.created_at / 1000,
-                                    "link-type": mode.mode_type.link_type(), "copies": source.copies
-                                }},
-                                { "method": "cut-job", "params": {
-                                    "copies": source.copies, "media-size": canvas_size.media_size,
-                                    "document-name": format!("{}.plt", source.created_at),
-                                    "file-size": payload.plt.len(), "channel": mode.mode_type.channel(),
-                                    "media-type": canvas_size.media_type, "job-type": mode.mode_type.job_type(),
-                                    "document-format": 18, "job-send-time": source.created_at / 1000
-                                }}
-                            ]
-                        })
-                    } else {
-                        serde_json::json!({ "id": id, "method": "print-job", "params": {
-                            "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
-                            "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
-                            "file-size": source.encoded_image_len, "document-format": 9,
-                            "document-name": format!("{}.jpeg", source.created_at),
-                            "hash-method": 1, "hash-value": source.image_hash,
-                            "user-account": "000000.00000000000000000000000000000000.0000",
-                            "link-type": mode.mode_type.link_type(), "job-send-time": source.created_at / 1000,
-                            "copies": source.copies
-                        }})
-                    };
-                    let response = manager.wait_for_response(AvocadoPacket {
-                        version: 100, content_type: ContentType::Message,
-                        interaction_type: InteractionType::Request, encoding_type: EncodingType::Json,
-                        encryption_mode: EncryptionMode::None, terminal_id: id, msg_number: id,
-                        msg_package_total: 1, msg_package_num: 1, is_subpackage: false,
+                let source = &payload.source;
+                let mode = &DEVICES[source.device_index].modes[source.mode_index];
+                let canvas_size = &mode.canvas_sizes[source.canvas_index];
+                let command_profile = manager.job_command_profile().await;
+                if command_profile == JobCommandProfile::PixCutUsb {
+                    validate_pixcut_job_documents(source, &payload.plt, mode, canvas_size)?;
+                    manager.prepare_pixcut_usb_job().await?;
+                }
+                let id = manager.next_message_id();
+                let data = build_device_job_command(
+                    id,
+                    source,
+                    &payload.plt,
+                    mode,
+                    canvas_size,
+                    command_profile,
+                );
+                let response = manager
+                    .wait_for_response(AvocadoPacket {
+                        version: 100,
+                        content_type: ContentType::Message,
+                        interaction_type: InteractionType::Request,
+                        encoding_type: EncodingType::Json,
+                        encryption_mode: EncryptionMode::None,
+                        terminal_id: id,
+                        msg_number: id,
+                        msg_package_total: 1,
+                        msg_package_num: 1,
+                        is_subpackage: false,
                         data: serde_json::to_vec(&data)?,
-                    }).await?;
-                    #[derive(Debug, Deserialize)]
-                    #[serde(rename_all = "kebab-case")]
-                    struct JobResult { #[serde(alias = "job_id")] job_id: u32 }
-                    let device_job_id = response.as_json::<AvocadoResult<JobResult>>()
-                        .ok_or_else(|| anyhow::anyhow!("printer returned an invalid job response"))?
-                        .result.job_id;
-                    let _ = tx.send(Action::CalibrationDeviceJobStarted {
-                        queue_id,
-                        device_job_id,
-                    });
-                    manager.send_data(device_job_id, &payload.packet_data, |total, sent| {
-                        let _ = tx.send(Action::SendProgress {
-                            job_id: queue_id, progress: sent as f32 / total as f32,
-                        });
-                    }).await?;
-                    manager.poll_job(device_job_id).await?;
-                    Ok::<(), anyhow::Error>(())
-            }.await;
+                    })
+                    .await?;
+                #[derive(Debug, Deserialize)]
+                #[serde(rename_all = "kebab-case")]
+                struct JobResult {
+                    #[serde(alias = "job_id")]
+                    job_id: u32,
+                }
+                let device_job_id = response
+                    .as_json::<AvocadoResult<JobResult>>()
+                    .ok_or_else(|| anyhow::anyhow!("printer returned an invalid job response"))?
+                    .result
+                    .job_id;
+                let _ = tx.send(Action::CalibrationDeviceJobStarted {
+                    queue_id,
+                    device_job_id,
+                });
+                if command_profile == JobCommandProfile::PixCutUsb {
+                    manager.prime_pixcut_usb_job(device_job_id).await?;
+                }
+                if command_profile == JobCommandProfile::PixCutUsb {
+                    manager
+                        .send_data_streams(
+                            device_job_id,
+                            &[payload.plt.as_slice(), source.encoded_image.as_slice()],
+                            |total, sent| {
+                                let _ = tx.send(Action::SendProgress {
+                                    job_id: queue_id,
+                                    progress: sent as f32 / total as f32,
+                                });
+                            },
+                        )
+                        .await?;
+                } else {
+                    let mut packet_data =
+                        Vec::with_capacity(payload.plt.len() + source.encoded_image.len());
+                    packet_data.extend_from_slice(&payload.plt);
+                    packet_data.extend_from_slice(&source.encoded_image);
+                    manager
+                        .send_data_streams(
+                            device_job_id,
+                            &[packet_data.as_slice()],
+                            |total, sent| {
+                                let _ = tx.send(Action::SendProgress {
+                                    job_id: queue_id,
+                                    progress: sent as f32 / total as f32,
+                                });
+                            },
+                        )
+                        .await?;
+                }
+                manager.poll_job(device_job_id).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             if let Err(error) = result {
                 let _ = tx.send(Action::PrinterJobError {
                     job_id: queue_id,
@@ -7041,6 +7117,193 @@ fn calibration_job_spec(name: &str, printer_id: String) -> JobSpec {
         .restricted_to([printer_id])
 }
 
+fn build_device_job_command(
+    id: u32,
+    source: &PendingPrintJob,
+    plt: &[u8],
+    mode: &Mode,
+    canvas_size: &CanvasSize,
+    profile: JobCommandProfile,
+) -> serde_json::Value {
+    const USB_CAPTURED_HASH: &str = "26b8714aea78792854637621ad5cf1c4ed31ad1f";
+    let plot_len = plt.len();
+    if profile == JobCommandProfile::PixCutUsb {
+        let document = format!("sapodilla-{:016x}", source.created_at);
+        if mode.mode_type.has_cutting() {
+            // Match the complete job descriptors and USB channel captured
+            // from working desktop clients. The data phase sends PLT first,
+            // followed by JPEG as a separately chunked stream.
+            return serde_json::json!({
+                "id": id,
+                "method": "combo-job",
+                "params": [
+                    { "method": "print-job", "params": {
+                        "uuid": "f45d69a1da22727c26aa863ea657de8b32a501f2",
+                        "job-url": "",
+                        "print-quality": 4,
+                        "copies": source.copies,
+                        "document-name": format!("{document}.jpg"),
+                        "file-size": source.encoded_image_len,
+                        "document-format": 9,
+                        "hash-method": 1,
+                        "hash-value": USB_CAPTURED_HASH,
+                        "media-size": canvas_size.media_size,
+                        "media-type": canvas_size.media_type,
+                        "user-account": "12345678",
+                        "job-type": mode.mode_type.job_type(),
+                        "channel": 14864,
+                        "timeout": 180
+                    }},
+                    { "method": "cut-job", "params": {
+                        "file-size": plot_len,
+                        "document-format": 18,
+                        "document-name": format!("{document}.plt"),
+                        "job-url": "",
+                        "hash-method": 1,
+                        "hash-value": USB_CAPTURED_HASH,
+                        "timeout": 100
+                    }}
+                ]
+            });
+        }
+        return serde_json::json!({
+            "id": id,
+            "method": "print-job",
+            "params": {
+                "channel": 14864,
+                "copies": source.copies,
+                "document-name": format!("{document}.jpg"),
+                "file-size": source.encoded_image_len,
+                "document-format": 9,
+                "hash-method": 1,
+                "hash-value": USB_CAPTURED_HASH,
+                "media-size": canvas_size.media_size,
+                "media-type": canvas_size.media_type,
+                "user-account": "12345678",
+                "job-send-time": source.created_at / 1000,
+                "job-type": mode.mode_type.job_type()
+            }
+        });
+    }
+
+    if mode.mode_type.has_cutting() {
+        serde_json::json!({
+            "id": id, "method": "combo-job", "params": [
+                { "method": "print-job", "params": {
+                    "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
+                    "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
+                    "file-size": source.encoded_image_len, "document-format": 9,
+                    "document-name": format!("{}.jpeg", source.created_at),
+                    "hash-method": 1, "hash-value": &source.image_hash,
+                    "user-account": "000000.00000000000000000000000000000000.0000",
+                    "job-send-time": source.created_at / 1000,
+                    "link-type": mode.mode_type.link_type(), "copies": source.copies
+                }},
+                { "method": "cut-job", "params": {
+                    "copies": source.copies, "media-size": canvas_size.media_size,
+                    "document-name": format!("{}.plt", source.created_at),
+                    "file-size": plot_len, "channel": mode.mode_type.channel(),
+                    "media-type": canvas_size.media_type, "job-type": mode.mode_type.job_type(),
+                    "document-format": 18, "job-send-time": source.created_at / 1000
+                }}
+            ]
+        })
+    } else {
+        serde_json::json!({ "id": id, "method": "print-job", "params": {
+            "media-size": canvas_size.media_size, "media-type": canvas_size.media_type,
+            "job-type": mode.mode_type.job_type(), "channel": mode.mode_type.channel(),
+            "file-size": source.encoded_image_len, "document-format": 9,
+            "document-name": format!("{}.jpeg", source.created_at),
+            "hash-method": 1, "hash-value": &source.image_hash,
+            "user-account": "000000.00000000000000000000000000000000.0000",
+            "link-type": mode.mode_type.link_type(), "job-send-time": source.created_at / 1000,
+            "copies": source.copies
+        }})
+    }
+}
+
+fn validate_pixcut_job_documents(
+    source: &PendingPrintJob,
+    plt: &[u8],
+    mode: &Mode,
+    canvas_size: &CanvasSize,
+) -> anyhow::Result<()> {
+    const MAX_JPEG_BYTES: usize = 1024 * 1024;
+    anyhow::ensure!(
+        source.encoded_image.len() == source.encoded_image_len,
+        "encoded JPEG length changed after job preparation"
+    );
+    anyhow::ensure!(
+        source.encoded_image.len() <= MAX_JPEG_BYTES,
+        "PixCut JPEG is {} bytes; maximum is {MAX_JPEG_BYTES}",
+        source.encoded_image.len()
+    );
+    anyhow::ensure!(
+        source.encoded_image.starts_with(&[0xff, 0xd8])
+            && source.encoded_image.ends_with(&[0xff, 0xd9]),
+        "PixCut print document is not a complete JPEG"
+    );
+    anyhow::ensure!(
+        source
+            .encoded_image
+            .windows(2)
+            .any(|marker| marker == [0xff, 0xc0])
+            && !source
+                .encoded_image
+                .windows(2)
+                .any(|marker| marker == [0xff, 0xc2]),
+        "PixCut print document must be a baseline JPEG"
+    );
+    let decoded =
+        image::load_from_memory_with_format(&source.encoded_image, image::ImageFormat::Jpeg)
+            .context("could not decode the prepared PixCut JPEG")?;
+    let expected_width = canvas_size.size.x.round() as u32;
+    let expected_height = canvas_size.size.y.round() as u32;
+    anyhow::ensure!(
+        decoded.width() == expected_width && decoded.height() == expected_height,
+        "PixCut JPEG is {}x{}; expected {expected_width}x{expected_height}",
+        decoded.width(),
+        decoded.height()
+    );
+
+    if !mode.mode_type.has_cutting() {
+        anyhow::ensure!(
+            plt.is_empty(),
+            "print-only PixCut job unexpectedly contains PLT data"
+        );
+        return Ok(());
+    }
+    let text = std::str::from_utf8(plt).context("PixCut PLT is not ASCII text")?;
+    anyhow::ensure!(
+        text.starts_with("IN VER0.1.0") && text.ends_with(" U6476,0  @ "),
+        "PixCut PLT header or terminator is invalid"
+    );
+    let mut drew = false;
+    for token in text.split_ascii_whitespace() {
+        match token {
+            "IN" | "VER0.1.0" | "@" => {}
+            _ if token.starts_with("KP") => {
+                token[2..]
+                    .parse::<u8>()
+                    .with_context(|| format!("invalid PLT pressure token {token}"))?;
+            }
+            _ if token.starts_with('U') || token.starts_with('D') => {
+                let (x, y) = token[1..]
+                    .split_once(',')
+                    .with_context(|| format!("invalid PLT coordinate token {token}"))?;
+                x.parse::<i32>()
+                    .with_context(|| format!("invalid PLT x coordinate {token}"))?;
+                y.parse::<i32>()
+                    .with_context(|| format!("invalid PLT y coordinate {token}"))?;
+                drew |= token.starts_with('D');
+            }
+            _ => anyhow::bail!("unrecognized PLT token {token}"),
+        }
+    }
+    anyhow::ensure!(drew, "PixCut PLT contains no blade-down moves");
+    Ok(())
+}
+
 fn build_calibration_print_job(
     identity: ManifestIdentity,
     method: CalibrationMethod,
@@ -7945,6 +8208,287 @@ mod ui_tests;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn job_status(state: u8, reason: Option<serde_json::Value>) -> JobStatusInfo {
+        serde_json::from_value(serde_json::json!({
+            "job-id": 17,
+            "job-state": state,
+            "job-sub-state": match state {
+                7 => 7000,
+                8 => 8000,
+                9 => 9000,
+                _ => 3000,
+            },
+            "job-state-reason": reason,
+        }))
+        .unwrap()
+    }
+
+    /// Opt-in native-USB end-to-end harness for a real PixCut. It is ignored
+    /// during normal test runs because it creates and executes a calibration
+    /// print/cut job on the first explicitly matched PixCut USB device.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-usb"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an attached PixCut and consumes one calibration sheet"]
+    async fn native_usb_flatbed_calibration_job_completes() -> anyhow::Result<()> {
+        use crate::transports::native_usb::NativeUsbTransport;
+        use anyhow::Context as _;
+        use futures::channel::mpsc as futures_mpsc;
+
+        async fn next_event(
+            events: &mut futures_mpsc::UnboundedReceiver<TransportEvent>,
+        ) -> anyhow::Result<TransportEvent> {
+            tokio::time::timeout(std::time::Duration::from_secs(30), events.next())
+                .await
+                .context("timed out waiting for native USB event")?
+                .context("native USB event stream ended")
+        }
+
+        async fn send_command(
+            transport: &mut NativeUsbTransport,
+            events: &mut futures_mpsc::UnboundedReceiver<TransportEvent>,
+            value: serde_json::Value,
+        ) -> anyhow::Result<AvocadoPacket> {
+            let id = value["id"].as_u64().context("command omitted id")? as u32;
+            let completion = transport
+                .send_packet(AvocadoPacket {
+                    version: 100,
+                    content_type: ContentType::Message,
+                    interaction_type: InteractionType::Request,
+                    encoding_type: EncodingType::Json,
+                    encryption_mode: EncryptionMode::None,
+                    terminal_id: id,
+                    msg_number: id,
+                    msg_package_total: 1,
+                    msg_package_num: 1,
+                    is_subpackage: false,
+                    data: serde_json::to_vec(&value)?,
+                })
+                .await?;
+            completion.await?;
+            loop {
+                match next_event(events).await? {
+                    TransportEvent::Packet(packet)
+                        if packet
+                            .as_json::<AvocadoId>()
+                            .is_some_and(|value| value.id == id) =>
+                    {
+                        return Ok(packet);
+                    }
+                    TransportEvent::Error(error) => return Err(error),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut transport = NativeUsbTransport::default();
+        let devices = transport.discover_devices().await?;
+        anyhow::ensure!(
+            devices.len() == 1,
+            "expected exactly one attached PixCut, found {}",
+            devices.len()
+        );
+        transport.select_device(&devices[0].id)?;
+        let (event_tx, mut events) = futures_mpsc::unbounded();
+        transport.start(event_tx).await?;
+        loop {
+            match next_event(&mut events).await? {
+                TransportEvent::TransportStatus(TransportStatus::Connected) => break,
+                TransportEvent::Error(error) => return Err(error),
+                _ => {}
+            }
+        }
+
+        send_command(
+            &mut transport,
+            &mut events,
+            serde_json::json!({
+                "id": 79_997,
+                "method": "get-prop",
+                "params": [
+                    "firmware-revision", "hardware-revision", "model", "sku",
+                    "serial-number", "media-size", "auto-off-interval"
+                ]
+            }),
+        )
+        .await?;
+        let state = send_command(
+            &mut transport,
+            &mut events,
+            serde_json::json!({
+                "id": 79_998,
+                "method": "get-prop",
+                "params": ["printer-state", "printer-sub-state", "printer-state-alerts"]
+            }),
+        )
+        .await?
+        .as_json::<AvocadoResult<(PrinterState, PrinterSubState, String)>>()
+        .context("printer returned an invalid preflight state")?
+        .result;
+        if state.0 == PrinterState::Sleep {
+            send_command(
+                &mut transport,
+                &mut events,
+                serde_json::json!({"id": 79_999, "method": "resume-printer", "params": {}}),
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        let source = build_calibration_print_job(
+            ManifestIdentity::stock("native-usb-hardware-smoke"),
+            CalibrationMethod::FlatbedScanner,
+            CalibrationJobSlot::Primary,
+            MaterialProfile::default(),
+            None,
+        )?;
+        let mode = &DEVICES[source.device_index].modes[source.mode_index];
+        let canvas_size = &mode.canvas_sizes[source.canvas_index];
+        let plt = encode_calibration_plt(
+            source
+                .calibration_phases
+                .as_deref()
+                .context("calibration job omitted cut phases")?,
+            stock_plotter_mapping(source.device_index, canvas_size),
+            source.material.passes,
+        );
+        let create_id = 80_001;
+        let create = build_device_job_command(
+            create_id,
+            &source,
+            &plt,
+            mode,
+            canvas_size,
+            JobCommandProfile::PixCutUsb,
+        );
+        let response = send_command(&mut transport, &mut events, create).await?;
+        let job_id = response
+            .as_json::<AvocadoResult<serde_json::Value>>()
+            .and_then(|value| {
+                value
+                    .result
+                    .get("job-id")
+                    .or_else(|| value.result.get("job_id"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .context("create-job response omitted numeric job-id")? as u32;
+        eprintln!(
+            "native USB calibration job {job_id}: sending {} bytes",
+            plt.len() + source.encoded_image.len()
+        );
+
+        send_command(
+            &mut transport,
+            &mut events,
+            serde_json::json!({
+                "id": 80_002,
+                "method": "get-job-info",
+                "params": { "job-id": job_id }
+            }),
+        )
+        .await?;
+
+        let payload_size = transport.max_data_size() - size_of::<u32>();
+        let mut last_heartbeat = std::time::Instant::now();
+        let mut heartbeat_id = 80_100;
+        for document in [plt.as_slice(), source.encoded_image.as_slice()] {
+            let frame_count = usize::div_ceil(document.len(), payload_size);
+            for (index, chunk) in document.chunks(payload_size).enumerate() {
+                if last_heartbeat.elapsed() >= crate::raw_usb::DATA_HEARTBEAT_INTERVAL {
+                    send_command(
+                        &mut transport,
+                        &mut events,
+                        serde_json::json!({
+                            "id": heartbeat_id,
+                            "method": "get-prop",
+                            "params": [
+                                "printer-state", "printer-sub-state", "printer-state-alerts"
+                            ]
+                        }),
+                    )
+                    .await?;
+                    heartbeat_id += 1;
+                    last_heartbeat = std::time::Instant::now();
+                }
+                let mut data = Vec::with_capacity(chunk.len() + size_of::<u32>());
+                data.extend_from_slice(&job_id.to_le_bytes());
+                data.extend_from_slice(chunk);
+                let completion = transport
+                    .send_packet(AvocadoPacket {
+                        version: 100,
+                        content_type: ContentType::Data,
+                        interaction_type: InteractionType::Request,
+                        encoding_type: EncodingType::Hexadecimal,
+                        encryption_mode: EncryptionMode::None,
+                        terminal_id: job_id,
+                        msg_number: index as u32 + 1,
+                        msg_package_total: u16::try_from(frame_count)?,
+                        msg_package_num: u16::try_from(index + 1)?,
+                        is_subpackage: frame_count > 1,
+                        data,
+                    })
+                    .await?;
+                completion.await?;
+            }
+        }
+
+        for poll in 1..=180u32 {
+            let id = 81_000 + poll;
+            let packet = send_command(
+                &mut transport,
+                &mut events,
+                serde_json::json!({
+                    "id": id,
+                    "method": "get-job-info",
+                    "params": { "job-id": job_id }
+                }),
+            )
+            .await?;
+            let value = packet
+                .as_json::<serde_json::Value>()
+                .context("get-job-info was not valid JSON")?;
+            eprintln!("native USB calibration job {job_id} poll {poll}: {value}");
+            if let Some(result) = packet.as_json::<AvocadoResult<JobStatusResult>>()
+                && let Some(info) = result.result.into_for_job(job_id)
+            {
+                match info.job_state {
+                    JobState::Completed => {
+                        transport.disconnect().await?;
+                        return Ok(());
+                    }
+                    JobState::Aborted | JobState::Cancelled => {
+                        anyhow::bail!(
+                            "native USB calibration job ended as {:?}: {:?}",
+                            info.job_state,
+                            info.job_state_reason
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        anyhow::bail!("native USB calibration job {job_id} did not complete within 180 seconds")
+    }
+
+    #[test]
+    fn device_terminal_status_distinguishes_abort_cancel_and_completion() {
+        assert_eq!(
+            device_job_terminal_disposition(&job_status(7, Some(serde_json::json!(70000)))),
+            Some(DeviceJobTerminalDisposition::Aborted(
+                "printer aborted job (reason 70000)".into()
+            ))
+        );
+        assert_eq!(
+            device_job_terminal_disposition(&job_status(8, None)),
+            Some(DeviceJobTerminalDisposition::Cancelled)
+        );
+        assert_eq!(
+            device_job_terminal_disposition(&job_status(9, None)),
+            Some(DeviceJobTerminalDisposition::Completed)
+        );
+        assert_eq!(device_job_terminal_disposition(&job_status(3, None)), None);
+    }
 
     #[test]
     fn appearance_preferences_round_trip_and_reject_unknown_versions() {
@@ -9182,6 +9726,93 @@ mod tests {
         assert_eq!(
             spec.required_capabilities,
             BTreeSet::from(["cut".into(), "print".into()])
+        );
+    }
+
+    #[test]
+    fn raw_usb_combo_job_uses_vendor_sdk_schema_and_channel() {
+        let job = build_calibration_print_job(
+            ManifestIdentity::stock("usb-command"),
+            CalibrationMethod::FlatbedScanner,
+            CalibrationJobSlot::Primary,
+            MaterialProfile::built_ins().remove(1),
+            None,
+        )
+        .unwrap();
+        let mode = &DEVICES[job.device_index].modes[job.mode_index];
+        let canvas = &mode.canvas_sizes[job.canvas_index];
+        let plot = vec![0x5a; 4321];
+        let command =
+            build_device_job_command(17, &job, &plot, mode, canvas, JobCommandProfile::PixCutUsb);
+
+        assert_eq!(command["method"], "combo-job");
+        assert_eq!(command["params"][0]["params"]["channel"], 14864);
+        assert_eq!(command["params"][0]["params"]["print-quality"], 4);
+        assert_eq!(command["params"][0]["params"]["document-format"], 9);
+        assert_eq!(command["params"][0]["params"]["timeout"], 180);
+        assert_eq!(
+            command["params"][0]["params"]["file-size"],
+            job.encoded_image_len
+        );
+        assert_eq!(command["params"][1]["params"]["file-size"], 4321);
+        assert_eq!(command["params"][1]["params"]["document-format"], 18);
+        assert_eq!(command["params"][1]["params"]["timeout"], 100);
+        assert_eq!(
+            command["params"][1]["params"]["hash-value"],
+            "26b8714aea78792854637621ad5cf1c4ed31ad1f"
+        );
+        assert!(command["params"][1]["params"].get("channel").is_none());
+
+        let print_mode = &DEVICES[job.device_index].modes[0];
+        let print_canvas = &print_mode.canvas_sizes[0];
+        let print_command = build_device_job_command(
+            18,
+            &job,
+            &[],
+            print_mode,
+            print_canvas,
+            JobCommandProfile::PixCutUsb,
+        );
+        assert_eq!(print_command["method"], "print-job");
+        assert_eq!(print_command["params"]["channel"], 14864);
+        assert_eq!(print_command["params"]["document-format"], 9);
+
+        let hannto =
+            build_device_job_command(19, &job, &plot, mode, canvas, JobCommandProfile::Hannto);
+        assert_eq!(hannto["params"][0]["params"]["channel"], 30960);
+        assert_eq!(hannto["params"][0]["params"]["document-format"], 9);
+        assert_eq!(hannto["params"][1]["params"]["document-format"], 18);
+    }
+
+    #[test]
+    fn flatbed_calibration_documents_match_validated_usb_contract() {
+        let job = build_calibration_print_job(
+            ManifestIdentity::stock("native-usb-exact-flatbed"),
+            CalibrationMethod::FlatbedScanner,
+            CalibrationJobSlot::Primary,
+            MaterialProfile::default(),
+            None,
+        )
+        .unwrap();
+        let mode = &DEVICES[job.device_index].modes[job.mode_index];
+        let canvas = &mode.canvas_sizes[job.canvas_index];
+        let plt = encode_calibration_plt(
+            job.calibration_phases.as_deref().unwrap(),
+            stock_plotter_mapping(job.device_index, canvas),
+            job.material.passes,
+        );
+
+        validate_pixcut_job_documents(&job, &plt, mode, canvas).unwrap();
+        assert_eq!((job.encoded_image.len(), plt.len()), (518_272, 11_996));
+        assert_eq!(
+            job.image_hash,
+            hex::encode(sha1::Sha1::digest(&job.encoded_image))
+        );
+        let command =
+            build_device_job_command(23, &job, &plt, mode, canvas, JobCommandProfile::PixCutUsb);
+        assert_eq!(
+            command["params"][1]["params"]["hash-value"],
+            "26b8714aea78792854637621ad5cf1c4ed31ad1f"
         );
     }
 
