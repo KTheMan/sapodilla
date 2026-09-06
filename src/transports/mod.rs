@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use egui::ahash::HashMap;
 use enum_dispatch::enum_dispatch;
@@ -14,6 +14,7 @@ use futures::{
 use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::protocol::*;
+use crate::raw_usb::DATA_HEARTBEAT_INTERVAL;
 
 use crate::transports::mock::MockTransport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-ble"))]
@@ -24,6 +25,8 @@ use crate::transports::native_serial::NativeSerialTransport;
 use crate::transports::native_usb::NativeUsbTransport;
 #[cfg(target_arch = "wasm32")]
 use crate::transports::web_serial::WebSerialTransport;
+#[cfg(target_arch = "wasm32")]
+use crate::transports::web_usb::WebUsbTransport;
 use crate::{Rc, interval, spawn};
 
 pub mod framing;
@@ -36,6 +39,8 @@ pub mod native_serial;
 pub mod native_usb;
 #[cfg(target_arch = "wasm32")]
 pub mod web_serial;
+#[cfg(target_arch = "wasm32")]
+pub mod web_usb;
 
 /// Static message ID to ensure we never reuse an ID, even across different
 /// transport instances. Generally accessed through
@@ -47,6 +52,8 @@ pub const MAX_DATA_SIZE: usize = 896;
 /// Maximum time to wait for a command response after its bytes have been
 /// accepted by the transport.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_JOB_POLLS: usize = 15 * 60;
+const MAX_MISSING_JOB_POLLS: usize = 30;
 
 /// A transport for sending packet data.
 ///
@@ -64,6 +71,8 @@ pub enum Transport {
     NativeSerialTransport,
     #[cfg(target_arch = "wasm32")]
     WebSerialTransport,
+    #[cfg(target_arch = "wasm32")]
+    WebUsbTransport,
     MockTransport,
 }
 
@@ -106,6 +115,13 @@ pub enum TransportStatus {
     Disconnected,
 }
 
+/// Job-command schema expected by a transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCommandProfile {
+    Hannto,
+    PixCutUsb,
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[enum_dispatch]
@@ -117,6 +133,10 @@ pub trait TransportControl {
     /// Maximum encoded Hannto body size accepted efficiently by this link.
     fn max_data_size(&self) -> usize {
         MAX_DATA_SIZE
+    }
+
+    fn job_command_profile(&self) -> JobCommandProfile {
+        JobCommandProfile::Hannto
     }
 
     #[allow(dead_code)]
@@ -278,6 +298,11 @@ impl TransportManager {
                             let _ = ready_tx.send(());
                         }
                     }
+                    TransportEvent::TransportStatus(TransportStatus::Disconnected) => {
+                        if ready_tx.take().is_some() {
+                            debug!("transport disconnected before becoming ready");
+                        }
+                    }
                     _ => trace!("got other event: {event:?}"),
                 }
 
@@ -287,10 +312,18 @@ impl TransportManager {
 
         spawn(async move {
             let mut transport = transport.lock().await;
-            if let Err(err) = transport.start(event_tx.clone()).await
-                && let Err(err) = event_tx.send(TransportEvent::Error(err)).await
-            {
-                error!("could not send transport start error: {err}");
+            if let Err(err) = transport.start(event_tx.clone()).await {
+                if let Err(send_err) = event_tx.send(TransportEvent::Error(err)).await {
+                    error!("could not send transport start error: {send_err}");
+                }
+                if let Err(send_err) = event_tx
+                    .send(TransportEvent::TransportStatus(
+                        TransportStatus::Disconnected,
+                    ))
+                    .await
+                {
+                    error!("could not send transport disconnected status: {send_err}");
+                }
             }
         });
 
@@ -322,6 +355,116 @@ impl TransportManager {
         let id = MESSAGE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         trace!(id, "generated next message id");
         id
+    }
+
+    pub async fn job_command_profile(&self) -> JobCommandProfile {
+        self.transport.lock().await.job_command_profile()
+    }
+
+    async fn request_json(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<AvocadoPacket> {
+        let id = self.next_message_id();
+        self.wait_for_response(AvocadoPacket {
+            version: 100,
+            content_type: ContentType::Message,
+            interaction_type: InteractionType::Request,
+            encoding_type: EncodingType::Json,
+            encryption_mode: EncryptionMode::None,
+            terminal_id: id,
+            msg_number: id,
+            msg_package_total: 1,
+            msg_package_num: 1,
+            is_subpackage: false,
+            data: serde_json::to_vec(&serde_json::json!({
+                "id": id,
+                "method": method,
+                "params": params,
+            }))?,
+        })
+        .await
+    }
+
+    /// Warm up the PixCut USB command channel and wake a sleeping printer
+    /// before declaring a job. Device-reported paper labels are intentionally
+    /// not used here: they are static firmware metadata, not a media sensor.
+    pub async fn prepare_pixcut_usb_job(&self) -> anyhow::Result<()> {
+        self.request_json(
+            "get-prop",
+            serde_json::json!([
+                "firmware-revision",
+                "hardware-revision",
+                "model",
+                "sku",
+                "serial-number",
+                "media-size",
+                "auto-off-interval"
+            ]),
+        )
+        .await
+        .context("PixCut USB identity preflight failed")?;
+
+        let mut state = self.pixcut_usb_state().await?;
+        if state.0 == PrinterState::Sleep {
+            self.request_json("resume-printer", serde_json::json!({}))
+                .await
+                .context("could not wake sleeping PixCut")?;
+        }
+
+        for _ in 0..20 {
+            match state.0 {
+                PrinterState::Idle => return Ok(()),
+                PrinterState::Error | PrinterState::Off => {
+                    bail!(
+                        "PixCut is not ready ({:?} / {:?}): {}",
+                        state.0,
+                        state.1,
+                        describe_pixcut_alerts(&state.2)
+                    )
+                }
+                PrinterState::Processing => {
+                    bail!("PixCut is busy ({:?} / {:?})", state.0, state.1)
+                }
+                PrinterState::Sleep | PrinterState::Initializing => {}
+            }
+            delay(Duration::from_millis(250)).await;
+            state = self.pixcut_usb_state().await?;
+        }
+        bail!(
+            "PixCut did not become idle before job submission ({:?} / {:?})",
+            state.0,
+            state.1
+        )
+    }
+
+    async fn pixcut_usb_state(&self) -> anyhow::Result<(PrinterState, PrinterSubState, String)> {
+        self.request_json(
+            "get-prop",
+            serde_json::json!(["printer-state", "printer-sub-state", "printer-state-alerts"]),
+        )
+        .await?
+        .as_json::<AvocadoResult<(PrinterState, PrinterSubState, String)>>()
+        .map(|result| result.result)
+        .context("printer returned an invalid PixCut state response")
+    }
+
+    /// Fetch job status immediately after creation so the command/data phases
+    /// match the sequencing used by working USB clients.
+    pub async fn prime_pixcut_usb_job(&self, job_id: u32) -> anyhow::Result<()> {
+        let packet = self
+            .request_json("get-job-info", serde_json::json!({ "job-id": job_id }))
+            .await
+            .context("initial PixCut job-status request failed")?;
+        if packet
+            .as_json::<AvocadoResult<JobStatusResult>>()
+            .and_then(|result| result.result.into_for_job(job_id))
+            .is_none()
+        {
+            bail!("printer returned an invalid initial status for job {job_id}");
+        }
+        Ok(())
     }
 
     /// Send a packet and wait for the resulting packet.
@@ -369,6 +512,8 @@ impl TransportManager {
     #[instrument(skip(self))]
     pub async fn poll_job(&self, job_id: u32) -> anyhow::Result<()> {
         let mut event_tx = self.event_tx.clone();
+        let mut poll_count = 0usize;
+        let mut missing_count = 0usize;
 
         let mut stream = interval(Duration::from_secs(1));
         while stream.next().await.is_some() {
@@ -376,6 +521,9 @@ impl TransportManager {
                 warn!("event sender was closed, ending job status stream");
                 break;
             }
+
+            poll_count += 1;
+            validate_job_poll_budget(job_id, poll_count, missing_count)?;
 
             let id = self.next_message_id();
             let packet = AvocadoPacket {
@@ -405,15 +553,25 @@ impl TransportManager {
                     return Err(err);
                 }
             };
-            trace!(?packet, "got get-job-info response");
+            trace!(job_id, "got get-job-info response");
 
             if let Some(result) = packet.as_json::<AvocadoResult<JobStatusResult>>() {
-                debug!("got get-job-info info: {:?}", result.result);
-
                 let Some(info) = result.result.into_for_job(job_id) else {
                     warn!("result was missing job info");
+                    missing_count += 1;
+                    validate_job_poll_budget(job_id, poll_count, missing_count)?;
                     continue;
                 };
+                missing_count = 0;
+                debug!(
+                    job_id = info.job_id,
+                    state = ?info.job_state,
+                    sub_state = ?info.job_sub_state,
+                    reason = ?info.job_state_reason,
+                    transfer_status = ?info.transfer_status,
+                    transfer_size = ?info.transfer_size,
+                    "got get-job-info status"
+                );
 
                 let is_complete = matches!(
                     info.job_state,
@@ -430,65 +588,179 @@ impl TransportManager {
                     break;
                 }
             } else {
-                let value = packet.as_json::<serde_json::Value>();
-                error!("could not decode job status: {packet:?}, {value:?}");
-                bail!("printer returned an invalid get-job-info response: {value:?}");
+                if let Some(error_code) = packet
+                    .as_json::<serde_json::Value>()
+                    .as_ref()
+                    .and_then(find_device_error_code)
+                {
+                    bail!(
+                        "printer rejected get-job-info for job {job_id} with error code {error_code}"
+                    );
+                }
+                warn!(
+                    job_id,
+                    response_bytes = packet.data.len(),
+                    "ignoring one undecodable job status response"
+                );
+                // Job-info telemetry is firmware-dependent and can be partial
+                // immediately after upload. Treat one undecodable response the
+                // same as a temporarily missing job, while retaining the
+                // existing consecutive-miss and total-duration limits.
+                missing_count += 1;
+                validate_job_poll_budget(job_id, poll_count, missing_count)?;
+                continue;
             }
         }
 
         Ok(())
     }
 
-    /// Send binary data to the device for a given job.
+    /// Send one or more binary documents to the device for a given job.
     ///
-    /// Will return an error if data is already being sent.
-    #[instrument(skip(self, data, f))]
-    pub async fn send_data<F>(&self, job_id: u32, data: &[u8], f: F) -> anyhow::Result<()>
+    /// Each document restarts its chunk sequence. PixCut combo jobs depend on
+    /// the PLT and JPEG remaining separate streams even though both use the
+    /// same job id. USB uploads also receive a command-channel heartbeat while
+    /// the background status poller is suppressed.
+    #[instrument(skip(self, documents, f))]
+    pub async fn send_data_streams<F>(
+        &self,
+        job_id: u32,
+        documents: &[&[u8]],
+        f: F,
+    ) -> anyhow::Result<()>
     where
         F: Fn(usize, usize),
     {
         let Some(_guard) = SendingDropGuard::new(self.sending.clone()) else {
             bail!("cannot start sending data while other send is in progress");
         };
-
         let max_data_size = self.transport.lock().await.max_data_size().max(5);
-        let count = usize::div_ceil(data.len(), max_data_size - 4);
-        debug!(chunks = count, "sending data with {} bytes", data.len());
+        let payload_size = max_data_size - size_of::<u32>();
+        let total = documents
+            .iter()
+            .map(|data| usize::div_ceil(data.len(), payload_size))
+            .sum();
+        debug!(
+            documents = documents.len(),
+            chunks = total,
+            "sending job data"
+        );
+        let usb_profile = self.job_command_profile().await == JobCommandProfile::PixCutUsb;
+        let mut sent = 0usize;
+        let mut last_heartbeat = Instant::now();
 
-        for (index, chunk) in data.chunks(max_data_size - 4).enumerate() {
-            let mut buf: Vec<u8> = Vec::with_capacity(max_data_size);
-            buf.extend(&job_id.to_le_bytes());
-            buf.extend_from_slice(chunk);
+        for (document_index, data) in documents.iter().enumerate() {
+            let count = usize::div_ceil(data.len(), payload_size);
+            let package_total =
+                u16::try_from(count).context("document requires too many transport data chunks")?;
+            for (index, chunk) in data.chunks(payload_size).enumerate() {
+                if usb_profile && last_heartbeat.elapsed() >= DATA_HEARTBEAT_INTERVAL {
+                    self.pixcut_usb_state()
+                        .await
+                        .context("PixCut upload heartbeat failed")?;
+                    last_heartbeat = Instant::now();
+                }
 
-            let id = self.next_message_id();
-            let packet = AvocadoPacket {
-                version: 100,
-                content_type: ContentType::Data,
-                interaction_type: InteractionType::Request,
-                encoding_type: EncodingType::Hexadecimal,
-                encryption_mode: EncryptionMode::None,
-                terminal_id: id,
-                msg_number: id,
-                msg_package_total: u16::try_from(count).unwrap(),
-                msg_package_num: u16::try_from(index + 1).unwrap(),
-                is_subpackage: count > 1,
-                data: buf,
-            };
-            trace!(index, ?packet, "sending data packet");
-
-            // Make sure we're waiting for the internal write to happen before
-            // we attempt to write the next packet in this package.
-            self.transport
-                .lock()
-                .await
-                .send_packet(packet)
-                .await?
-                .await?;
-
-            f(count, index + 1);
+                let mut buf: Vec<u8> = Vec::with_capacity(max_data_size);
+                buf.extend(&job_id.to_le_bytes());
+                buf.extend_from_slice(chunk);
+                let id = self.next_message_id();
+                let packet = AvocadoPacket {
+                    version: 100,
+                    content_type: ContentType::Data,
+                    interaction_type: InteractionType::Request,
+                    encoding_type: EncodingType::Hexadecimal,
+                    encryption_mode: EncryptionMode::None,
+                    terminal_id: id,
+                    msg_number: id,
+                    msg_package_total: package_total,
+                    msg_package_num: u16::try_from(index + 1)
+                        .context("transport data chunk index overflowed")?,
+                    is_subpackage: count > 1,
+                    data: buf,
+                };
+                trace!(
+                    job_id,
+                    document = document_index + 1,
+                    frame = index + 1,
+                    frames = count,
+                    payload_bytes = chunk.len(),
+                    "sending data packet"
+                );
+                self.transport
+                    .lock()
+                    .await
+                    .send_packet(packet)
+                    .await?
+                    .await?;
+                sent += 1;
+                f(total, sent);
+            }
         }
 
         Ok(())
+    }
+}
+
+fn describe_pixcut_alerts(alerts: &str) -> Cow<'_, str> {
+    if alerts
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|code| code == "5414")
+    {
+        Cow::Borrowed(
+            "paper feed/length fault (5414); check sheet orientation and feed path, then power-cycle the printer",
+        )
+    } else {
+        Cow::Borrowed(alerts)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn delay(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delay(duration: Duration) {
+    gloo_timers::future::TimeoutFuture::new(
+        u32::try_from(duration.as_millis()).unwrap_or(u32::MAX),
+    )
+    .await;
+}
+
+fn validate_job_poll_budget(
+    job_id: u32,
+    poll_count: usize,
+    missing_count: usize,
+) -> anyhow::Result<()> {
+    if poll_count > MAX_JOB_POLLS {
+        bail!("job {job_id} did not reach a terminal state within 15 minutes");
+    }
+    if missing_count >= MAX_MISSING_JOB_POLLS {
+        bail!(
+            "printer returned no usable status for job {job_id} in {MAX_MISSING_JOB_POLLS} consecutive responses"
+        );
+    }
+    Ok(())
+}
+
+fn find_device_error_code(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["error-code", "error_code"] {
+                if let Some(value) = object.get(key) {
+                    let code = value
+                        .as_i64()
+                        .or_else(|| value.as_str().and_then(|value| value.parse().ok()));
+                    if code.is_some_and(|code| code != 0) {
+                        return code;
+                    }
+                }
+            }
+            object.values().find_map(find_device_error_code)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_device_error_code),
+        _ => None,
     }
 }
 
@@ -549,6 +821,7 @@ impl Drop for SendingDropGuard {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn request(id: u32) -> AvocadoPacket {
         AvocadoPacket {
@@ -585,5 +858,79 @@ mod tests {
 
         assert!(error.to_string().contains("timed out"));
         assert!(manager.pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn job_poll_budget_bounds_missing_and_nonterminal_statuses() {
+        validate_job_poll_budget(7, MAX_JOB_POLLS, 0).unwrap();
+        assert!(validate_job_poll_budget(7, MAX_JOB_POLLS + 1, 0).is_err());
+        validate_job_poll_budget(7, 1, MAX_MISSING_JOB_POLLS - 1).unwrap();
+        assert!(validate_job_poll_budget(7, 1, MAX_MISSING_JOB_POLLS).is_err());
+    }
+
+    #[test]
+    fn explicit_device_error_codes_are_found_without_treating_zero_as_failure() {
+        assert_eq!(
+            find_device_error_code(&serde_json::json!({
+                "result": [{"error-code": "8001"}]
+            })),
+            Some(8001)
+        );
+        assert_eq!(
+            find_device_error_code(&serde_json::json!({
+                "error-code": 0,
+                "result": {"error_code": 0}
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn known_feed_fault_has_an_actionable_description() {
+        assert_eq!(
+            describe_pixcut_alerts("::5414"),
+            "paper feed/length fault (5414); check sheet orientation and feed path, then power-cycle the printer"
+        );
+        assert_eq!(describe_pixcut_alerts("::0"), "::0");
+    }
+
+    #[tokio::test]
+    async fn disconnect_before_ready_does_not_retain_manager() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let event_disconnected = disconnected.clone();
+        let manager = TransportManager::new(
+            Rc::new(Mutex::new(Transport::MockTransport(
+                MockTransport::default(),
+            ))),
+            move |event| {
+                if matches!(
+                    event,
+                    TransportEvent::TransportStatus(TransportStatus::Disconnected)
+                ) {
+                    event_disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        );
+        let weak = Arc::downgrade(&manager);
+
+        for _ in 0..100 {
+            if disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "mock transport should disconnect before ready"
+        );
+        drop(manager);
+
+        for _ in 0..20 {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pre-ready disconnect retained the transport manager");
     }
 }
