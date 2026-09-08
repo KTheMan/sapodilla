@@ -49,6 +49,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 svgtypes = "0.15.3"
 thiserror = "2.0.18"
 tracing = "0.1"
+web-time = "1.1.0"
 web-sys = { version = "0.3", features = [
     "Serial",
     "SerialPort",
@@ -56,7 +57,9 @@ web-sys = { version = "0.3", features = [
     "SerialOptions",
     "ReadableStream",
     "ReadableStreamDefaultReader",
+    "Navigator",
     "Performance",
+    "StorageManager",
     "WritableStream",
     "WritableStreamDefaultWriter",
     "Window",
@@ -88,7 +91,9 @@ uuid = { version = "1.18.1", features = ["v4"] }
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.2.17", features = ["js"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+js-sys = "0.3"
 uuid = { version = "1.18.1", features = ["v4", "js"] }
+wasm-bindgen = "0.2"
 wasm_thread = { version = "0.3.3", optional = true }
 wasm-bindgen-futures = "0.4.50"
 wasm-tracing = "2.1.0"

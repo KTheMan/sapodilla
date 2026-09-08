@@ -4066,6 +4066,7 @@ dependencies = [
  "image",
  "imageproc",
  "itertools",
+ "js-sys",
  "lazy_static",
  "nusb",
  "oneshot",
@@ -4087,10 +4088,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-tracing",
  "wasm_thread",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]
