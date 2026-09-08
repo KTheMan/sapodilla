@@ -87,6 +87,20 @@ impl WizardStep {
             Self::Finish => "Finish",
         }
     }
+
+    /// Label for steps whose optional input can be bypassed without weakening
+    /// the workflow's print, evidence, or validation gates.
+    pub const fn skip_label(self) -> Option<&'static str> {
+        match self {
+            Self::Prepare => Some("Skip preparation walkthrough"),
+            Self::PrintCalibration => Some("Use existing printed sheet"),
+            Self::PrintArea => Some("Skip print-area measurements"),
+            Self::PrintScale | Self::SecondPrintScale => Some("Assume 1:1 print scale"),
+            Self::SecondSheetChoice => Some("Skip the second sheet"),
+            Self::SecondManualTargets => Some("Abandon the second sheet"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +111,14 @@ pub enum JobStatus {
     Queued,
     InProgress,
     Completed,
+    ExistingSheet,
     Failed,
+}
+
+impl JobStatus {
+    pub const fn has_physical_output(self) -> bool {
+        matches!(self, Self::Completed | Self::ExistingSheet)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -888,6 +909,54 @@ impl CalibrationWizard {
         Ok(next)
     }
 
+    /// Bypass the current optional step and advance in one operation.
+    ///
+    /// Required physical-job, evidence, fitting, and validation steps are not
+    /// skippable. This records the same explicit fallback values exposed by
+    /// each optional step's in-page controls before using the normal guarded
+    /// transition, so history and resume behavior remain consistent.
+    pub fn skip_current_step(&mut self, now: u64) -> Result<WizardStep, WizardError> {
+        self.ensure_active()?;
+        match self.step {
+            WizardStep::Prepare => {
+                // Preparation is guidance rather than calibration evidence.
+                // Skipping it deliberately accepts the checklist defaults so
+                // the normal guarded transition can remain the single path.
+                self.confirm_prepared(true, now);
+            }
+            WizardStep::PrintCalibration => {
+                if matches!(self.primary_job, JobStatus::Queued | JobStatus::InProgress) {
+                    return Err(WizardError::TransitionBlocked(
+                        "wait for or cancel the active calibration job before using another sheet"
+                            .into(),
+                    ));
+                }
+                self.set_job_status(JobSlot::Primary, JobStatus::ExistingSheet, now);
+            }
+            WizardStep::PrintArea => {
+                self.mark_print_area_reviewed([None; 4], now)?;
+            }
+            WizardStep::PrintScale => {
+                self.set_print_scale(ManualSheetSlot::Primary, None, now)?;
+            }
+            WizardStep::SecondSheetChoice => {
+                self.choose_second_sheet(SecondSheetChoice::ContinueWithOneSheet, now);
+            }
+            WizardStep::SecondPrintScale => {
+                self.set_print_scale(ManualSheetSlot::Second, None, now)?;
+            }
+            WizardStep::SecondManualTargets => {
+                self.continue_with_one_sheet(now);
+            }
+            _ => {
+                return Err(WizardError::TransitionBlocked(
+                    "this required calibration step cannot be skipped".into(),
+                ));
+            }
+        }
+        self.next(now)
+    }
+
     pub fn back(&mut self, now: u64) -> Result<WizardStep, WizardError> {
         self.ensure_active()?;
         let previous = self.history.pop().ok_or(WizardError::NoPreviousStep)?;
@@ -935,7 +1004,7 @@ impl CalibrationWizard {
                 }
             }
             WizardStep::PrintCalibration => {
-                if self.primary_job != JobStatus::Completed {
+                if !self.primary_job.has_physical_output() {
                     return blocked("the calibration job has not completed");
                 }
                 match method {
@@ -1532,8 +1601,10 @@ mod tests {
         assert!(!wizard.second_sheet_merge_eligible());
         assert!(wizard.next(20).is_err());
         let mut fallback = wizard.clone();
-        fallback.continue_with_one_sheet(21);
-        assert_eq!(fallback.next(22).unwrap(), WizardStep::Candidate);
+        assert_eq!(
+            fallback.skip_current_step(22).unwrap(),
+            WizardStep::Candidate
+        );
         assert_eq!(fallback.training_observations().len(), 6);
         wizard
             .set_manual_target(ManualSheetSlot::Second, "C6", complete_edges(), false, 23)
@@ -1541,6 +1612,82 @@ mod tests {
         assert!(wizard.second_sheet_merge_eligible());
         assert_eq!(wizard.next(24).unwrap(), WizardStep::Candidate);
         assert_eq!(wizard.training_observations().len(), 12);
+    }
+
+    #[test]
+    fn skip_advances_only_optional_steps_and_preserves_history_and_resume() {
+        let mut wizard = CalibrationWizard::new("manual-skip", 0).unwrap();
+        assert_eq!(
+            wizard.skip_current_step(1),
+            Err(WizardError::TransitionBlocked(
+                "this required calibration step cannot be skipped".into()
+            ))
+        );
+        assert!(wizard.history.is_empty());
+
+        wizard
+            .select_method(CalibrationMethod::ManualEastBay, 2)
+            .unwrap();
+        assert_eq!(wizard.next(3).unwrap(), WizardStep::Prepare);
+        assert_eq!(
+            wizard.skip_current_step(4).unwrap(),
+            WizardStep::PrintCalibration
+        );
+        assert!(wizard.prepared);
+
+        assert_eq!(wizard.skip_current_step(5).unwrap(), WizardStep::PrintArea);
+        assert_eq!(wizard.primary_job, JobStatus::ExistingSheet);
+        assert_eq!(wizard.skip_current_step(7).unwrap(), WizardStep::PrintScale);
+        assert!(wizard.print_area_reviewed);
+        assert_eq!(wizard.printability_insets_mm, [None; 4]);
+        assert_eq!(wizard.history.last(), Some(&WizardStep::PrintArea));
+
+        assert_eq!(
+            wizard.skip_current_step(8).unwrap(),
+            WizardStep::ManualTargets
+        );
+        assert_eq!(
+            wizard.manual_primary.print_scale.state,
+            OptionalMeasurementState::Skipped
+        );
+        for id in MANUAL_PRIMARY_IDS.iter().take(4) {
+            wizard
+                .set_manual_target(ManualSheetSlot::Primary, id, complete_edges(), false, 9)
+                .unwrap();
+        }
+        assert_eq!(wizard.next(10).unwrap(), WizardStep::SecondSheetChoice);
+        assert_eq!(wizard.skip_current_step(11).unwrap(), WizardStep::Candidate);
+        assert_eq!(
+            wizard.second_sheet_choice,
+            Some(SecondSheetChoice::ContinueWithOneSheet)
+        );
+        assert_eq!(wizard.candidate, CandidateStatus::Computing);
+
+        let json = wizard.save_json(12).unwrap();
+        let resumed = CalibrationWizard::resume_json(&json).unwrap();
+        assert_eq!(resumed.step, WizardStep::Candidate);
+        assert_eq!(resumed.history, wizard.history);
+    }
+
+    #[test]
+    fn existing_primary_sheet_enters_the_flatbed_center_removal_flow() {
+        let mut wizard = CalibrationWizard::new("flatbed-existing", 0).unwrap();
+        wizard
+            .select_method(CalibrationMethod::FlatbedScanner, 1)
+            .unwrap();
+        wizard.next(2).unwrap();
+        wizard.skip_current_step(3).unwrap();
+        assert_eq!(wizard.step, WizardStep::PrintCalibration);
+        wizard.set_job_status(JobSlot::Primary, JobStatus::Queued, 4);
+        assert!(wizard.skip_current_step(5).is_err());
+        assert_eq!(wizard.step, WizardStep::PrintCalibration);
+        assert_eq!(wizard.primary_job, JobStatus::Queued);
+        wizard.set_job_status(JobSlot::Primary, JobStatus::Failed, 6);
+        assert_eq!(
+            wizard.skip_current_step(7).unwrap(),
+            WizardStep::RemoveCenters
+        );
+        assert_eq!(wizard.primary_job, JobStatus::ExistingSheet);
     }
 
     #[test]

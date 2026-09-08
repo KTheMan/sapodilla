@@ -2,5 +2,20 @@
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Opener-Policy: same-origin
 
-/dist/*
+/*.js
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.wasm
   Cache-Control: public, max-age=31556952, immutable
+
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/coi-serviceworker.js
+  Cache-Control: no-cache
+
+/manifest.webmanifest
+  Cache-Control: no-cache

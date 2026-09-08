@@ -19,11 +19,18 @@ use crate::calibration::{
 };
 
 const WIDE_LAYOUT_MIN_POINTS: f32 = 680.0;
+const CALIBRATION_WINDOW_MAX_HEIGHT: f32 = 760.0;
+const CALIBRATION_WINDOW_MARGIN: f32 = 24.0;
+// Title bar, header, separators, and wrapped footer controls live outside the
+// scrolling body. Reserving them from the viewport-derived window cap keeps
+// navigation reachable even during egui's first sizing pass.
+const CALIBRATION_NON_BODY_HEIGHT: f32 = 340.0;
 
 /// Work that must be performed by the application hosting the walkthrough.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibrationUiEvent {
     PrintPrimary,
+    UseExistingPrimarySheet,
     PrintSecond,
     PrintValidation,
     ImportTrainingScan,
@@ -44,6 +51,7 @@ pub struct CalibrationUiState {
     pub selected_printer: String,
     pub selected_media: String,
     confirm_discard: bool,
+    fullscreen_scan: Option<ScanSlot>,
     text_fields: BTreeMap<String, String>,
 }
 
@@ -55,6 +63,7 @@ impl Default for CalibrationUiState {
             selected_printer: String::new(),
             selected_media: String::new(),
             confirm_discard: false,
+            fullscreen_scan: None,
             text_fields: BTreeMap::new(),
         }
     }
@@ -83,33 +92,52 @@ pub fn show_calibration_wizard(
     diagnostics: CalibrationUiDiagnostics<'_>,
 ) -> Vec<CalibrationUiEvent> {
     if !state.open {
+        state.fullscreen_scan = None;
         return Vec::new();
     }
-    if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-        state.confirm_discard = true;
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if state.fullscreen_scan.take().is_some() {
+            // Close only the evidence viewer.
+        } else {
+            state.confirm_discard = !state.confirm_discard;
+        }
     }
 
     let mut events = Vec::new();
     let mut window_open = state.open;
+    let (window_min_height, window_max_height) =
+        calibration_window_height_limits(ctx.content_rect().height());
     egui::Window::new("Print-to-cut calibration")
         .id(egui::Id::new("print_to_cut_calibration_wizard"))
         .open(&mut window_open)
         .collapsible(false)
+        .constrain_to(ctx.content_rect())
         .resizable(true)
         .default_width(780.0)
         .min_width(340.0)
-        .min_height(460.0)
+        .min_height(window_min_height)
+        .max_height(window_max_height)
         .show(ctx, |ui| {
+            if state.confirm_discard || state.fullscreen_scan.is_some() {
+                ui.disable();
+            }
             render_header(ui, wizard);
             ui.separator();
 
-            let body_height = (ui.available_height() - 76.0).max(260.0);
+            // Keep the navigation controls visible; step content and the rail
+            // independently scroll within whatever height the viewport leaves.
+            let body_height = (window_max_height - CALIBRATION_NON_BODY_HEIGHT).max(0.0);
             if ui.available_width() >= WIDE_LAYOUT_MIN_POINTS {
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(176.0, body_height),
                         egui::Layout::top_down(egui::Align::Min),
-                        |ui| render_step_rail(ui, wizard),
+                        |ui| {
+                            ScrollArea::vertical()
+                                .id_salt("calibration_step_rail")
+                                .max_height(body_height)
+                                .show(ui, |ui| render_step_rail(ui, wizard));
+                        },
                     );
                     ui.separator();
                     ui.allocate_ui_with_layout(
@@ -118,6 +146,7 @@ pub fn show_calibration_wizard(
                         |ui| {
                             ScrollArea::vertical()
                                 .id_salt("calibration_step_body_wide")
+                                .max_height(body_height)
                                 .show(ui, |ui| {
                                     render_step(
                                         ui,
@@ -155,8 +184,8 @@ pub fn show_calibration_wizard(
             render_footer(ui, wizard, state, now, &mut events);
         });
 
-    // Closing with the title-bar button behaves like Save & Exit; the host
-    // decides where and how the durable JSON is stored.
+    // Save/Discard buttons close explicitly. The title-bar button enters the
+    // same leave-confirmation flow as Escape rather than choosing for users.
     let explicitly_closed = events.iter().any(|event| {
         matches!(
             event,
@@ -166,10 +195,19 @@ pub fn show_calibration_wizard(
     if explicitly_closed {
         state.open = false;
     } else if state.open && !window_open {
-        state.open = false;
-        events.push(CalibrationUiEvent::SaveAndExit);
+        // The title-bar close button follows the same explicit leave flow as
+        // Escape and Discard instead of silently choosing Save & Exit.
+        state.confirm_discard = true;
+        state.open = true;
     } else {
         state.open = window_open;
+    }
+    if state.open && state.confirm_discard {
+        render_discard_confirmation(ctx, wizard, state, now, &mut events);
+    } else if state.open {
+        render_fullscreen_scan(ctx, wizard, state, diagnostics);
+    } else {
+        state.fullscreen_scan = None;
     }
     events
 }
@@ -252,11 +290,13 @@ fn render_step(
         WizardStep::ReviewScan => render_scan_review(
             ui,
             wizard,
+            state,
             false,
             now,
             diagnostics.training_scan,
-            diagnostics.training_scan_preview_png,
-            diagnostics.training_scan_preview_sha1,
+            diagnostics
+                .training_scan_preview_png
+                .zip(diagnostics.training_scan_preview_sha1),
         ),
         WizardStep::PrintArea => render_print_area(ui, wizard, state, now),
         WizardStep::PrintScale => {
@@ -533,12 +573,15 @@ fn render_print_job(
     };
     ui.heading(heading);
     ui.label("Keep scaling at 100% / Actual size and use the production print-and-cut settings.");
+    if slot == JobSlot::Primary && wizard.method == Some(CalibrationMethod::FlatbedScanner) {
+        ui.weak("You can reuse an earlier flatbed calibration sheet when it has the same 12-aperture target layout. Validation sheets are not interchangeable.");
+    }
     ui.add_space(8.0);
     ui.label(format!("Job status: {}", job_status_label(status)));
     if ui
         .add_enabled(
             !matches!(status, JobStatus::Queued | JobStatus::InProgress),
-            egui::Button::new(if status == JobStatus::Completed {
+            egui::Button::new(if status.has_physical_output() {
                 "Print again"
             } else {
                 "Print and cut"
@@ -550,7 +593,7 @@ fn render_print_job(
         clear_slot_text_fields(state, slot);
         events.push(event);
     }
-    if status != JobStatus::Completed {
+    if !status.has_physical_output() {
         ui.weak("Next becomes available after the host reports that the job completed.");
     }
     if status == JobStatus::Failed {
@@ -661,11 +704,11 @@ fn render_scan_status(ui: &mut Ui, status: &ScanImportStatus, validation: bool) 
 fn render_scan_review(
     ui: &mut Ui,
     wizard: &mut CalibrationWizard,
+    state: &mut CalibrationUiState,
     validation: bool,
     now: u64,
     report: Option<&ScanAnalysisReport>,
-    preview_png: Option<&Arc<[u8]>>,
-    preview_sha1: Option<&str>,
+    preview: Option<(&Arc<[u8]>, &str)>,
 ) {
     let (status, mut reviewed) = if validation {
         (&wizard.validation_scan, wizard.validation_scan_reviewed)
@@ -684,8 +727,16 @@ fn render_scan_review(
             report.backing_rgb[1],
             report.backing_rgb[2]
         ));
-        if let (Some(preview_png), Some(preview_sha1)) = (preview_png, preview_sha1) {
-            render_scan_overlay(ui, report, preview_png, preview_sha1, validation, wizard);
+        if let Some((preview_png, preview_sha1)) = preview {
+            render_scan_overlay(
+                ui,
+                report,
+                preview_png,
+                preview_sha1,
+                validation,
+                wizard,
+                state,
+            );
         } else {
             ui.colored_label(
                 Color32::YELLOW,
@@ -769,7 +820,7 @@ fn render_scan_review(
     }
     if ui
         .add_enabled(
-            coverage_issue.is_none() && preview_png.is_some() && preview_sha1.is_some(),
+            coverage_issue.is_none() && preview.is_some(),
             egui::Checkbox::new(&mut reviewed, "The overlay follows the physical cut edges"),
         )
         .changed()
@@ -786,25 +837,89 @@ fn render_scan_overlay(
     preview_sha1: &str,
     validation: bool,
     wizard: &CalibrationWizard,
+    state: &mut CalibrationUiState,
 ) {
     let [source_width, source_height] = report.scan_dimensions_px;
     if source_width == 0 || source_height == 0 {
         return;
     }
-    let width = ui.available_width().clamp(240.0, 720.0);
-    let height = (width * source_height as f32 / source_width as f32).min(480.0);
+    let maximum = egui::vec2(ui.available_width().clamp(1.0, 720.0), 480.0);
+    let size = fitted_evidence_size(source_width, source_height, maximum);
+    let slot = if validation {
+        ScanSlot::Validation
+    } else {
+        ScanSlot::Training
+    };
+    let response = render_scan_overlay_image(
+        ui,
+        report,
+        preview_png,
+        preview_sha1,
+        validation,
+        wizard,
+        size,
+        true,
+    );
+    if response.clicked() {
+        state.fullscreen_scan = Some(slot);
+    }
+    response
+        .clone()
+        .on_hover_text("Click to inspect this evidence full screen");
+    ui.small("Overlay: yellow cross = intended center · green circle = included detection · orange = excluded/review");
+    if ui
+        .button(if validation {
+            "View validation evidence full screen"
+        } else {
+            "View calibration evidence full screen"
+        })
+        .clicked()
+    {
+        state.fullscreen_scan = Some(slot);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scan_overlay_image(
+    ui: &mut Ui,
+    report: &ScanAnalysisReport,
+    preview_png: &Arc<[u8]>,
+    preview_sha1: &str,
+    validation: bool,
+    wizard: &CalibrationWizard,
+    size: egui::Vec2,
+    clickable: bool,
+) -> egui::Response {
     let uri = format!(
         "bytes://calibration-scan-{}-{}.png",
         preview_sha1,
         if validation { "validation" } else { "training" }
     );
-    let response = ui.add(
-        egui::Image::from_bytes(uri, preview_png.clone())
-            .fit_to_exact_size(egui::vec2(width, height)),
-    );
-    let Some(print_to_scanner) = report.scanner_to_print.inverse() else {
-        return;
+    let image = egui::Image::from_bytes(uri, preview_png.clone())
+        .fit_to_exact_size(size)
+        .alt_text(if validation {
+            "Validation scan evidence"
+        } else {
+            "Calibration scan evidence"
+        });
+    let response = if clickable {
+        let label = if validation {
+            "Open full-screen validation scan evidence"
+        } else {
+            "Open full-screen calibration scan evidence"
+        };
+        let response = ui.add(egui::Button::new(image).frame(false));
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        response
+    } else {
+        ui.add(image)
     };
+    let Some(print_to_scanner) = report.scanner_to_print.inverse() else {
+        return response;
+    };
+    let [source_width, source_height] = report.scan_dimensions_px;
     let to_screen = |point_mm: [f64; 2]| {
         let point = print_to_scanner.apply(point_mm);
         egui::pos2(
@@ -849,7 +964,131 @@ fn render_scan_overlay(
             painter.circle_stroke(observed, 6.0_f32, egui::Stroke::new(2.0_f32, color));
         }
     }
-    ui.small("Overlay: yellow cross = intended center · green circle = included detection · orange = excluded/review");
+    response
+}
+
+fn render_fullscreen_scan(
+    ctx: &egui::Context,
+    wizard: &CalibrationWizard,
+    state: &mut CalibrationUiState,
+    diagnostics: CalibrationUiDiagnostics<'_>,
+) {
+    let Some(slot) = state.fullscreen_scan else {
+        return;
+    };
+    let (report, preview_png, preview_sha1, validation) = match slot {
+        ScanSlot::Training => (
+            diagnostics.training_scan,
+            diagnostics.training_scan_preview_png,
+            diagnostics.training_scan_preview_sha1,
+            false,
+        ),
+        ScanSlot::Validation => (
+            diagnostics.validation_scan,
+            diagnostics.validation_scan_preview_png,
+            diagnostics.validation_scan_preview_sha1,
+            true,
+        ),
+    };
+    let (Some(report), Some(preview_png), Some(preview_sha1)) = (report, preview_png, preview_sha1)
+    else {
+        state.fullscreen_scan = None;
+        return;
+    };
+
+    let mut close_requested = false;
+    let modal = egui::Modal::new(egui::Id::new("calibration_evidence_fullscreen")).show(ctx, |ui| {
+        let viewport = ctx.content_rect();
+        let modal_size = (viewport.size() - egui::vec2(32.0, 32.0)).max(egui::Vec2::ZERO);
+        ui.set_min_size(modal_size);
+        ui.set_max_size(modal_size);
+        ui.horizontal(|ui| {
+            ui.strong(if validation {
+                "Validation scan and detected cut edges"
+            } else {
+                "Calibration scan and detected cut edges"
+            });
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui.button("Close full-screen evidence").clicked() {
+                        close_requested = true;
+                    }
+                },
+            );
+        });
+        ui.label("Yellow crosses are intended centers; circles show the detected physical cut edges.");
+
+        let [source_width, source_height] = report.scan_dimensions_px;
+        let available = ui.available_size() - egui::vec2(0.0, 8.0);
+        let image_size = fitted_evidence_size(source_width, source_height, available);
+        render_scan_overlay_image(
+            ui,
+            report,
+            preview_png,
+            preview_sha1,
+            validation,
+            wizard,
+            image_size,
+            false,
+        );
+    });
+    if modal.should_close() || close_requested {
+        state.fullscreen_scan = None;
+    }
+}
+
+fn render_discard_confirmation(
+    ctx: &egui::Context,
+    wizard: &mut CalibrationWizard,
+    state: &mut CalibrationUiState,
+    now: u64,
+    events: &mut Vec<CalibrationUiEvent>,
+) {
+    let mut keep_calibrating = false;
+    let modal = egui::Modal::new(egui::Id::new("leave_calibration_confirmation")).show(ctx, |ui| {
+        ui.set_width(390.0);
+        ui.heading("Leave calibration?");
+        ui.label(
+            "Save the current progress so this calibration can be resumed, or discard the run.",
+        );
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Keep calibrating").clicked() {
+                keep_calibrating = true;
+            }
+            if ui.button("Save progress and exit").clicked() {
+                state.open = false;
+                state.confirm_discard = false;
+                events.push(CalibrationUiEvent::SaveAndExit);
+                ui.close();
+            }
+            if ui.button("Discard run").clicked() {
+                wizard.discard(now);
+                state.open = false;
+                state.confirm_discard = false;
+                events.push(CalibrationUiEvent::Discard);
+                ui.close();
+            }
+        });
+    });
+    if keep_calibrating || (modal.should_close() && state.open) {
+        state.confirm_discard = false;
+    }
+}
+
+fn fitted_evidence_size(
+    source_width: u32,
+    source_height: u32,
+    available: egui::Vec2,
+) -> egui::Vec2 {
+    if source_width == 0 || source_height == 0 || available.x <= 0.0 || available.y <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    let scale = (available.x / source_width as f32)
+        .min(available.y / source_height as f32)
+        .max(0.0);
+    egui::vec2(source_width as f32 * scale, source_height as f32 * scale)
 }
 
 fn render_print_area(
@@ -1208,7 +1447,15 @@ fn render_validation_review(
 ) {
     ui.heading("Review validation result");
     if wizard.method == Some(CalibrationMethod::FlatbedScanner) {
-        render_scan_review(ui, wizard, true, now, report, preview_png, preview_sha1);
+        render_scan_review(
+            ui,
+            wizard,
+            state,
+            true,
+            now,
+            report,
+            preview_png.zip(preview_sha1),
+        );
     }
     match &wizard.validation {
         ValidationStatus::NotStarted | ValidationStatus::Collecting => {
@@ -1334,28 +1581,6 @@ fn render_footer(
         ui.colored_label(Color32::from_rgb(210, 70, 70), error);
     }
 
-    if state.confirm_discard {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Leave calibration?");
-                if ui.button("Save & Exit").clicked() {
-                    state.open = false;
-                    state.confirm_discard = false;
-                    events.push(CalibrationUiEvent::SaveAndExit);
-                }
-                if ui.button("Discard").clicked() {
-                    wizard.discard(now);
-                    state.open = false;
-                    state.confirm_discard = false;
-                    events.push(CalibrationUiEvent::Discard);
-                }
-                if ui.button("Keep calibrating").clicked() {
-                    state.confirm_discard = false;
-                }
-            });
-        });
-    }
-
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(!wizard.history.is_empty(), egui::Button::new("Back"))
@@ -1391,6 +1616,46 @@ fn render_footer(
             }
         }
 
+        let skip_label = wizard.step.skip_label();
+        let primary_job_active = wizard.step == WizardStep::PrintCalibration
+            && matches!(
+                wizard.primary_job,
+                JobStatus::Queued | JobStatus::InProgress
+            );
+        let skip_button_label = if wizard.step == WizardStep::PrintCalibration {
+            "Use existing sheet"
+        } else {
+            "Skip step"
+        };
+        let skip_response = ui.add_enabled(
+            skip_label.is_some() && !primary_job_active,
+            egui::Button::new(skip_button_label),
+        );
+        if skip_response.clicked() {
+            if wizard.step == WizardStep::PrintCalibration {
+                events.push(CalibrationUiEvent::UseExistingPrimarySheet);
+            } else {
+                match wizard.skip_current_step(now) {
+                    Ok(step) => {
+                        state.last_error = None;
+                        if step == WizardStep::Candidate
+                            && matches!(wizard.candidate, CandidateStatus::Computing)
+                        {
+                            events.push(CalibrationUiEvent::ComputeCandidate);
+                        }
+                    }
+                    Err(error) => state.last_error = Some(error.to_string()),
+                }
+            }
+        }
+        if primary_job_active {
+            skip_response.on_hover_text("Wait for or cancel the active print job first");
+        } else if let Some(label) = skip_label {
+            skip_response.on_hover_text(label);
+        } else {
+            skip_response.on_hover_text("This calibration step is required");
+        }
+
         if ui.button("Save & Exit").clicked() {
             state.open = false;
             events.push(CalibrationUiEvent::SaveAndExit);
@@ -1399,6 +1664,12 @@ fn render_footer(
             state.confirm_discard = true;
         }
     });
+}
+
+fn calibration_window_height_limits(available_height: f32) -> (f32, f32) {
+    let max_height =
+        (available_height - CALIBRATION_WINDOW_MARGIN).clamp(1.0, CALIBRATION_WINDOW_MAX_HEIGHT);
+    (460.0_f32.min(max_height), max_height)
 }
 
 /// Returns `Ok` when the wizard's real transition guard currently permits
@@ -1502,6 +1773,7 @@ fn job_status_label(status: JobStatus) -> &'static str {
         JobStatus::Queued => "queued",
         JobStatus::InProgress => "in progress",
         JobStatus::Completed => "completed",
+        JobStatus::ExistingSheet => "using an existing sheet",
         JobStatus::Failed => "failed",
     }
 }
@@ -1692,6 +1964,27 @@ mod tests {
         assert!(next_availability(&wizard, 2).is_ok());
         wizard.next(2).unwrap();
         assert!(next_availability(&wizard, 3).is_err());
+    }
+
+    #[test]
+    fn calibration_window_height_is_bounded_by_viewport_and_design_cap() {
+        assert_eq!(calibration_window_height_limits(400.0), (376.0, 376.0));
+        assert_eq!(calibration_window_height_limits(900.0), (460.0, 760.0));
+    }
+
+    #[test]
+    fn evidence_size_preserves_source_aspect_ratio_and_fits_viewport() {
+        let portrait = fitted_evidence_size(5100, 7012, egui::vec2(720.0, 480.0));
+        assert!(portrait.x <= 720.0 && portrait.y <= 480.0);
+        assert!((portrait.x / portrait.y - 5100.0 / 7012.0).abs() < 0.0001);
+
+        let landscape = fitted_evidence_size(7012, 5100, egui::vec2(320.0, 700.0));
+        assert!(landscape.x <= 320.0 && landscape.y <= 700.0);
+        assert!((landscape.x / landscape.y - 7012.0 / 5100.0).abs() < 0.0001);
+        assert_eq!(
+            fitted_evidence_size(0, 5100, egui::vec2(320.0, 700.0)),
+            egui::Vec2::ZERO
+        );
     }
 
     #[test]

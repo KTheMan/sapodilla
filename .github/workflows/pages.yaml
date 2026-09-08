@@ -10,6 +10,9 @@ permissions:
   pages: write
   id-token: write
 
+env:
+  RUST_NIGHTLY_VERSION: "nightly-2026-03-17"
+
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -22,9 +25,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           targets: wasm32-unknown-unknown
+          components: rust-src
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -35,7 +40,18 @@ jobs:
           tool: trunk
 
       - name: Build project site
-        run: trunk build --release --public-url /sapodilla/
+        run: ./scripts/build-wasm32-unknown-unknown_web-workers.sh --public-url /sapodilla/
+
+      - name: Verify installable app assets
+        run: |
+          test -f dist/manifest.webmanifest
+          test -f dist/coi-serviceworker.js
+          test -f dist/icons/sapodilla-192.png
+          test -f dist/icons/sapodilla-512.png
+          grep -q 'rel="manifest"' dist/index.html
+
+      - name: Test browser persistence and cache ownership
+        run: node --test tests/web_persistence.test.mjs
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

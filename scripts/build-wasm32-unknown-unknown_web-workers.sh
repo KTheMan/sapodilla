@@ -12,6 +12,7 @@ export RUSTFLAGS="\
     -C link-arg=--export=__wasm_init_tls \
     -C link-arg=--export=__tls_size \
     -C link-arg=--export=__tls_align \
-    -C link-arg=--export=__tls_base"
+    -C link-arg=--export=__tls_base \
+    -C link-arg=--export=__heap_base"
 
-trunk build --release --features web-workers
+trunk build --release --features web-workers "$@"

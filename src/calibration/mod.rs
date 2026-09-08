@@ -3,6 +3,7 @@
 //! Public coordinates are always unmirrored canvas coordinates. A stored
 //! [`CanvasToPlotter`] maps those coordinates directly to plotter units.
 
+pub mod external_storage;
 mod profile;
 mod report;
 mod scan;

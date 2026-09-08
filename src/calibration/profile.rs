@@ -467,6 +467,46 @@ pub struct ActiveCalibrationProfile {
     pub profile_id: String,
 }
 
+/// Compact, durability-critical calibration state.
+///
+/// Run reports can be comparatively large and are intentionally excluded so
+/// browser quota pressure cannot prevent the active transform from being
+/// checkpointed. `CalibrationStore` remains the import/export and history
+/// container.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationRegistry {
+    pub version: u8,
+    pub profiles: Vec<CalibrationProfile>,
+    pub active_profiles: Vec<ActiveCalibrationProfile>,
+}
+
+impl CalibrationRegistry {
+    pub fn from_store(store: &CalibrationStore) -> Self {
+        Self {
+            version: store.version,
+            profiles: store.profiles.clone(),
+            active_profiles: store.active_profiles.clone(),
+        }
+    }
+
+    pub fn sanitize(self) -> Result<Self, CalibrationDataError> {
+        let store = CalibrationStore {
+            version: self.version,
+            profiles: self.profiles,
+            runs: Vec::new(),
+            active_profiles: self.active_profiles,
+        }
+        .sanitize()?;
+        Ok(Self::from_store(&store))
+    }
+
+    pub fn apply_to(self, store: &mut CalibrationStore) {
+        store.version = self.version;
+        store.profiles = self.profiles;
+        store.active_profiles = self.active_profiles;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationStore {
     pub version: u8,
@@ -765,6 +805,28 @@ mod tests {
         assert_eq!(store.active_profile(&key("1.0.15")).unwrap().profile_id, id);
         assert_eq!(store.reset(&key("1.0.15")), Some(id));
         assert!(store.active_profile(&key("1.0.15")).is_none());
+    }
+
+    #[test]
+    fn compact_registry_round_trips_active_affine_profiles_without_run_history() {
+        let mut calibrated = profile("affine", 42);
+        calibrated.selected_model = CalibrationModel::Affine;
+        calibrated.canvas_to_plotter.matrix = [[1.001, 0.002], [-0.003, 0.999]];
+        calibrated.canvas_to_plotter.translation = [0.42, -0.17];
+        let mut store = CalibrationStore::default();
+        store.add_and_activate(calibrated.clone()).unwrap();
+
+        let encoded = serde_json::to_string(&CalibrationRegistry::from_store(&store)).unwrap();
+        assert!(!encoded.contains("\"runs\""));
+        let registry = serde_json::from_str::<CalibrationRegistry>(&encoded)
+            .unwrap()
+            .sanitize()
+            .unwrap();
+
+        let mut restored = CalibrationStore::default();
+        registry.apply_to(&mut restored);
+        assert_eq!(restored.active_profile(&calibrated.key), Some(&calibrated));
+        assert!(restored.runs.is_empty());
     }
 
     #[test]

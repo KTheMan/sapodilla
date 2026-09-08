@@ -11,6 +11,7 @@ use gloo_timers::future::TimeoutFuture;
 use tracing::{debug, error, info, trace};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::js_sys::{self, Array, Function, Promise, Reflect, Uint8Array};
+use web_time::Instant;
 
 use crate::{
     protocol::{AvocadoPacket, ContentType, EncodingType, EncryptionMode, InteractionType},
@@ -20,11 +21,15 @@ use crate::{
         MAX_TRANSPORT_DATA_SIZE, PIXCUT_USB_PID, PIXCUT_USB_VID, encode_data_frame,
         validate_data_ack, write_slices,
     },
-    transports::{JobCommandProfile, TransportControl, TransportEvent, TransportStatus},
+    transports::{
+        JobCommandProfile, TransportControl, TransportEvent, TransportStatus,
+        validate_webusb_response_budget,
+    },
 };
 
 const RESPONSE_BUFFER_SIZE: u32 = 16 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -370,9 +375,24 @@ async fn read_matching_json_response(
     pending: &mut VecDeque<serde_json::Value>,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) -> anyhow::Result<AvocadoPacket> {
+    // `web_time::Instant` uses the browser's monotonic clock on wasm32;
+    // `std::time::Instant::now()` panics on wasm32-unknown-unknown.
+    let started = Instant::now();
+    let mut reads = 0usize;
+    let mut unmatched = 0usize;
     loop {
         if pending.is_empty() {
-            let response = read_response(device, webusb_endpoint(COMMAND_IN_ENDPOINT)).await?;
+            let remaining = COMMAND_RESPONSE_TIMEOUT
+                .checked_sub(started.elapsed())
+                .context("WebUSB command response timed out")?;
+            validate_webusb_response_budget(reads, unmatched)?;
+            let response = read_response_with_timeout(
+                device,
+                webusb_endpoint(COMMAND_IN_ENDPOINT),
+                remaining.min(READ_TIMEOUT),
+            )
+            .await?;
+            reads += 1;
             for result in decoder.push(&response) {
                 pending.push_back(result?);
             }
@@ -386,10 +406,16 @@ async fn read_matching_json_response(
             if response_id == Some(request.msg_number) {
                 return Ok(packet);
             }
+            unmatched += 1;
+            validate_webusb_response_budget(reads, unmatched)?;
             event_tx
                 .unbounded_send(TransportEvent::Packet(packet))
                 .map_err(|_| anyhow::anyhow!("transport event receiver was dropped"))?;
         }
+        // Some USB bridges resolve empty or stale reads immediately. Yield to
+        // the browser task queue so that rendering and timeout callbacks still
+        // run instead of forming an unbounded microtask loop.
+        TimeoutFuture::new(0).await;
     }
 }
 
@@ -487,6 +513,14 @@ async fn write_frame(device: &JsValue, endpoint: u8, frame: &[u8]) -> anyhow::Re
 }
 
 async fn read_response(device: &JsValue, endpoint: u8) -> anyhow::Result<Vec<u8>> {
+    read_response_with_timeout(device, endpoint, READ_TIMEOUT).await
+}
+
+async fn read_response_with_timeout(
+    device: &JsValue,
+    endpoint: u8,
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
     let result = call_promise_with_timeout(
         device,
         "transferIn",
@@ -494,7 +528,7 @@ async fn read_response(device: &JsValue, endpoint: u8) -> anyhow::Result<Vec<u8>
             JsValue::from_f64(endpoint.into()),
             JsValue::from_f64(RESPONSE_BUFFER_SIZE.into()),
         ],
-        READ_TIMEOUT,
+        timeout,
     )
     .await
     .with_context(|| format!("WebUSB bulk read from endpoint {endpoint} failed"))?;

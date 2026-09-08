@@ -3,14 +3,75 @@
   <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ff2daa" />
     <title>Sapodilla</title>
+    <script>
+      // GitHub Pages cannot configure COOP/COEP response headers. Install a
+      // same-origin service worker before starting the threaded WASM build;
+      // its first activation reloads this page under cross-origin isolation.
+      if ("serviceWorker" in navigator) {
+        const needsIsolation = !window.crossOriginIsolated;
+        const showStartupError = () => {
+          const show = () => {
+            const loading = document.getElementById("loading_text");
+            if (loading) {
+              loading.innerHTML =
+                "<p style='font-size: 16px'>Sapodilla could not start. Reload the page or use a current Chromium browser.</p>";
+            }
+          };
+          if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", show, { once: true });
+          } else {
+            show();
+          }
+        };
+        const workerUrl = new URL("coi-serviceworker.js", document.baseURI);
+        const startupTimeout = window.setTimeout(showStartupError, 10000);
+        navigator.serviceWorker
+          .register(workerUrl.href, { scope: "./" })
+          .then(() => {
+            if (!navigator.serviceWorker.controller) {
+              // Reload the first controlled page even when server headers
+              // already provide isolation. That lets the worker observe and
+              // cache the hashed JS/WASM requests for subsequent offline use.
+              navigator.serviceWorker.addEventListener(
+                "controllerchange",
+                () => window.location.reload(),
+                { once: true },
+              );
+            } else if (
+              needsIsolation &&
+              sessionStorage.getItem("sapodilla-coi-reload") !== "1"
+            ) {
+              sessionStorage.setItem("sapodilla-coi-reload", "1");
+              window.location.reload();
+            } else {
+              window.clearTimeout(startupTimeout);
+              if (window.crossOriginIsolated) {
+                sessionStorage.removeItem("sapodilla-coi-reload");
+              } else if (needsIsolation) {
+                showStartupError();
+              }
+            }
+          })
+          .catch(() => {
+            window.clearTimeout(startupTimeout);
+            showStartupError();
+          });
+      }
+    </script>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff2daa'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='sans-serif' font-size='20' fill='%230b0b10'%3ES%3C/text%3E%3C/svg%3E"
     />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="icons/sapodilla-192.png" />
 
     <link data-trunk rel="rust" data-wasm-opt="2" data-bindgen-target="web" />
     <link data-trunk rel="copy-file" href="static/_headers" />
+    <link data-trunk rel="copy-file" href="static/coi-serviceworker.js" />
+    <link data-trunk rel="copy-file" href="static/manifest.webmanifest" />
+    <link data-trunk rel="copy-dir" href="static/icons" />
 
     <base data-trunk-public-url />
 
