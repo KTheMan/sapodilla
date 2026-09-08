@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    io::Write,
+    io::{Cursor, Write},
     sync::{Arc, mpsc},
 };
 
@@ -22,10 +22,10 @@ use crate::{
     calibration::{
         CalibrationActivationPolicy, CalibrationCutMode, CalibrationMethod, CalibrationObservation,
         CalibrationPayloadHashes, CalibrationPlotterCommand, CalibrationPlotterCommandKind,
-        CalibrationPolicy, CalibrationProfile, CalibrationRun, CalibrationRunState,
-        CalibrationSolution, CalibrationStore, CalibrationTargetManifest, CalibrationWizard,
-        CanvasToPlotter, CutPathDirection, JobSlot as CalibrationJobSlot, ManifestIdentity,
-        PrinterCalibrationKey, ScanAnalysisConfig, ScanAnalysisReport, ScanSlot,
+        CalibrationPolicy, CalibrationProfile, CalibrationRegistry, CalibrationRun,
+        CalibrationRunState, CalibrationSolution, CalibrationStore, CalibrationTargetManifest,
+        CalibrationWizard, CanvasToPlotter, CutPathDirection, JobSlot as CalibrationJobSlot,
+        ManifestIdentity, PrinterCalibrationKey, ScanAnalysisConfig, ScanAnalysisReport, ScanSlot,
         StablePrinterIdentity, TargetCutMode, TargetManifest, TransformBounds, ValidationMetrics,
         analyze_flatbed_scan, flatbed_calibration, flatbed_validation, manual_calibration,
         manual_validation, observation_error_metrics, render_print_raster, solve_calibration,
@@ -48,6 +48,63 @@ use crate::{
     views,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CalibrationCommitKind {
+    WizardActivation,
+    ProfileChange {
+        success_message: String,
+    },
+    Import,
+    #[cfg(target_arch = "wasm32")]
+    FolderInitialization,
+    #[cfg(target_arch = "wasm32")]
+    FolderLoaded {
+        recovered_backup: bool,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CalibrationDirectoryState {
+    Unavailable,
+    Checking,
+    Unconfigured,
+    PermissionRequired {
+        directory_name: String,
+    },
+    Ready {
+        directory_name: String,
+        verified_registry_json: Option<String>,
+    },
+    Writing {
+        directory_name: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug)]
+struct PendingExternalCalibrationCommit {
+    request_id: u64,
+    candidate_store: CalibrationStore,
+    registry_json: Option<String>,
+    kind: CalibrationCommitKind,
+}
+
+const MAX_ACTIONS_PER_FRAME: usize = 256;
+
+#[cfg(target_arch = "wasm32")]
+async fn yield_compute_task() {
+    gloo_timers::future::TimeoutFuture::new(0).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn yield_compute_task() {
+    tokio::task::yield_now().await;
+}
+
 mod calibration_ui;
 
 const MATERIAL_PROFILES_STORAGE_KEY: &str = "sapodilla.material-profiles.v1";
@@ -57,14 +114,68 @@ const LIBRARY_CONSUMED_STORAGE_KEY: &str = "sapodilla.library-consumed-ahead.v1"
 const CANVAS_VIEW_STORAGE_KEY: &str = "sapodilla.canvas-view.v1";
 const APPEARANCE_STORAGE_KEY: &str = "sapodilla.appearance.v1";
 const CALIBRATION_STORAGE_KEY: &str = "sapodilla.calibration.v1";
+const CALIBRATION_REGISTRY_STORAGE_KEY: &str = "sapodilla.calibration-registry.v1";
 const CALIBRATION_SESSION_STORAGE_KEY: &str = "sapodilla.calibration-session.v1";
 const PRINTER_FALLBACK_NAMES_STORAGE_KEY: &str = "sapodilla.printer-fallback-names.v1";
 const APPEARANCE_VERSION: u8 = 1;
+
+fn checkpoint_calibration_registry(
+    storage: Option<&mut (dyn eframe::Storage + 'static)>,
+    store: &CalibrationStore,
+) -> Result<(), String> {
+    let Some(storage) = storage else {
+        return Err("persistent application storage is unavailable".into());
+    };
+    let registry = CalibrationRegistry::from_store(store);
+    eframe::set_value(storage, CALIBRATION_REGISTRY_STORAGE_KEY, &registry);
+    if eframe::get_value::<CalibrationRegistry>(storage, CALIBRATION_REGISTRY_STORAGE_KEY).as_ref()
+        != Some(&registry)
+    {
+        return Err("the calibration checkpoint could not be read back".into());
+    }
+    storage.flush();
+    Ok(())
+}
+
+fn commit_calibration_store(
+    storage: Option<&mut (dyn eframe::Storage + 'static)>,
+    current: &mut CalibrationStore,
+    candidate: CalibrationStore,
+) -> Result<(), String> {
+    checkpoint_calibration_registry(storage, &candidate)?;
+    *current = candidate;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn request_persistent_browser_storage() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let storage = window.navigator().storage();
+    spawn(async move {
+        let result = match storage.persist() {
+            Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(granted) if granted.as_bool() == Some(true) => {
+                info!("browser granted persistent calibration storage")
+            }
+            Ok(_) => info!("browser retained best-effort calibration storage"),
+            Err(error) => debug!(?error, "persistent browser storage request was unavailable"),
+        }
+    });
+}
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const LIBRARY_PAGE_SIZE: usize = 100;
 const MAX_LIBRARY_FILL_ATTEMPTS: usize = 512;
 const NEW_ARTWORK_MIN_FRACTION: f32 = 0.22;
 const NEW_ARTWORK_MAX_FRACTION: f32 = 0.72;
+
+fn should_show_empty_workspace_hint(is_empty: bool, dismissed: bool) -> bool {
+    is_empty && !dismissed
+}
 
 #[derive(Clone, Debug)]
 pub struct CalibrationScanImport {
@@ -152,7 +263,7 @@ pub enum Action {
         printer_id: String,
         job_id: u64,
         #[debug(skip)]
-        payload: EncodedPrintJob,
+        result: anyhow::Result<EncodedPrintJob>,
     },
     CalibrationJobPrepared {
         run_id: String,
@@ -182,6 +293,19 @@ pub enum Action {
     CalibrationStoreImported {
         #[debug(skip)]
         result: Result<CalibrationStore, String>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    CalibrationDirectoryResolved {
+        result: Result<crate::calibration::external_storage::ExternalDirectorySnapshot, String>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    CalibrationDirectoryWriteFinished {
+        request_id: u64,
+        result: Result<String, String>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    CalibrationDirectoryForgot {
+        result: Result<(), String>,
     },
     CalibrationDeviceJobStarted {
         queue_id: u64,
@@ -348,6 +472,15 @@ pub struct SapodillaApp {
     pub background_color: [u8; 3],
     pub material_profiles: Vec<MaterialProfile>,
     pub calibration_store: CalibrationStore,
+    pending_calibration_store_import: Option<CalibrationStore>,
+    #[cfg(target_arch = "wasm32")]
+    calibration_directory_state: CalibrationDirectoryState,
+    #[cfg(target_arch = "wasm32")]
+    pending_external_calibration_commit: Option<PendingExternalCalibrationCommit>,
+    #[cfg(target_arch = "wasm32")]
+    ready_external_calibration_commit: Option<PendingExternalCalibrationCommit>,
+    #[cfg(target_arch = "wasm32")]
+    next_external_calibration_request_id: u64,
     calibration_session: Option<CalibrationSession>,
     calibration_ui_state: calibration_ui::CalibrationUiState,
     show_calibration_profiles: bool,
@@ -385,6 +518,7 @@ pub struct SapodillaApp {
 
     pub error: Option<anyhow::Error>,
     confirm_new_sheet: bool,
+    empty_workspace_hint_dismissed: bool,
     show_settings: bool,
     show_library_panel: bool,
     show_inspector_panel: bool,
@@ -582,7 +716,9 @@ pub struct LoadedImage {
 
 #[derive(Clone)]
 pub struct PendingPrintJob {
-    encoded_image: Vec<u8>,
+    // Routing and retry bookkeeping may clone a pending job on the UI thread.
+    // Keep the encoded document shared so that clone remains constant-time.
+    encoded_image: Arc<[u8]>,
     encoded_image_len: usize,
     image_hash: String,
     created_at: u64,
@@ -1052,6 +1188,18 @@ impl SapodillaApp {
         let tx = ContextSender::new(tx, cc.egui_ctx.clone());
         let job_queue = JobQueue::new();
 
+        #[cfg(target_arch = "wasm32")]
+        let calibration_directory_state = if crate::calibration::external_storage::is_supported() {
+            let restore_tx = tx.clone();
+            spawn(async move {
+                let result = crate::calibration::external_storage::restore().await;
+                let _ = restore_tx.send(Action::CalibrationDirectoryResolved { result });
+            });
+            CalibrationDirectoryState::Checking
+        } else {
+            CalibrationDirectoryState::Unavailable
+        };
+
         let material_profiles = cc
             .storage
             .and_then(|storage| {
@@ -1061,13 +1209,25 @@ impl SapodillaApp {
             .filter(|profiles| !profiles.is_empty())
             .unwrap_or_else(MaterialProfile::built_ins);
         let selected_material = usize::from(material_profiles.len() > 1);
-        let calibration_store = cc
+        let mut calibration_store = cc
             .storage
             .and_then(|storage| {
                 eframe::get_value::<CalibrationStore>(storage, CALIBRATION_STORAGE_KEY)
             })
             .and_then(|store| store.sanitize().ok())
             .unwrap_or_default();
+        if let Some(registry) = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<CalibrationRegistry>(storage, CALIBRATION_REGISTRY_STORAGE_KEY)
+            })
+            .and_then(|registry| registry.sanitize().ok())
+        {
+            // The compact registry is authoritative for profiles and active
+            // pointers. Legacy storage continues to supply optional run
+            // history during migration.
+            registry.apply_to(&mut calibration_store);
+        }
         let calibration_session = cc
             .storage
             .and_then(|storage| {
@@ -1209,6 +1369,15 @@ impl SapodillaApp {
             background_color: [255, 255, 255],
             material_profiles,
             calibration_store,
+            pending_calibration_store_import: None,
+            #[cfg(target_arch = "wasm32")]
+            calibration_directory_state,
+            #[cfg(target_arch = "wasm32")]
+            pending_external_calibration_commit: None,
+            #[cfg(target_arch = "wasm32")]
+            ready_external_calibration_commit: None,
+            #[cfg(target_arch = "wasm32")]
+            next_external_calibration_request_id: 1,
             calibration_session,
             calibration_ui_state: calibration_ui::CalibrationUiState::default(),
             show_calibration_profiles: false,
@@ -1251,6 +1420,7 @@ impl SapodillaApp {
 
             error: None,
             confirm_new_sheet: false,
+            empty_workspace_hint_dismissed: false,
             show_settings: false,
             show_library_panel: true,
             show_inspector_panel: true,
@@ -2544,8 +2714,13 @@ impl SapodillaApp {
             [self.selected_canvas_size]
     }
 
-    fn apply_actions(&mut self) {
-        while let Ok(action) = self.rx.try_recv() {
+    fn apply_actions(&mut self) -> bool {
+        let mut processed = 0;
+        while processed < MAX_ACTIONS_PER_FRAME {
+            let Ok(action) = self.rx.try_recv() else {
+                break;
+            };
+            processed += 1;
             info!("got action: {action:?}");
 
             match action {
@@ -2943,6 +3118,7 @@ impl SapodillaApp {
                         };
                         self.background_color = document.background;
                         self.loaded_images = images;
+                        self.empty_workspace_hint_dismissed = false;
                         self.cut_shapes = document
                             .cut_paths
                             .into_iter()
@@ -3157,8 +3333,26 @@ impl SapodillaApp {
                 Action::PrintRouteEncoded {
                     printer_id,
                     job_id,
-                    payload,
+                    result,
                 } => {
+                    // The worker may finish after a retry, cancellation, or
+                    // calibration-generation change detached this route.
+                    if self.active_queue_jobs.get(&printer_id) != Some(&job_id) {
+                        continue;
+                    }
+                    let payload = match result {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            let _ = self.job_queue.fail(job_id, error.to_string());
+                            self.active_queue_jobs.remove(&printer_id);
+                            if self.active_queue_job == Some(job_id) {
+                                self.active_queue_job = None;
+                                self.send_progress = None;
+                            }
+                            self.error = Some(error);
+                            continue;
+                        }
+                    };
                     if let Some(session) = self.calibration_session.as_mut()
                         && let Some(slot) = [
                             CalibrationJobSlot::Primary,
@@ -3314,10 +3508,59 @@ impl SapodillaApp {
                 }
                 Action::CalibrationStoreImported { result } => match result {
                     Ok(store) => {
-                        self.calibration_store = store;
-                        self.calibration_message = Some("Calibration profiles imported.".into());
+                        self.pending_calibration_store_import = Some(store);
                     }
                     Err(message) => self.calibration_message = Some(message),
+                },
+                #[cfg(target_arch = "wasm32")]
+                Action::CalibrationDirectoryResolved { result } => {
+                    self.apply_calibration_directory_snapshot(result);
+                }
+                #[cfg(target_arch = "wasm32")]
+                Action::CalibrationDirectoryWriteFinished { request_id, result } => {
+                    if self
+                        .pending_external_calibration_commit
+                        .as_ref()
+                        .is_none_or(|pending| pending.request_id != request_id)
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_external_calibration_commit
+                        .take()
+                        .expect("matching calibration write must still be pending");
+                    match result {
+                        Ok(directory_name) => {
+                            self.calibration_directory_state = CalibrationDirectoryState::Ready {
+                                directory_name,
+                                verified_registry_json: pending.registry_json.clone(),
+                            };
+                            self.ready_external_calibration_commit = Some(pending);
+                        }
+                        Err(error) => {
+                            self.calibration_directory_state = CalibrationDirectoryState::Error {
+                                message: error.clone(),
+                            };
+                            self.finish_calibration_store_commit(
+                                pending.kind,
+                                Err(format!("could not save to the calibration folder: {error}")),
+                            );
+                        }
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                Action::CalibrationDirectoryForgot { result } => match result {
+                    Ok(()) => {
+                        self.calibration_directory_state = CalibrationDirectoryState::Unconfigured;
+                        self.calibration_message = Some(
+                            "Calibration folder disconnected; existing files were left in place."
+                                .into(),
+                        );
+                    }
+                    Err(message) => {
+                        self.calibration_directory_state =
+                            CalibrationDirectoryState::Error { message };
+                    }
                 },
                 Action::CalibrationDeviceJobStarted {
                     queue_id,
@@ -3349,6 +3592,7 @@ impl SapodillaApp {
         }
         self.synchronize_calibration_jobs();
         self.dispatch_queued_jobs();
+        processed == MAX_ACTIONS_PER_FRAME
     }
 
     fn start_calibration(&mut self, printer_id: String) {
@@ -3585,7 +3829,12 @@ impl SapodillaApp {
             }
         }
         let tx = self.tx.clone();
-        spawn_blocking(move || {
+        // Calibration sheet generation is bounded and substantially smaller
+        // than scan analysis. Keep it on the browser event loop after yielding
+        // one task instead of sharing the UI allocator with a wasm thread;
+        // allocator contention there can make Chromium appear hung.
+        spawn(async move {
+            yield_compute_task().await;
             let result = build_calibration_print_job(
                 manifest_identity,
                 method,
@@ -3610,6 +3859,49 @@ impl SapodillaApp {
         });
     }
 
+    fn use_existing_primary_calibration_sheet(&mut self) {
+        let active_queue_job = self
+            .calibration_session
+            .as_ref()
+            .and_then(|session| session.queue_job(CalibrationJobSlot::Primary))
+            .filter(|job_id| {
+                self.job_queue.job(*job_id).is_some_and(|job| {
+                    matches!(job.status, QueueJobStatus::Queued | QueueJobStatus::Running)
+                })
+            });
+        if active_queue_job.is_some() {
+            self.calibration_message =
+                Some("Wait for or cancel the active calibration job first.".into());
+            return;
+        }
+
+        let now = current_timestamp_millis();
+        let (result, stale_queue_job) = {
+            let Some(session) = self.calibration_session.as_mut() else {
+                return;
+            };
+            let result = session.wizard.skip_current_step(now);
+            let stale_queue_job = if result.is_ok() {
+                session.take_queue_job(CalibrationJobSlot::Primary)
+            } else {
+                None
+            };
+            (result, stale_queue_job)
+        };
+        if let Some(job_id) = stale_queue_job {
+            self.pending_print_jobs.remove(&job_id);
+            self.active_queue_jobs
+                .retain(|_, active_job_id| *active_job_id != job_id);
+            if self.active_queue_job == Some(job_id) {
+                self.active_queue_job = None;
+            }
+        }
+        match result {
+            Ok(_) => self.calibration_message = None,
+            Err(error) => self.calibration_message = Some(error.to_string()),
+        }
+    }
+
     fn import_calibration_scan(&mut self, slot: ScanSlot) {
         let Some(session) = self.calibration_session.as_mut() else {
             return;
@@ -3626,6 +3918,7 @@ impl SapodillaApp {
         if method != CalibrationMethod::FlatbedScanner {
             return;
         }
+        let scan_config = calibration_scan_analysis_config(slot, session.wizard.primary_job);
         session
             .wizard
             .begin_scan_import(slot, "choosing file…", current_timestamp_millis());
@@ -3671,31 +3964,33 @@ impl SapodillaApp {
             };
             let file_name = file.file_name();
             let bytes = file.read().await;
-            let manifest =
-                calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
-            let result = manifest
-                .map_err(|error| error.to_string())
-                .and_then(|manifest| {
-                    analyze_flatbed_scan(&bytes, &manifest, ScanAnalysisConfig::default())
-                        .map_err(|error| error.to_string())
-                })
-                .and_then(|report| {
-                    calibration_scan_preview(&bytes)
-                        .map(|preview_png| CalibrationScanImport {
-                            report,
-                            preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
-                            preview_png: preview_png.into(),
-                        })
-                        .map_err(|error| error.to_string())
+            spawn_blocking(move || {
+                let manifest =
+                    calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
+                let result = manifest
+                    .map_err(|error| error.to_string())
+                    .and_then(|manifest| {
+                        analyze_flatbed_scan(&bytes, &manifest, scan_config)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|report| {
+                        calibration_scan_preview(&bytes)
+                            .map(|preview_png| CalibrationScanImport {
+                                report,
+                                preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
+                                preview_png: preview_png.into(),
+                            })
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = tx.send(Action::CalibrationScanAnalyzed {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name,
+                    result,
                 });
-            let _ = tx.send(Action::CalibrationScanAnalyzed {
-                run_id,
-                validation_generation,
-                physical_sheet_attempt,
-                scan_request_generation,
-                slot,
-                file_name,
-                result,
             });
         });
     }
@@ -3784,7 +4079,253 @@ impl SapodillaApp {
             .set_validation_result(passed, message, current_timestamp_millis());
     }
 
-    fn activate_calibration_profile(&mut self) {
+    fn finish_calibration_store_commit(
+        &mut self,
+        kind: CalibrationCommitKind,
+        result: Result<(), String>,
+    ) {
+        #[cfg(target_arch = "wasm32")]
+        if result.is_ok() {
+            request_persistent_browser_storage();
+        }
+        match kind {
+            CalibrationCommitKind::WizardActivation => {
+                self.present_calibration_activation_result(result)
+            }
+            CalibrationCommitKind::ProfileChange { success_message } => {
+                self.calibration_message = Some(match result {
+                    Ok(()) => success_message,
+                    Err(error) => format!("Calibration change was not applied: {error}"),
+                });
+            }
+            CalibrationCommitKind::Import => {
+                self.calibration_message = Some(match result {
+                    Ok(()) => "Calibration profiles imported.".into(),
+                    Err(error) => format!("Calibration profiles were not imported: {error}"),
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            CalibrationCommitKind::FolderInitialization => {
+                self.calibration_message = Some(match result {
+                    Ok(()) => "Calibration folder connected and initialized.".into(),
+                    Err(error) => format!("Calibration folder could not be initialized: {error}"),
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            CalibrationCommitKind::FolderLoaded { recovered_backup } => {
+                self.calibration_message = Some(match result {
+                    Ok(()) if recovered_backup => {
+                        "Calibration profiles recovered from the folder backup.".into()
+                    }
+                    Ok(()) => "Calibration profiles loaded from the connected folder.".into(),
+                    Err(error) => {
+                        format!("Calibration folder profiles could not be loaded: {error}")
+                    }
+                });
+            }
+        }
+    }
+
+    fn begin_calibration_store_commit(
+        &mut self,
+        candidate_store: CalibrationStore,
+        kind: CalibrationCommitKind,
+        storage: Option<&mut (dyn eframe::Storage + 'static)>,
+    ) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.pending_external_calibration_commit.is_some() {
+                self.finish_calibration_store_commit(
+                    kind,
+                    Err("another calibration-folder write is still in progress".into()),
+                );
+                return;
+            }
+            let blocked = match &self.calibration_directory_state {
+                CalibrationDirectoryState::Checking => {
+                    Some("wait for the calibration folder check to finish".to_owned())
+                }
+                CalibrationDirectoryState::PermissionRequired { directory_name } => Some(format!(
+                    "reconnect the calibration folder {directory_name} before changing profiles"
+                )),
+                CalibrationDirectoryState::Writing { directory_name } => {
+                    Some(format!("wait for the write to {directory_name} to finish"))
+                }
+                CalibrationDirectoryState::Error { message } => Some(format!(
+                    "resolve the calibration folder error before changing profiles: {message}"
+                )),
+                CalibrationDirectoryState::Unavailable
+                | CalibrationDirectoryState::Unconfigured
+                | CalibrationDirectoryState::Ready { .. } => None,
+            };
+            if let Some(error) = blocked {
+                self.finish_calibration_store_commit(kind, Err(error));
+                return;
+            }
+            if let CalibrationDirectoryState::Ready {
+                directory_name,
+                verified_registry_json,
+            } = &self.calibration_directory_state
+            {
+                let registry = CalibrationRegistry::from_store(&candidate_store);
+                let now = current_timestamp_millis();
+                let registry_json =
+                    match crate::calibration::external_storage::encode_registry(registry, now, now)
+                    {
+                        Ok(json) => json,
+                        Err(error) => {
+                            self.finish_calibration_store_commit(kind, Err(error));
+                            return;
+                        }
+                    };
+                let request_id = self.next_external_calibration_request_id;
+                self.next_external_calibration_request_id = request_id.saturating_add(1);
+                let expected_registry_json = verified_registry_json.clone();
+                self.pending_external_calibration_commit = Some(PendingExternalCalibrationCommit {
+                    request_id,
+                    candidate_store,
+                    registry_json: Some(registry_json.clone()),
+                    kind,
+                });
+                self.calibration_directory_state = CalibrationDirectoryState::Writing {
+                    directory_name: directory_name.clone(),
+                };
+                let tx = self.tx.clone();
+                spawn(async move {
+                    let result = crate::calibration::external_storage::write_registry(
+                        registry_json,
+                        expected_registry_json,
+                    )
+                    .await;
+                    let _ =
+                        tx.send(Action::CalibrationDirectoryWriteFinished { request_id, result });
+                });
+                return;
+            }
+        }
+
+        let result =
+            commit_calibration_store(storage, &mut self.calibration_store, candidate_store)
+                .map_err(|error| format!("could not save on this computer: {error}"));
+        self.finish_calibration_store_commit(kind, result);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn choose_calibration_directory(&mut self) {
+        // The picker itself must be created synchronously from this button
+        // activation; only awaiting its result may be deferred.
+        let request = crate::calibration::external_storage::begin_choose();
+        self.calibration_directory_state = CalibrationDirectoryState::Checking;
+        let tx = self.tx.clone();
+        spawn(async move {
+            let result = crate::calibration::external_storage::snapshot_from(request).await;
+            let _ = tx.send(Action::CalibrationDirectoryResolved { result });
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn reconnect_calibration_directory(&mut self) {
+        let request = crate::calibration::external_storage::begin_reconnect();
+        self.calibration_directory_state = CalibrationDirectoryState::Checking;
+        let tx = self.tx.clone();
+        spawn(async move {
+            let result = crate::calibration::external_storage::snapshot_from(request).await;
+            let _ = tx.send(Action::CalibrationDirectoryResolved { result });
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn forget_calibration_directory(&mut self) {
+        self.calibration_directory_state = CalibrationDirectoryState::Checking;
+        let tx = self.tx.clone();
+        spawn(async move {
+            let result = crate::calibration::external_storage::forget().await;
+            let _ = tx.send(Action::CalibrationDirectoryForgot { result });
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply_calibration_directory_snapshot(
+        &mut self,
+        result: Result<crate::calibration::external_storage::ExternalDirectorySnapshot, String>,
+    ) {
+        use crate::calibration::external_storage::ExternalDirectorySnapshot;
+
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                self.calibration_directory_state = CalibrationDirectoryState::Error { message };
+                return;
+            }
+        };
+        match snapshot {
+            ExternalDirectorySnapshot::Unavailable => {
+                self.calibration_directory_state = CalibrationDirectoryState::Unavailable;
+            }
+            ExternalDirectorySnapshot::Unconfigured => {
+                self.calibration_directory_state = CalibrationDirectoryState::Unconfigured;
+            }
+            ExternalDirectorySnapshot::PermissionRequired { directory_name } => {
+                self.calibration_directory_state =
+                    CalibrationDirectoryState::PermissionRequired { directory_name };
+            }
+            ExternalDirectorySnapshot::Ready {
+                directory_name,
+                registry_json,
+                backup_json,
+            } => {
+                let (registry, recovered_backup) =
+                    match crate::calibration::external_storage::decode_registry_with_backup(
+                        registry_json.as_deref(),
+                        backup_json.as_deref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.calibration_directory_state = CalibrationDirectoryState::Error {
+                                message: format!("{directory_name}: {error}"),
+                            };
+                            return;
+                        }
+                    };
+                let verified_registry_json = if registry.is_some() {
+                    if recovered_backup {
+                        backup_json.clone()
+                    } else {
+                        registry_json.clone()
+                    }
+                } else {
+                    None
+                };
+                self.calibration_directory_state = CalibrationDirectoryState::Ready {
+                    directory_name: directory_name.clone(),
+                    verified_registry_json,
+                };
+
+                if let Some(registry) = registry {
+                    let mut candidate_store = self.calibration_store.clone();
+                    registry.apply_to(&mut candidate_store);
+                    self.ready_external_calibration_commit =
+                        Some(PendingExternalCalibrationCommit {
+                            request_id: 0,
+                            candidate_store,
+                            registry_json: None,
+                            kind: CalibrationCommitKind::FolderLoaded { recovered_backup },
+                        });
+                } else {
+                    self.begin_calibration_store_commit(
+                        self.calibration_store.clone(),
+                        CalibrationCommitKind::FolderInitialization,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    fn activate_calibration_profile(
+        &mut self,
+        storage: Option<&mut (dyn eframe::Storage + 'static)>,
+    ) {
         let Some(session) = self.calibration_session.as_mut() else {
             return;
         };
@@ -3794,7 +4335,9 @@ impl SapodillaApp {
             session.validation_metrics.clone(),
             session.wizard.method,
         ) else {
-            self.calibration_message = Some("Calibration result is incomplete.".into());
+            self.present_calibration_activation_result(Err(
+                "Calibration result is incomplete.".into()
+            ));
             return;
         };
         validation.normal_kiss_cut_passed = session.wizard.normal_kiss_cut_passed;
@@ -3820,31 +4363,54 @@ impl SapodillaApp {
         let mut run = match persisted_calibration_run(session, solution, validation.clone()) {
             Ok(run) => run,
             Err(error) => {
-                self.calibration_message = Some(format!(
+                self.present_calibration_activation_result(Err(format!(
                     "Calibration evidence is incomplete; profile was not activated: {error}"
-                ));
+                )));
                 return;
             }
         };
         if let Err(error) = run.validate_and_sanitize() {
-            self.calibration_message = Some(format!(
+            self.present_calibration_activation_result(Err(format!(
                 "Calibration evidence is invalid; profile was not activated: {error}"
-            ));
+            )));
             return;
         }
-        match self.calibration_store.add_and_activate(profile) {
+        let mut candidate_store = self.calibration_store.clone();
+        match candidate_store.add_and_activate(profile) {
             Ok(_) => {
-                self.calibration_store.runs.push(run);
-                self.calibration_store
+                candidate_store.runs.push(run);
+                candidate_store
                     .runs
                     .sort_by_key(|run| std::cmp::Reverse(run.updated_at));
-                self.calibration_store
+                candidate_store
                     .runs
                     .truncate(crate::calibration::MAX_CALIBRATION_RUNS);
-                self.calibration_message = Some("Calibration profile activated.".into());
-                self.calibration_session = None;
+                self.begin_calibration_store_commit(
+                    candidate_store,
+                    CalibrationCommitKind::WizardActivation,
+                    storage,
+                );
             }
-            Err(error) => self.calibration_message = Some(error.to_string()),
+            Err(error) => self.present_calibration_activation_result(Err(error.to_string())),
+        }
+    }
+
+    fn present_calibration_activation_result(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.calibration_message = Some("Calibration profile activated.".into());
+                self.calibration_ui_state.last_error = None;
+                // Close the finished walkthrough and open the profile list so
+                // the operator immediately sees which profile is now active.
+                self.calibration_session = None;
+                self.show_calibration_profiles = true;
+            }
+            Err(message) => {
+                self.calibration_message = Some(message.clone());
+                // Activation errors belong in the still-open walkthrough,
+                // not solely in the separate profile-management window.
+                self.calibration_ui_state.last_error = Some(message);
+            }
         }
     }
 
@@ -3881,7 +4447,7 @@ impl SapodillaApp {
             let job = PendingPrintJob {
                 encoded_image_len: image.len(),
                 image_hash: hex::encode(sha1::Sha1::digest(&image)),
-                encoded_image: image,
+                encoded_image: image.into(),
                 created_at: current_timestamp_millis(),
                 copies,
                 device_index,
@@ -3925,7 +4491,6 @@ impl SapodillaApp {
                 .unwrap_or_else(|| {
                     self.routed_canvas_to_plotter(&route.printer_id, &payload, &canvas_size)
                 });
-            let has_cutting = mode.mode_type.has_cutting();
             self.active_queue_job = Some(route.job_id);
             self.active_queue_jobs
                 .insert(route.printer_id.clone(), route.job_id);
@@ -3934,37 +4499,26 @@ impl SapodillaApp {
             let tx = self.tx.clone();
             let queue_id = route.job_id;
             let printer_id = route.printer_id;
-            spawn_blocking(move || {
-                let plt = if has_cutting {
-                    if let Some(phases) = payload.calibration_phases.as_ref() {
-                        encode_calibration_plt(phases, plotter_mapping, payload.material.passes)
-                    } else {
-                        encode_plt(
-                            &payload.cut_shapes,
-                            &payload.cut_modes,
-                            plotter_mapping,
-                            &canvas_size,
-                            &payload.material,
-                            payload.perf_cut,
-                            payload.perf_dash,
-                            payload.perf_gap,
-                            payload.peel_tabs,
-                            &payload.peel_tab_positions,
-                            payload.overcut,
-                        )
-                    }
-                } else {
-                    Vec::new()
-                };
+            let payload_is_calibration = payload.calibration_phases.is_some();
+            let encode = move || {
+                let result =
+                    encode_and_validate_print_route(payload, plotter_mapping, mode, &canvas_size);
                 let _ = tx.send(Action::PrintRouteEncoded {
                     printer_id,
                     job_id: queue_id,
-                    payload: EncodedPrintJob {
-                        source: payload,
-                        plt,
-                    },
+                    result,
                 });
-            });
+            };
+            if payload_is_calibration {
+                // See prepare_calibration_job: the small calibration route must
+                // not contend with the browser UI through shared wasm memory.
+                spawn(async move {
+                    yield_compute_task().await;
+                    encode();
+                });
+            } else {
+                spawn_blocking(encode);
+            }
         }
     }
 
@@ -3993,7 +4547,7 @@ impl SapodillaApp {
                 let canvas_size = &mode.canvas_sizes[source.canvas_index];
                 let command_profile = manager.job_command_profile().await;
                 if command_profile == JobCommandProfile::PixCutUsb {
-                    validate_pixcut_job_documents(source, &payload.plt, mode, canvas_size)?;
+                    validate_pixcut_job_envelope(source, &payload.plt, mode)?;
                     manager.prepare_pixcut_usb_job().await?;
                 }
                 let id = manager.next_message_id();
@@ -4042,7 +4596,7 @@ impl SapodillaApp {
                     manager
                         .send_data_streams(
                             device_job_id,
-                            &[payload.plt.as_slice(), source.encoded_image.as_slice()],
+                            &[payload.plt.as_slice(), source.encoded_image.as_ref()],
                             |total, sent| {
                                 let _ = tx.send(Action::SendProgress {
                                     job_id: queue_id,
@@ -4114,6 +4668,7 @@ impl SapodillaApp {
         self.off_canvas = false;
         self.selected_images.clear();
         self.confirm_new_sheet = false;
+        self.empty_workspace_hint_dismissed = false;
     }
 
     fn request_new_sheet(&mut self) {
@@ -4262,7 +4817,11 @@ impl SapodillaApp {
         }
     }
 
-    fn calibration_profile_manager(&mut self, ctx: &egui::Context) {
+    fn calibration_profile_manager(
+        &mut self,
+        ctx: &egui::Context,
+        storage: Option<&mut (dyn eframe::Storage + 'static)>,
+    ) {
         if !self.show_calibration_profiles {
             return;
         }
@@ -4273,6 +4832,14 @@ impl SapodillaApp {
         let mut import = false;
         let mut export = false;
         let mut export_run = None;
+        #[cfg(target_arch = "wasm32")]
+        let directory_state = self.calibration_directory_state.clone();
+        #[cfg(target_arch = "wasm32")]
+        let mut choose_directory = false;
+        #[cfg(target_arch = "wasm32")]
+        let mut reconnect_directory = false;
+        #[cfg(target_arch = "wasm32")]
+        let mut forget_directory = false;
         egui::Window::new("Calibration profiles")
             .open(&mut open)
             .default_width(620.0)
@@ -4281,8 +4848,77 @@ impl SapodillaApp {
                 ui.heading("Print-to-cut calibration profiles");
                 theme::muted(
                     ui,
-                    "Profiles are isolated by printer identity, firmware, and media.",
+                    "Profiles are saved on this computer and selected by printer identity, firmware, and media.",
                 );
+                #[cfg(target_arch = "wasm32")]
+                ui.group(|ui| {
+                    ui.strong("Calibration storage folder");
+                    match &directory_state {
+                        CalibrationDirectoryState::Unavailable => {
+                            ui.label("User-visible folders are unavailable in this browser. Browser storage and JSON export remain available.");
+                        }
+                        CalibrationDirectoryState::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking calibration folder…");
+                            });
+                        }
+                        CalibrationDirectoryState::Unconfigured => {
+                            ui.label("Not connected. Choose a folder for separately backed-up calibration profiles.");
+                            theme::muted(ui, "Sapodilla will create a readable registry JSON file and recovery copy in the folder you choose.");
+                            if ui.button("Choose folder…").clicked() {
+                                choose_directory = true;
+                            }
+                        }
+                        CalibrationDirectoryState::PermissionRequired { directory_name } => {
+                            ui.label(format!("{directory_name} needs permission before Sapodilla can load or save profiles."));
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Reconnect folder").clicked() {
+                                    reconnect_directory = true;
+                                }
+                                if ui.button("Choose another folder…").clicked() {
+                                    choose_directory = true;
+                                }
+                                if ui.button("Forget folder").clicked() {
+                                    forget_directory = true;
+                                }
+                            });
+                        }
+                        CalibrationDirectoryState::Ready { directory_name, .. } => {
+                            ui.label(format!("Connected: {directory_name}"));
+                            theme::muted(ui, "The folder registry is authoritative; browser storage is a local cache.");
+                            theme::muted(ui, "Files: sapodilla-calibration-registry.json and sapodilla-calibration-registry.backup.json");
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Change folder…").clicked() {
+                                    choose_directory = true;
+                                }
+                                if ui.button("Forget folder").clicked() {
+                                    forget_directory = true;
+                                }
+                            });
+                        }
+                        CalibrationDirectoryState::Writing { directory_name } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Saving to {directory_name}…"));
+                            });
+                        }
+                        CalibrationDirectoryState::Error { message } => {
+                            ui.colored_label(ui.visuals().error_fg_color, message);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Reconnect folder").clicked() {
+                                    reconnect_directory = true;
+                                }
+                                if ui.button("Choose another folder…").clicked() {
+                                    choose_directory = true;
+                                }
+                                if ui.button("Forget folder").clicked() {
+                                    forget_directory = true;
+                                }
+                            });
+                        }
+                    }
+                });
                 if let Some(message) = &self.calibration_message {
                     ui.label(message);
                 }
@@ -4362,24 +4998,52 @@ impl SapodillaApp {
             });
         self.show_calibration_profiles = open;
 
-        if let Some(profile_id) = activate {
-            self.calibration_message = self
-                .calibration_store
-                .activate(&profile_id)
-                .err()
-                .map(|error| error.to_string())
-                .or_else(|| Some("Calibration profile activated.".into()));
+        #[cfg(target_arch = "wasm32")]
+        if choose_directory {
+            self.choose_calibration_directory();
+        } else if reconnect_directory {
+            self.reconnect_calibration_directory();
+        } else if forget_directory {
+            self.forget_calibration_directory();
         }
-        if let Some(key) = rollback {
-            self.calibration_message = match self.calibration_store.rollback(&key) {
-                Ok(Some(_)) => Some("Previous calibration restored.".into()),
-                Ok(None) => Some("No active calibration to revert.".into()),
-                Err(error) => Some(error.to_string()),
+
+        enum ProfileMutation {
+            Activate(String),
+            Rollback(PrinterCalibrationKey),
+            Reset(PrinterCalibrationKey),
+        }
+        let mutation = activate
+            .map(ProfileMutation::Activate)
+            .or_else(|| rollback.map(ProfileMutation::Rollback))
+            .or_else(|| reset.map(ProfileMutation::Reset));
+        if let Some(mutation) = mutation {
+            let mut candidate_store = self.calibration_store.clone();
+            let result = match mutation {
+                ProfileMutation::Activate(profile_id) => candidate_store
+                    .activate(&profile_id)
+                    .map(|_| "Calibration profile activated."),
+                ProfileMutation::Rollback(key) => candidate_store.rollback(&key).map(|previous| {
+                    if previous.is_some() {
+                        "Previous calibration restored."
+                    } else {
+                        "No active calibration to revert."
+                    }
+                }),
+                ProfileMutation::Reset(key) => {
+                    candidate_store.reset(&key);
+                    Ok("Stock mapping restored.")
+                }
             };
-        }
-        if let Some(key) = reset {
-            self.calibration_store.reset(&key);
-            self.calibration_message = Some("Stock mapping restored.".into());
+            match result {
+                Ok(message) => self.begin_calibration_store_commit(
+                    candidate_store,
+                    CalibrationCommitKind::ProfileChange {
+                        success_message: message.into(),
+                    },
+                    storage,
+                ),
+                Err(error) => self.calibration_message = Some(error.to_string()),
+            }
         }
         if export {
             let store = self.calibration_store.clone();
@@ -5665,10 +6329,42 @@ fn validate_current_cut_paths_with_tabs(
 }
 
 impl eframe::App for SapodillaApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let accent = self.accent_color();
         theme::apply(ctx, accent);
-        self.apply_actions();
+        if self.apply_actions() {
+            // A noisy transport must not monopolize the browser renderer. The
+            // next repaint continues draining the bounded action backlog.
+            ctx.request_repaint();
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(pending) = self.ready_external_calibration_commit.take() {
+            let candidate_store = pending.candidate_store;
+            let local_result = commit_calibration_store(
+                frame.storage_mut(),
+                &mut self.calibration_store,
+                candidate_store.clone(),
+            );
+            if local_result.is_err() {
+                // The user-visible folder is canonical and has already passed
+                // write-close-readback verification. Keep using it even if the
+                // browser cache cannot be refreshed.
+                self.calibration_store = candidate_store;
+            }
+            self.finish_calibration_store_commit(pending.kind, Ok(()));
+            if let Err(error) = local_result {
+                self.calibration_message = Some(format!(
+                    "Calibration was saved in the connected folder, but the browser cache could not be updated: {error}"
+                ));
+            }
+        }
+        if let Some(candidate_store) = self.pending_calibration_store_import.take() {
+            self.begin_calibration_store_commit(
+                candidate_store,
+                CalibrationCommitKind::Import,
+                frame.storage_mut(),
+            );
+        }
         self.cut_modes.resize(self.cut_shapes.len(), CutMode::Kiss);
         self.cut_modes.truncate(self.cut_shapes.len());
         self.cutline_owners.resize(self.cut_shapes.len(), None);
@@ -6862,7 +7558,10 @@ impl eframe::App for SapodillaApp {
             }
             self.synchronize_cut_geometry();
 
-            if self.loaded_images.is_empty() {
+            if should_show_empty_workspace_hint(
+                self.loaded_images.is_empty(),
+                self.empty_workspace_hint_dismissed,
+            ) {
                 let hint_size = Vec2::new(300.0, 142.0);
                 let hint_position = ui.max_rect().center() - hint_size / 2.0;
                 egui::Area::new(Id::new("empty_workspace_hint"))
@@ -6872,7 +7571,28 @@ impl eframe::App for SapodillaApp {
                     .show(ctx, |ui| {
                         ui.set_width(hint_size.x);
                         theme::card(ui.visuals().dark_mode).show(ui, |ui| {
-                            ui.label(egui::RichText::new("Start with your artwork").size(18.0).strong());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Start with your artwork")
+                                        .size(18.0)
+                                        .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if theme::icon_button(
+                                            ui,
+                                            crate::icons::CLOSE,
+                                            "Dismiss start artwork help",
+                                            "Dismiss",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.empty_workspace_hint_dismissed = true;
+                                        }
+                                    },
+                                );
+                            });
                             theme::muted(ui, "Drop PNG or JPEG files here, or import them from your computer.");
                             ui.add_space(4.0);
                             if theme::primary_button(ui, accent, "+ Add artwork").clicked() {
@@ -6945,7 +7665,7 @@ impl eframe::App for SapodillaApp {
             }
 
             self.appearance_settings(ctx);
-            self.calibration_profile_manager(ctx);
+            self.calibration_profile_manager(ctx, frame.storage_mut());
 
             if let Some(err) = &self.error {
                 let modal = Modal::new(Id::new("error_modal")).show(ui.ctx(), |ui| {
@@ -7006,6 +7726,9 @@ impl eframe::App for SapodillaApp {
                 calibration_ui::CalibrationUiEvent::PrintPrimary => {
                     self.prepare_calibration_job(CalibrationJobSlot::Primary)
                 }
+                calibration_ui::CalibrationUiEvent::UseExistingPrimarySheet => {
+                    self.use_existing_primary_calibration_sheet()
+                }
                 calibration_ui::CalibrationUiEvent::PrintSecond => {
                     self.prepare_calibration_job(CalibrationJobSlot::Second)
                 }
@@ -7025,7 +7748,7 @@ impl eframe::App for SapodillaApp {
                     self.evaluate_calibration_validation()
                 }
                 calibration_ui::CalibrationUiEvent::ActivateProfile => {
-                    self.activate_calibration_profile()
+                    self.activate_calibration_profile(frame.storage_mut())
                 }
                 calibration_ui::CalibrationUiEvent::SaveAndExit => {
                     if let Some(session) = self.calibration_session.as_mut() {
@@ -7077,6 +7800,11 @@ impl eframe::App for SapodillaApp {
             },
         );
         eframe::set_value(storage, APPEARANCE_STORAGE_KEY, &self.appearance);
+        eframe::set_value(
+            storage,
+            CALIBRATION_REGISTRY_STORAGE_KEY,
+            &CalibrationRegistry::from_store(&self.calibration_store),
+        );
         eframe::set_value(storage, CALIBRATION_STORAGE_KEY, &self.calibration_store);
         eframe::set_value(
             storage,
@@ -7092,6 +7820,14 @@ impl eframe::App for SapodillaApp {
         } else {
             storage.set_string(CALIBRATION_SESSION_STORAGE_KEY, "null".into());
         }
+    }
+
+    fn auto_save_interval(&self) -> std::time::Duration {
+        // Wizard progress is small, and a shorter interval materially reduces
+        // loss after a browser or USB-driver crash. Completed profile changes
+        // are still checkpointed synchronously before they are reported as
+        // active.
+        std::time::Duration::from_secs(5)
     }
 }
 
@@ -7222,11 +7958,79 @@ fn build_device_job_command(
     }
 }
 
+fn encode_and_validate_print_route(
+    payload: PendingPrintJob,
+    plotter_mapping: PlotterMapping,
+    mode: &Mode,
+    canvas_size: &CanvasSize,
+) -> anyhow::Result<EncodedPrintJob> {
+    let plt = if mode.mode_type.has_cutting() {
+        if let Some(phases) = payload.calibration_phases.as_ref() {
+            encode_calibration_plt(phases, plotter_mapping, payload.material.passes)
+        } else {
+            encode_plt(
+                &payload.cut_shapes,
+                &payload.cut_modes,
+                plotter_mapping,
+                canvas_size,
+                &payload.material,
+                payload.perf_cut,
+                payload.perf_dash,
+                payload.perf_gap,
+                payload.peel_tabs,
+                &payload.peel_tab_positions,
+                payload.overcut,
+            )
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Header inspection stays in the route worker with PLT generation. The
+    // USB sender must remain limited to short checks before touching WebUSB.
+    validate_print_job_image_dimensions(&payload, canvas_size)?;
+    Ok(EncodedPrintJob {
+        source: payload,
+        plt,
+    })
+}
+
+#[cfg(test)]
 fn validate_pixcut_job_documents(
     source: &PendingPrintJob,
     plt: &[u8],
     mode: &Mode,
     canvas_size: &CanvasSize,
+) -> anyhow::Result<()> {
+    validate_pixcut_job_envelope(source, plt, mode)?;
+    validate_print_job_image_dimensions(source, canvas_size)
+}
+
+fn validate_print_job_image_dimensions(
+    source: &PendingPrintJob,
+    canvas_size: &CanvasSize,
+) -> anyhow::Result<()> {
+    let dimensions = image::ImageReader::with_format(
+        Cursor::new(source.encoded_image.as_ref()),
+        image::ImageFormat::Jpeg,
+    )
+    .into_dimensions()
+    .context("could not read the prepared print JPEG dimensions")?;
+    let expected_width = canvas_size.size.x.round() as u32;
+    let expected_height = canvas_size.size.y.round() as u32;
+    anyhow::ensure!(
+        dimensions == (expected_width, expected_height),
+        "print JPEG is {}x{}; expected {expected_width}x{expected_height}",
+        dimensions.0,
+        dimensions.1
+    );
+    Ok(())
+}
+
+fn validate_pixcut_job_envelope(
+    source: &PendingPrintJob,
+    plt: &[u8],
+    mode: &Mode,
 ) -> anyhow::Result<()> {
     const MAX_JPEG_BYTES: usize = 1024 * 1024;
     anyhow::ensure!(
@@ -7254,18 +8058,6 @@ fn validate_pixcut_job_documents(
                 .any(|marker| marker == [0xff, 0xc2]),
         "PixCut print document must be a baseline JPEG"
     );
-    let decoded =
-        image::load_from_memory_with_format(&source.encoded_image, image::ImageFormat::Jpeg)
-            .context("could not decode the prepared PixCut JPEG")?;
-    let expected_width = canvas_size.size.x.round() as u32;
-    let expected_height = canvas_size.size.y.round() as u32;
-    anyhow::ensure!(
-        decoded.width() == expected_width && decoded.height() == expected_height,
-        "PixCut JPEG is {}x{}; expected {expected_width}x{expected_height}",
-        decoded.width(),
-        decoded.height()
-    );
-
     if !mode.mode_type.has_cutting() {
         anyhow::ensure!(
             plt.is_empty(),
@@ -7357,7 +8149,7 @@ fn build_calibration_print_job(
     Ok(PendingPrintJob {
         encoded_image_len: encoded_image.len(),
         image_hash: hex::encode(sha1::Sha1::digest(&encoded_image)),
-        encoded_image,
+        encoded_image: encoded_image.into(),
         created_at: current_timestamp_millis(),
         copies: 1,
         device_index: 0,
@@ -7563,6 +8355,17 @@ fn calibration_scan_preview(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
         image::ExtendedColorType::Rgba8,
     )?;
     Ok(png)
+}
+
+fn calibration_scan_analysis_config(
+    slot: ScanSlot,
+    primary_job: crate::calibration::JobStatus,
+) -> ScanAnalysisConfig {
+    ScanAnalysisConfig {
+        accept_compatible_sheet_binding: slot == ScanSlot::Training
+            && primary_job == crate::calibration::JobStatus::ExistingSheet,
+        ..ScanAnalysisConfig::default()
+    }
 }
 
 fn observations_cover_all_quadrants(observations: &[CalibrationObservation]) -> bool {
@@ -8209,6 +9012,52 @@ mod ui_tests;
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CalibrationTestStorage {
+        values: BTreeMap<String, String>,
+        discard_writes: bool,
+        flushed: bool,
+    }
+
+    impl eframe::Storage for CalibrationTestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            if !self.discard_writes {
+                self.values.insert(key.into(), value);
+            }
+        }
+
+        fn flush(&mut self) {
+            self.flushed = true;
+        }
+    }
+
+    #[test]
+    fn calibration_checkpoint_is_read_back_before_success() {
+        let store = CalibrationStore::default();
+        let mut storage = CalibrationTestStorage::default();
+        checkpoint_calibration_registry(Some(&mut storage), &store).unwrap();
+        assert!(storage.flushed);
+        assert_eq!(
+            eframe::get_value::<CalibrationRegistry>(&storage, CALIBRATION_REGISTRY_STORAGE_KEY),
+            Some(CalibrationRegistry::from_store(&store))
+        );
+
+        let mut failing = CalibrationTestStorage {
+            discard_writes: true,
+            ..CalibrationTestStorage::default()
+        };
+        let mut current = CalibrationStore::default();
+        let mut candidate = current.clone();
+        candidate.version = 7;
+        assert!(commit_calibration_store(Some(&mut failing), &mut current, candidate).is_err());
+        assert_eq!(current, CalibrationStore::default());
+        assert!(!failing.flushed);
+    }
+
     fn job_status(state: u8, reason: Option<serde_json::Value>) -> JobStatusInfo {
         serde_json::from_value(serde_json::json!({
             "job-id": 17,
@@ -8222,6 +9071,27 @@ mod tests {
             "job-state-reason": reason,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn only_the_existing_primary_sheet_accepts_a_compatible_binding() {
+        let existing = calibration_scan_analysis_config(
+            ScanSlot::Training,
+            crate::calibration::JobStatus::ExistingSheet,
+        );
+        assert!(existing.accept_compatible_sheet_binding);
+
+        let newly_printed = calibration_scan_analysis_config(
+            ScanSlot::Training,
+            crate::calibration::JobStatus::Completed,
+        );
+        assert!(!newly_printed.accept_compatible_sheet_binding);
+
+        let validation = calibration_scan_analysis_config(
+            ScanSlot::Validation,
+            crate::calibration::JobStatus::ExistingSheet,
+        );
+        assert!(!validation.accept_compatible_sheet_binding);
     }
 
     /// Opt-in native-USB end-to-end harness for a real PixCut. It is ignored
@@ -8391,7 +9261,7 @@ mod tests {
         let payload_size = transport.max_data_size() - size_of::<u32>();
         let mut last_heartbeat = std::time::Instant::now();
         let mut heartbeat_id = 80_100;
-        for document in [plt.as_slice(), source.encoded_image.as_slice()] {
+        for document in [plt.as_slice(), source.encoded_image.as_ref()] {
             let frame_count = usize::div_ceil(document.len(), payload_size);
             for (index, chunk) in document.chunks(payload_size).enumerate() {
                 if last_heartbeat.elapsed() >= crate::raw_usb::DATA_HEARTBEAT_INTERVAL {
@@ -9831,12 +10701,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(job.mapping_override, Some(override_mapping));
+        let cloned = job.clone();
+        assert!(Arc::ptr_eq(&job.encoded_image, &cloned.encoded_image));
         assert!(
             job.calibration_phases
                 .as_ref()
                 .unwrap()
                 .iter()
                 .all(|phase| phase.mode == CutMode::Kiss)
+        );
+
+        let mode = &DEVICES[job.device_index].modes[job.mode_index];
+        let canvas = &mode.canvas_sizes[job.canvas_index];
+        let routed = encode_and_validate_print_route(
+            cloned,
+            PlotterMapping::direct(override_mapping),
+            mode,
+            canvas,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &job.encoded_image,
+            &routed.source.encoded_image
+        ));
+        assert!(!routed.plt.is_empty());
+
+        let mut corrupt = job;
+        Arc::make_mut(&mut corrupt.encoded_image)[0] = 0;
+        assert!(
+            encode_and_validate_print_route(
+                corrupt,
+                PlotterMapping::direct(override_mapping),
+                mode,
+                canvas,
+            )
+            .err()
+            .expect("corrupt JPEG must be rejected")
+            .to_string()
+            .contains("dimensions")
         );
     }
 

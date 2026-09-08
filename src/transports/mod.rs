@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use futures::{
     lock::Mutex,
 };
 use tracing::{debug, error, info, instrument, trace, warn};
+use web_time::Instant;
 
 use crate::protocol::*;
 use crate::raw_usb::DATA_HEARTBEAT_INTERVAL;
@@ -54,6 +55,26 @@ pub const MAX_DATA_SIZE: usize = 896;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_JOB_POLLS: usize = 15 * 60;
 const MAX_MISSING_JOB_POLLS: usize = 30;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const MAX_WEBUSB_COMMAND_RESPONSE_READS: usize = 64;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const MAX_WEBUSB_UNMATCHED_COMMAND_RESPONSES: usize = 64;
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn validate_webusb_response_budget(
+    reads: usize,
+    unmatched: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        reads < MAX_WEBUSB_COMMAND_RESPONSE_READS,
+        "WebUSB command response exceeded {MAX_WEBUSB_COMMAND_RESPONSE_READS} reads"
+    );
+    anyhow::ensure!(
+        unmatched <= MAX_WEBUSB_UNMATCHED_COMMAND_RESPONSES,
+        "WebUSB command response exceeded {MAX_WEBUSB_UNMATCHED_COMMAND_RESPONSES} unmatched messages"
+    );
+    Ok(())
+}
 
 /// A transport for sending packet data.
 ///
@@ -866,6 +887,16 @@ mod tests {
         assert!(validate_job_poll_budget(7, MAX_JOB_POLLS + 1, 0).is_err());
         validate_job_poll_budget(7, 1, MAX_MISSING_JOB_POLLS - 1).unwrap();
         assert!(validate_job_poll_budget(7, 1, MAX_MISSING_JOB_POLLS).is_err());
+    }
+
+    #[test]
+    fn webusb_response_search_budget_is_finite_at_both_boundaries() {
+        validate_webusb_response_budget(MAX_WEBUSB_COMMAND_RESPONSE_READS - 1, 0).unwrap();
+        assert!(validate_webusb_response_budget(MAX_WEBUSB_COMMAND_RESPONSE_READS, 0).is_err());
+        validate_webusb_response_budget(0, MAX_WEBUSB_UNMATCHED_COMMAND_RESPONSES).unwrap();
+        assert!(
+            validate_webusb_response_budget(0, MAX_WEBUSB_UNMATCHED_COMMAND_RESPONSES + 1).is_err()
+        );
     }
 
     #[test]

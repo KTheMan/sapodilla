@@ -63,6 +63,10 @@ pub struct ScanAnalysisConfig {
     pub minimum_boundary_points: usize,
     pub maximum_circle_rms_mm: f64,
     pub accepted_confidence: f64,
+    /// Accept an internally valid binding from another run when the caller is
+    /// intentionally reusing a compatible physical calibration sheet.
+    #[serde(default)]
+    pub accept_compatible_sheet_binding: bool,
 }
 
 impl Default for ScanAnalysisConfig {
@@ -71,7 +75,8 @@ impl Default for ScanAnalysisConfig {
             backing_color_distance: 72.0,
             minimum_boundary_points: 36,
             maximum_circle_rms_mm: 0.22,
-            accepted_confidence: 0.72,
+            accepted_confidence: 0.45,
+            accept_compatible_sheet_binding: false,
         }
     }
 }
@@ -257,7 +262,12 @@ fn analyze_decoded(
             .collect::<Vec<_>>(),
         &located.centers,
     );
-    let run_binding_sha1 = verify_run_binding(&image, manifest, print_to_scanner)?;
+    let run_binding_sha1 = verify_run_binding(
+        &image,
+        manifest,
+        print_to_scanner,
+        config.accept_compatible_sheet_binding,
+    )?;
     let backing_rgb = sample_backing(&image, manifest, print_to_scanner)
         .ok_or(ScanAnalysisError::MissingBackingSample)?;
 
@@ -291,6 +301,7 @@ fn verify_run_binding(
     image: &RgbImage,
     manifest: &TargetManifest,
     print_to_scanner: Affine2d,
+    accept_compatible_sheet_binding: bool,
 ) -> Result<String, ScanAnalysisError> {
     let binding = manifest.diagnostics.iter().find_map(|diagnostic| {
         if let TargetDiagnostic::RunBinding {
@@ -373,10 +384,36 @@ fn verify_run_binding(
         .skip(8)
         .filter(|(actual, wanted)| actual != wanted)
         .count();
-    if sync_errors > 1 || payload_errors > 2 {
+    if sync_errors > 1 {
         return Err(ScanAnalysisError::RunBindingMismatch);
     }
-    Ok(digest_hex.clone())
+    if payload_errors <= 2 {
+        return Ok(digest_hex.clone());
+    }
+    if !accept_compatible_sheet_binding {
+        return Err(ScanAnalysisError::RunBindingMismatch);
+    }
+
+    // Legacy sheets carry a 32-bit digest prefix plus the complement of its
+    // first byte. That is enough to distinguish a coherent printed binding
+    // from noise even though the full originating run cannot be reconstructed.
+    let complement_errors = observed
+        .iter()
+        .skip(8)
+        .take(8)
+        .zip(observed.iter().skip(40).take(8))
+        .filter(|(identity, check)| **identity == **check)
+        .count();
+    if complement_errors > 2 {
+        return Err(ScanAnalysisError::RunBindingMismatch);
+    }
+    let mut prefix = [0_u8; 4];
+    for (byte_index, byte) in prefix.iter_mut().enumerate() {
+        for bit in 0..8 {
+            *byte |= u8::from(observed[8 + byte_index * 8 + bit]) << (7 - bit);
+        }
+    }
+    Ok(format!("compatible:{}", hex::encode(prefix)))
 }
 
 struct LocatedFiducials {
@@ -391,6 +428,31 @@ fn locate_fiducials(
     let reference =
         super::render_print_raster(manifest).map_err(|_| ScanAnalysisError::MissingFiducials)?;
     let canvas = [manifest.canvas.width_mm, manifest.canvas.height_mm];
+    let mut best: Option<(f64, LocatedFiducials)> = None;
+
+    // The large navy aperture patches form a clean, known grid and survive
+    // scanner-bed margins, liner text, and partially clipped edge fiducials.
+    // Use that grid to get close to the four corners before attempting the
+    // generic dark-pixel page search. Besides being more reliable on physical
+    // 600-DPI scans, this keeps the common browser path bounded to a sampled
+    // color pass plus four small template neighborhoods.
+    let station_candidates = station_grid_mapping_candidates(image, manifest);
+    for (orientation, initial) in station_candidates {
+        if let Some((score, located)) =
+            refine_fiducial_mapping(image, &reference, manifest, orientation, initial, Some(72))
+            && best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, located));
+        }
+    }
+    if let Some((score, located)) = best
+        && score >= 0.45 * 4.0
+    {
+        return Ok(located);
+    }
+
     let coarse = DarkIntegral::new(image);
     let mut best: Option<(f64, LocatedFiducials)> = None;
     let mut seeds = Vec::new();
@@ -450,59 +512,13 @@ fn locate_fiducials(
         {
             break;
         }
-        let mut centers = Vec::with_capacity(4);
-        let mut total_score = 0.0;
-        for fiducial in &manifest.fiducials {
-            let approximate = initial.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
-            let Some((center, score)) =
-                template_search(image, &reference, manifest, fiducial, initial, approximate)
-            else {
-                centers.clear();
-                break;
-            };
-            centers.push(center);
-            total_score += score;
-        }
-        if centers.len() == 4 {
-            let expected: Vec<_> = manifest
-                .fiducials
-                .iter()
-                .map(|fiducial| [fiducial.center_mm.x, fiducial.center_mm.y])
-                .collect();
-            for _ in 0..2 {
-                let Some(refined_mapping) = fit_affine(&expected, &centers) else {
-                    centers.clear();
-                    break;
-                };
-                total_score = 0.0;
-                for (center, fiducial) in centers.iter_mut().zip(&manifest.fiducials) {
-                    let approximate =
-                        refined_mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
-                    let (refined, score) = template_refine(
-                        image,
-                        &reference,
-                        manifest,
-                        fiducial,
-                        refined_mapping,
-                        approximate,
-                    );
-                    *center = refined;
-                    total_score += score;
-                }
-            }
-        }
-        if centers.len() == 4
+        if let Some((total_score, located)) =
+            refine_fiducial_mapping(image, &reference, manifest, orientation, initial, None)
             && best
                 .as_ref()
                 .is_none_or(|(best_score, _)| total_score > *best_score)
         {
-            best = Some((
-                total_score,
-                LocatedFiducials {
-                    orientation,
-                    centers,
-                },
-            ));
+            best = Some((total_score, located));
         }
     }
     let Some((score, located)) = best else {
@@ -514,7 +530,263 @@ fn locate_fiducials(
     Ok(located)
 }
 
-/// A max-pooled dark-pixel mask with a summed-area table. It makes a global
+fn refine_fiducial_mapping(
+    image: &RgbImage,
+    reference: &RgbImage,
+    manifest: &TargetManifest,
+    orientation: ScanOrientation,
+    initial: Affine2d,
+    maximum_search_radius: Option<i32>,
+) -> Option<(f64, LocatedFiducials)> {
+    let mut centers = Vec::with_capacity(4);
+    let mut total_score = 0.0;
+    for fiducial in &manifest.fiducials {
+        let approximate = initial.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+        let (center, score) = template_search(
+            image,
+            reference,
+            manifest,
+            fiducial,
+            initial,
+            approximate,
+            maximum_search_radius,
+        )?;
+        centers.push(center);
+        total_score += score;
+    }
+    let expected: Vec<_> = manifest
+        .fiducials
+        .iter()
+        .map(|fiducial| [fiducial.center_mm.x, fiducial.center_mm.y])
+        .collect();
+    for _ in 0..2 {
+        let refined_mapping = fit_affine(&expected, &centers)?;
+        total_score = 0.0;
+        for (center, fiducial) in centers.iter_mut().zip(&manifest.fiducials) {
+            let approximate = refined_mapping.apply([fiducial.center_mm.x, fiducial.center_mm.y]);
+            let (refined, score) = template_refine(
+                image,
+                reference,
+                manifest,
+                fiducial,
+                refined_mapping,
+                approximate,
+            );
+            *center = refined;
+            total_score += score;
+        }
+    }
+    Some((
+        total_score,
+        LocatedFiducials {
+            orientation,
+            centers,
+        },
+    ))
+}
+
+fn station_grid_mapping_candidates(
+    image: &RgbImage,
+    manifest: &TargetManifest,
+) -> Vec<(ScanOrientation, Affine2d)> {
+    let targets = manifest
+        .targets
+        .iter()
+        .filter(|target| target.kind == TargetKind::FlatbedAperture)
+        .collect::<Vec<_>>();
+    let mut print_x = targets
+        .iter()
+        .map(|target| target.center_mm.x)
+        .collect::<Vec<_>>();
+    let mut print_y = targets
+        .iter()
+        .map(|target| target.center_mm.y)
+        .collect::<Vec<_>>();
+    deduplicate_coordinates(&mut print_x);
+    deduplicate_coordinates(&mut print_y);
+    if print_x.len() < 2 || print_y.len() < 2 || targets.len() != print_x.len() * print_y.len() {
+        return Vec::new();
+    }
+
+    const MAX_GRID_EDGE: u32 = 1_400;
+    let divisor = image
+        .width()
+        .max(image.height())
+        .div_ceil(MAX_GRID_EDGE)
+        .max(1);
+    let sampled_width = image.width().div_ceil(divisor) as usize;
+    let sampled_height = image.height().div_ceil(divisor) as usize;
+    let mut navy_x_projection = vec![0_u32; sampled_width];
+    let mut navy_y_projection = vec![0_u32; sampled_height];
+    let mut neutral_x_projection = vec![0_u32; sampled_width];
+    let mut neutral_y_projection = vec![0_u32; sampled_height];
+    for sample_y in 0..sampled_height {
+        let y = (sample_y as u32 * divisor + divisor / 2).min(image.height() - 1);
+        for sample_x in 0..sampled_width {
+            let x = (sample_x as u32 * divisor + divisor / 2).min(image.width() - 1);
+            let rgb = image.get_pixel(x, y).0;
+            if is_aperture_navy(rgb) {
+                navy_x_projection[sample_x] += 1;
+                navy_y_projection[sample_y] += 1;
+            } else if is_neutral_patch_ink(rgb) {
+                neutral_x_projection[sample_x] += 1;
+                neutral_y_projection[sample_y] += 1;
+            }
+        }
+    }
+
+    // Saturated navy is much more selective on a color scan. Only fall back
+    // to neutral dark ink when the scanner actually emitted grayscale; mixing
+    // the two lets header text bias the projected station-row centers.
+    let navy_has_grid = projection_has_station_grid(
+        &navy_x_projection,
+        &navy_y_projection,
+        print_x.len(),
+        print_y.len(),
+        divisor,
+    );
+    let (x_projection, y_projection) = if navy_has_grid {
+        (&navy_x_projection, &navy_y_projection)
+    } else {
+        (&neutral_x_projection, &neutral_y_projection)
+    };
+
+    let upright_x = dominant_projection_centers(x_projection, print_x.len(), divisor);
+    let upright_y = dominant_projection_centers(y_projection, print_y.len(), divisor);
+    let rotated_x = dominant_projection_centers(x_projection, print_y.len(), divisor);
+    let rotated_y = dominant_projection_centers(y_projection, print_x.len(), divisor);
+
+    let mut output = Vec::with_capacity(4);
+    for orientation in [
+        ScanOrientation::Degrees0,
+        ScanOrientation::Degrees90,
+        ScanOrientation::Degrees180,
+        ScanOrientation::Degrees270,
+    ] {
+        let (observed_x, observed_y) = match orientation {
+            ScanOrientation::Degrees0 | ScanOrientation::Degrees180 => {
+                let (Some(x), Some(y)) = (&upright_x, &upright_y) else {
+                    continue;
+                };
+                (x, y)
+            }
+            ScanOrientation::Degrees90 | ScanOrientation::Degrees270 => {
+                let (Some(x), Some(y)) = (&rotated_x, &rotated_y) else {
+                    continue;
+                };
+                (x, y)
+            }
+        };
+        let destination = targets
+            .iter()
+            .map(|target| {
+                let xi = coordinate_index(&print_x, target.center_mm.x)?;
+                let yi = coordinate_index(&print_y, target.center_mm.y)?;
+                Some(match orientation {
+                    ScanOrientation::Degrees0 => [observed_x[xi], observed_y[yi]],
+                    ScanOrientation::Degrees90 => {
+                        [observed_x[print_y.len() - 1 - yi], observed_y[xi]]
+                    }
+                    ScanOrientation::Degrees180 => [
+                        observed_x[print_x.len() - 1 - xi],
+                        observed_y[print_y.len() - 1 - yi],
+                    ],
+                    ScanOrientation::Degrees270 => {
+                        [observed_x[yi], observed_y[print_x.len() - 1 - xi]]
+                    }
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let source = targets
+            .iter()
+            .map(|target| [target.center_mm.x, target.center_mm.y])
+            .collect::<Vec<_>>();
+        if let Some(mapping) = destination.and_then(|destination| fit_affine(&source, &destination))
+        {
+            output.push((orientation, mapping));
+        }
+    }
+    output
+}
+
+fn deduplicate_coordinates(values: &mut Vec<f64>) {
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| (*left - *right).abs() < 1e-6);
+}
+
+fn coordinate_index(values: &[f64], wanted: f64) -> Option<usize> {
+    values
+        .iter()
+        .position(|value| (*value - wanted).abs() < 1e-6)
+}
+
+fn dominant_projection_centers(
+    projection: &[u32],
+    expected_count: usize,
+    divisor: u32,
+) -> Option<Vec<f64>> {
+    let maximum = projection.iter().copied().max()?;
+    if maximum < 4 {
+        return None;
+    }
+    let threshold = (maximum / 8).max(3);
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < projection.len() {
+        if projection[index] < threshold {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut mass = 0_u64;
+        while index < projection.len() && projection[index] >= threshold {
+            mass += u64::from(projection[index]);
+            index += 1;
+        }
+        let end = index - 1;
+        if end - start + 1 >= 4 {
+            runs.push((mass, start, end));
+        }
+    }
+    if runs.len() < expected_count {
+        return None;
+    }
+    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
+    runs.truncate(expected_count);
+    runs.sort_by_key(|run| run.1);
+    Some(
+        runs.into_iter()
+            .map(|(_, start, end)| {
+                (start + end) as f64 * 0.5 * f64::from(divisor) + f64::from(divisor) * 0.5
+            })
+            .collect(),
+    )
+}
+
+fn projection_has_station_grid(
+    x_projection: &[u32],
+    y_projection: &[u32],
+    x_count: usize,
+    y_count: usize,
+    divisor: u32,
+) -> bool {
+    (dominant_projection_centers(x_projection, x_count, divisor).is_some()
+        && dominant_projection_centers(y_projection, y_count, divisor).is_some())
+        || (dominant_projection_centers(x_projection, y_count, divisor).is_some()
+            && dominant_projection_centers(y_projection, x_count, divisor).is_some())
+}
+
+fn is_aperture_navy(rgb: [u8; 3]) -> bool {
+    let [red, green, blue] = rgb.map(i16::from);
+    blue - red > 10 && blue - green > 5 && red < 150 && green < 165 && red + green + blue < 470
+}
+
+fn is_neutral_patch_ink(rgb: [u8; 3]) -> bool {
+    let [red, green, blue] = rgb.map(i16::from);
+    red.max(green).max(blue) - red.min(green).min(blue) < 28 && red + green + blue < 285
+}
+
+/// A sampled dark-pixel mask with a summed-area table. It makes a global
 /// page search proportional to a small, fixed analysis grid rather than to the
 /// potentially 60-megapixel source image.
 struct DarkIntegral {
@@ -535,9 +807,13 @@ impl DarkIntegral {
         let width = image.width().div_ceil(divisor) as usize;
         let height = image.height().div_ceil(divisor) as usize;
         let mut mask = vec![false; width * height];
-        for (x, y, pixel) in image.enumerate_pixels() {
-            if is_dark_neutral(pixel.0.map(f64::from)) {
-                mask[(y / divisor) as usize * width + (x / divisor) as usize] = true;
+        for y in 0..height {
+            let source_y = (y as u32 * divisor + divisor / 2).min(image.height() - 1);
+            for x in 0..width {
+                let source_x = (x as u32 * divisor + divisor / 2).min(image.width() - 1);
+                if is_dark_neutral(image.get_pixel(source_x, source_y).0.map(f64::from)) {
+                    mask[y * width + x] = true;
+                }
             }
         }
         let stride = width + 1;
@@ -733,11 +1009,15 @@ fn template_search(
     fiducial: &Fiducial,
     mapping: Affine2d,
     approximate: [f64; 2],
+    maximum_search_radius: Option<i32>,
 ) -> Option<([f64; 2], f64)> {
     let px_per_mm = mapping.matrix[0][0]
         .hypot(mapping.matrix[1][0])
         .max(mapping.matrix[0][1].hypot(mapping.matrix[1][1]));
-    let search_radius = (px_per_mm * 8.0).clamp(16.0, 240.0) as i32;
+    let mut search_radius = (px_per_mm * 8.0).clamp(16.0, 240.0) as i32;
+    if let Some(maximum) = maximum_search_radius {
+        search_radius = search_radius.min(maximum);
+    }
     let mut best: ([f64; 2], f64) = ([0.0, 0.0], f64::NEG_INFINITY);
     for step in [4_i32, 1_i32] {
         let (cx, cy, radius) = if step == 4 {
@@ -1482,6 +1762,15 @@ mod tests {
         bed
     }
 
+    fn grayscale(image: &mut RgbImage) {
+        for pixel in image.pixels_mut() {
+            let [red, green, blue] = pixel.0;
+            let luminance =
+                (u32::from(red) * 54 + u32::from(green) * 183 + u32::from(blue) * 19) / 256;
+            *pixel = Rgb([luminance as u8; 3]);
+        }
+    }
+
     fn rewrite_png_dimensions(mut bytes: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
         // PNG signature (8), length (4), then the IHDR type/data. Recompute
         // the chunk CRC so the decoder accepts the deliberately huge header.
@@ -1582,6 +1871,66 @@ mod tests {
     }
 
     #[test]
+    fn grayscale_bed_localization_handles_rotation_and_sampling_phase() {
+        let manifest = manifest();
+        for (rotation_degrees, expected, dimensions, offset) in [
+            (0.0, ScanOrientation::Degrees0, [1_800, 2_100], [311, 227]),
+            (90.0, ScanOrientation::Degrees90, [2_100, 1_800], [317, 503]),
+            (
+                270.0,
+                ScanOrientation::Degrees270,
+                [2_100, 1_800],
+                [503, 317],
+            ),
+        ] {
+            let mut sheet = fixture(
+                &manifest,
+                FixtureOptions {
+                    scale: 8.0,
+                    rotation_degrees,
+                    ..FixtureOptions::default()
+                },
+            );
+            grayscale(&mut sheet);
+            let bed = place_on_bed(&sheet, dimensions, offset);
+            let located = locate_fiducials(&bed, &manifest).unwrap_or_else(|error| {
+                panic!("{rotation_degrees} degree grayscale scan failed: {error}")
+            });
+            assert_eq!(located.orientation, expected);
+        }
+    }
+
+    #[test]
+    fn color_grid_seed_ignores_neutral_scanner_bed_artifacts() {
+        let manifest = manifest();
+        let sheet = fixture(
+            &manifest,
+            FixtureOptions {
+                scale: 8.0,
+                ..FixtureOptions::default()
+            },
+        );
+        let mut bed = place_on_bed(&sheet, [1_800, 2_100], [311, 227]);
+        // A dark scanner-lid strip plus neutral header-like material has more
+        // projected mass than one aperture row. It must not be mixed into the
+        // saturated navy grid used to estimate the page origin.
+        for y in 60..200 {
+            for x in 300..1_300 {
+                bed.put_pixel(x, y, Rgb([32, 32, 36]));
+            }
+        }
+
+        let candidates = station_grid_mapping_candidates(&bed, &manifest);
+        let upright = candidates
+            .iter()
+            .find(|(orientation, _)| *orientation == ScanOrientation::Degrees0)
+            .map(|(_, mapping)| *mapping)
+            .expect("upright navy grid seed");
+        assert!((upright.translation[0] - 335.0).abs() < 5.0, "{upright:?}");
+        assert!((upright.translation[1] - 251.0).abs() < 5.0, "{upright:?}");
+    }
+
+    #[test]
     fn clean_600_dpi_fixture_localizes_below_one_print_pixel() {
         let manifest = manifest();
         let image = fixture(
@@ -1647,6 +1996,26 @@ mod tests {
             analyze_flatbed_scan(&encoded, &next_candidate, ScanAnalysisConfig::default()),
             Err(ScanAnalysisError::RunBindingMismatch)
         ));
+    }
+
+    #[test]
+    fn compatible_binding_policy_reuses_an_earlier_calibration_sheet() {
+        let printed = manifest();
+        let image = fixture(&printed, FixtureOptions::default());
+        let current_run =
+            flatbed_calibration(ManifestIdentity::stock("replacement-wizard-run")).unwrap();
+        let report = analyze_flatbed_scan(
+            &encode_png(&image),
+            &current_run,
+            ScanAnalysisConfig {
+                accept_compatible_sheet_binding: true,
+                ..ScanAnalysisConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.run_binding_sha1.starts_with("compatible:"));
+        assert!(report.accepted_count() >= 8);
     }
 
     #[test]

@@ -57,6 +57,109 @@ fn open_calibration_fixture(harness: &mut Harness<'_, SapodillaApp>) {
 }
 
 #[test]
+fn current_print_route_error_releases_job_and_retains_retry_payload() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    let state = harness.state_mut();
+    state
+        .job_queue
+        .add_printer(QueuePrinter::new("printer-a", "PixCut").with_capabilities(["print", "cut"]))
+        .unwrap();
+    let job_id = state.job_queue.enqueue(
+        JobSpec::named("validation")
+            .requiring(["print", "cut"])
+            .restricted_to(["printer-a"]),
+    );
+    assert_eq!(state.job_queue.route_next().unwrap().job_id, job_id);
+    state.active_queue_job = Some(job_id);
+    state.active_queue_jobs.insert("printer-a".into(), job_id);
+    state.send_progress = Some(0.5);
+    state.pending_print_jobs.insert(
+        job_id,
+        build_calibration_print_job(
+            ManifestIdentity::stock("route-error"),
+            CalibrationMethod::FlatbedScanner,
+            CalibrationJobSlot::Validation,
+            MaterialProfile::default(),
+            Some(CanvasToPlotter::legacy_pixcut_s1(2100.0)),
+        )
+        .unwrap(),
+    );
+
+    state
+        .tx
+        .send(Action::PrintRouteEncoded {
+            printer_id: "printer-a".into(),
+            job_id,
+            result: Err(anyhow::anyhow!("worker validation failed")),
+        })
+        .unwrap();
+    state.apply_actions();
+
+    assert_eq!(
+        state.job_queue.job(job_id).unwrap().status,
+        QueueJobStatus::Error
+    );
+    assert!(!state.active_queue_jobs.contains_key("printer-a"));
+    assert_eq!(state.active_queue_job, None);
+    assert_eq!(state.send_progress, None);
+    assert!(state.pending_print_jobs.contains_key(&job_id));
+    state.job_queue.retry(job_id).unwrap();
+    assert_eq!(
+        state.job_queue.job(job_id).unwrap().status,
+        QueueJobStatus::Queued
+    );
+}
+
+#[test]
+fn stale_print_route_error_cannot_disturb_the_current_route() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    let state = harness.state_mut();
+    let stale_job_id = 41;
+    let current_job_id = 42;
+    state.active_queue_job = Some(current_job_id);
+    state
+        .active_queue_jobs
+        .insert("printer-a".into(), current_job_id);
+    state.send_progress = Some(0.75);
+
+    state
+        .tx
+        .send(Action::PrintRouteEncoded {
+            printer_id: "printer-a".into(),
+            job_id: stale_job_id,
+            result: Err(anyhow::anyhow!("stale worker failure")),
+        })
+        .unwrap();
+    state.apply_actions();
+
+    assert_eq!(state.active_queue_job, Some(current_job_id));
+    assert_eq!(
+        state.active_queue_jobs.get("printer-a"),
+        Some(&current_job_id)
+    );
+    assert_eq!(state.send_progress, Some(0.75));
+    assert!(state.error.is_none());
+}
+
+#[test]
+fn action_backlog_is_bounded_per_frame() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    let state = harness.state_mut();
+    for _ in 0..=MAX_ACTIONS_PER_FRAME {
+        state
+            .tx
+            .send(Action::SendProgress {
+                job_id: u64::MAX,
+                progress: 0.5,
+            })
+            .unwrap();
+    }
+
+    assert!(state.apply_actions());
+    assert!(!state.apply_actions());
+}
+
+#[test]
 fn calibration_method_chooser_names_printer_media_and_east_bay_credit() {
     let mut harness = app_harness(Vec2::new(1180.0, 900.0));
     open_calibration_fixture(&mut harness);
@@ -68,6 +171,119 @@ fn calibration_method_chooser_names_printer_media_and_east_bay_credit() {
     harness.get_by_label("Manual");
     harness.get_by_label("View the documented method");
     harness.get_by_label("Progress");
+    assert!(
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Skip step")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn calibration_activation_result_is_visible_on_success_and_failure() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    open_calibration_fixture(&mut harness);
+
+    harness
+        .state_mut()
+        .present_calibration_activation_result(Err("Profile could not be activated.".into()));
+    harness.run();
+    harness.get_by_label("Profile could not be activated.");
+    assert!(harness.state().calibration_session.is_some());
+
+    harness
+        .state_mut()
+        .present_calibration_activation_result(Ok(()));
+    harness.run();
+    harness.get_by_label("Calibration profiles");
+    harness.get_by_label("Calibration profile activated.");
+    assert!(harness.state().calibration_session.is_none());
+    assert!(harness.state().show_calibration_profiles);
+}
+
+#[test]
+fn scan_evidence_opens_fullscreen_and_escape_returns_to_the_wizard() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    open_calibration_fixture(&mut harness);
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.method = Some(CalibrationMethod::FlatbedScanner);
+        session.wizard.step = crate::calibration::WizardStep::ReviewScan;
+        session.wizard.training_scan = crate::calibration::ScanImportStatus::Imported {
+            file_name: "scan.png".into(),
+            accepted_targets: 8,
+            all_quadrants: true,
+        };
+        session.training_scan_report = Some(crate::calibration::ScanAnalysisReport {
+            format: crate::calibration::ScanImageFormat::Png,
+            scan_dimensions_px: [5100, 7012],
+            orientation: crate::calibration::ScanOrientation::Degrees0,
+            scanner_to_print: crate::calibration::Affine2d::IDENTITY,
+            backing_rgb: [255.0; 3],
+            fiducial_rms_px: 0.25,
+            run_binding_sha1: "0".repeat(40),
+            targets: Vec::new(),
+        });
+        session.training_scan_preview_png = Some(Arc::from(
+            include_bytes!("../../docs/review-evidence/transform-fixture.png").as_slice(),
+        ));
+        session.training_scan_preview_sha1 = Some("fixture-preview".into());
+    }
+    harness.run();
+
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Open full-screen calibration scan evidence",
+        )
+        .click_accesskit();
+    harness.run();
+    harness.get_by_label("Calibration scan and detected cut edges");
+    harness.get_by_label("Close full-screen evidence");
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert_eq!(
+        harness
+            .query_all_by_label("Calibration scan and detected cut edges")
+            .count(),
+        0
+    );
+    harness.get_by_label("Review detected targets");
+    assert_eq!(harness.query_all_by_label("Leave calibration?").count(), 0);
+}
+
+#[test]
+fn discard_uses_a_modal_confirmation_and_can_return_to_calibration() {
+    let mut harness = app_harness(Vec2::new(700.0, 620.0));
+    open_calibration_fixture(&mut harness);
+    harness.get_by_label("Use Manual").click_accesskit();
+    harness.run();
+
+    harness.get_by_label("Discard…").click_accesskit();
+    harness.run();
+    harness.get_by_label("Leave calibration?");
+    harness.get_by_label("Save progress and exit");
+    harness.get_by_label("Discard run");
+    assert!(
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Next")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness.get_by_label("Keep calibrating").click_accesskit();
+    harness.run();
+
+    assert_eq!(harness.query_all_by_label("Leave calibration?").count(), 0);
+    harness.get_by_label("Print-to-cut calibration");
+    assert!(harness.state().calibration_session.is_some());
+
+    harness.get_by_label("Discard…").click_accesskit();
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert_eq!(harness.query_all_by_label("Leave calibration?").count(), 0);
+    assert!(harness.state().calibration_session.is_some());
 }
 
 #[test]
@@ -81,6 +297,60 @@ fn compact_calibration_uses_progress_header_and_reaches_manual_prepare() {
     harness.run();
     harness.get_by_label("Before you start");
     harness.get_by_label("View the documented method");
+    assert!(
+        !harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Skip step")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn manual_calibration_can_continue_with_an_existing_printed_sheet() {
+    let mut harness = app_harness(Vec2::new(560.0, 520.0));
+    open_calibration_fixture(&mut harness);
+    harness.get_by_label("Use Manual").click_accesskit();
+    harness.run();
+    harness.get_by_label("Next").click_accesskit();
+    harness.run();
+    harness.get_by_label("Skip step").click_accesskit();
+    harness.run();
+    harness.get_by_label("Print and cut the calibration sheet");
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.primary_job = crate::calibration::JobStatus::Queued;
+    }
+    harness.run();
+    assert!(
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Use existing sheet")
+            .accesskit_node()
+            .is_disabled()
+    );
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.primary_job = crate::calibration::JobStatus::Failed;
+        session.primary_queue_job = Some(4242);
+    }
+    harness.run();
+    harness.get_by_label("Use existing sheet").click_accesskit();
+    harness.run();
+
+    let wizard = &harness.state().calibration_session.as_ref().unwrap().wizard;
+    assert_eq!(wizard.step, crate::calibration::WizardStep::PrintArea);
+    assert_eq!(
+        wizard.primary_job,
+        crate::calibration::JobStatus::ExistingSheet
+    );
+    assert_eq!(
+        harness
+            .state()
+            .calibration_session
+            .as_ref()
+            .unwrap()
+            .primary_queue_job,
+        None
+    );
 }
 
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {
@@ -143,6 +413,89 @@ fn fresh_workspace_exposes_primary_and_contextual_entry_points() {
     );
     harness.get_by_label("Generate Cut Lines");
     harness.get_by_label("Shape designer");
+}
+
+#[test]
+fn start_artwork_help_can_be_dismissed_and_returns_for_a_new_sheet() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    harness.get_by_label("Start with your artwork");
+    let dismiss =
+        harness.get_by_role_and_label(egui::accesskit::Role::Button, "Dismiss start artwork help");
+    assert!(dismiss.rect().width() >= 32.0 && dismiss.rect().height() >= 32.0);
+    dismiss.click_accesskit();
+    harness.run();
+    assert_eq!(
+        harness
+            .query_all_by_label("Start with your artwork")
+            .count(),
+        0
+    );
+
+    harness.state_mut().start_new_sheet();
+    harness.run();
+    harness.get_by_label("Start with your artwork");
+}
+
+#[test]
+fn compact_calibration_keeps_optional_skip_navigation_inside_the_viewport() {
+    let mut harness = app_harness(Vec2::new(560.0, 520.0));
+    open_calibration_fixture(&mut harness);
+    {
+        let wizard = &mut harness
+            .state_mut()
+            .calibration_session
+            .as_mut()
+            .unwrap()
+            .wizard;
+        advance_calibration_to_print_area(wizard);
+    }
+    harness.run();
+
+    let skip = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Skip step");
+    let viewport = harness.ctx.content_rect();
+    let title_rect = harness.get_by_label("Print-to-cut calibration").rect();
+    let step_rect = harness
+        .get_by_label("Optional: record the printable area")
+        .rect();
+    assert!(
+        title_rect.bottom() <= viewport.bottom() && title_rect.top() >= viewport.top(),
+        "calibration window should remain inside the compact viewport {viewport:?}, got {title_rect:?}"
+    );
+    assert!(
+        skip.rect().bottom() <= viewport.bottom() && skip.rect().top() >= viewport.top(),
+        "skip navigation should remain inside the compact viewport {viewport:?}; title {title_rect:?}, step {step_rect:?}, skip {:?}",
+        skip.rect()
+    );
+    skip.click_accesskit();
+    harness.run();
+    assert_eq!(
+        harness
+            .state()
+            .calibration_session
+            .as_ref()
+            .unwrap()
+            .wizard
+            .step,
+        crate::calibration::WizardStep::PrintScale
+    );
+}
+
+fn advance_calibration_to_print_area(wizard: &mut CalibrationWizard) {
+    wizard
+        .select_method(CalibrationMethod::ManualEastBay, 1)
+        .unwrap();
+    wizard.next(2).unwrap();
+    wizard.confirm_prepared(true, 3);
+    wizard.next(4).unwrap();
+    wizard.set_job_status(
+        CalibrationJobSlot::Primary,
+        crate::calibration::JobStatus::Completed,
+        5,
+    );
+    assert_eq!(
+        wizard.next(6).unwrap(),
+        crate::calibration::WizardStep::PrintArea
+    );
 }
 
 #[test]

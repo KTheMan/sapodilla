@@ -34,6 +34,7 @@ pub const LINK_BREAK: &str = phosphor::LINK_BREAK;
 pub const LOCK: &str = phosphor::LOCK;
 pub const LOCK_OPEN: &str = phosphor::LOCK_OPEN;
 pub const CUT_PREVIEW: &str = phosphor::SCISSORS;
+pub const CLOSE: &str = phosphor::X;
 pub const EDIT_NODES: &str = phosphor::VECTOR_THREE;
 pub const RULERS: &str = phosphor::RULER;
 pub const SAVE: &str = phosphor::FLOPPY_DISK;
@@ -69,6 +70,7 @@ mod tests {
             GRID,
             RULERS,
             CUT_PREVIEW,
+            CLOSE,
             EDIT_NODES,
             LIBRARY,
             INSPECTOR,
@@ -99,6 +101,7 @@ mod tests {
                 GRID,
                 RULERS,
                 CUT_PREVIEW,
+                CLOSE,
                 EDIT_NODES,
                 LIBRARY,
                 INSPECTOR,
