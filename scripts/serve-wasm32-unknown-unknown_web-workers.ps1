@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$env:NO_COLOR = 'true'
 
 $env:RUSTUP_TOOLCHAIN = if ($env:RUST_NIGHTLY_VERSION) {
     $env:RUST_NIGHTLY_VERSION
