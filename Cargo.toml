@@ -51,8 +51,6 @@ thiserror = "2.0.18"
 tracing = "0.1"
 web-time = "1.1.0"
 web-sys = { version = "0.3", features = [
-    "Blob",
-    "ImageBitmap",
     "Serial",
     "SerialPort",
     "SerialPortInfo",
@@ -62,8 +60,6 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "Performance",
     "StorageManager",
-    "OffscreenCanvas",
-    "OffscreenCanvasRenderingContext2d",
     "WritableStream",
     "WritableStreamDefaultWriter",
     "Window",
