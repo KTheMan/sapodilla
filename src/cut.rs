@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use egui::{Pos2, Vec2};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -188,7 +188,7 @@ pub struct CutGenerator {
 /// raster when a generation starts.
 pub(crate) struct CutImage {
     id: String,
-    image: image::RgbaImage,
+    image: Arc<image::RgbaImage>,
     size: Vec2,
     offset: Pos2,
     rotation_degrees: f32,
@@ -284,7 +284,7 @@ impl CutGenerator {
         // and diagonals.
         let size = image.size;
         let resized = imageops::resize(
-            &image.image,
+            image.image.as_ref(),
             size.x as u32,
             size.y as u32,
             FilterType::Gaussian,
@@ -584,7 +584,7 @@ mod tests {
         });
         let image = CutImage {
             id: "test-image".into(),
-            image: pixels,
+            image: Arc::new(pixels),
             size: Vec2::new(64.0, 48.0),
             offset: Pos2::new(10.0, 20.0),
             rotation_degrees: 0.0,

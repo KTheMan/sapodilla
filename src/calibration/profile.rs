@@ -366,7 +366,7 @@ impl CalibrationRun {
         self.queue_job_ids.truncate(MAX_RUN_JOB_IDS);
         self.device_job_ids.truncate(MAX_RUN_JOB_IDS);
         self.payload_hashes.truncate(3);
-        self.reused_sheet_slots.truncate(2);
+        self.reused_sheet_slots.truncate(3);
         for slot in &mut self.reused_sheet_slots {
             *slot = bounded_trim(slot);
         }
@@ -409,6 +409,10 @@ impl CalibrationRun {
                 .iter()
                 .find(|payload| payload.slot == "validation");
             let primary_reused = self.reused_sheet_slots.iter().any(|slot| slot == "primary");
+            let validation_reused = self
+                .reused_sheet_slots
+                .iter()
+                .any(|slot| slot == "validation");
             !validation.activation_passed(self.method)
                 || !self
                     .fit_candidates
@@ -417,7 +421,7 @@ impl CalibrationRun {
                 || self.queue_job_ids.len() < self.payload_hashes.len()
                 || self.device_job_ids.len() < self.payload_hashes.len()
                 || (!primary_reused && primary.is_none())
-                || validation_payload.is_none()
+                || (!validation_reused && validation_payload.is_none())
                 || primary.is_some_and(|payload| {
                     self.manifest.jpeg_sha1.as_deref() != Some(payload.jpeg_sha1.as_str())
                         || self.manifest.plt_sha1.as_deref() != Some(payload.plt_sha1.as_str())
@@ -461,7 +465,7 @@ impl CalibrationRun {
                     })
             })
             || self.reused_sheet_slots.iter().any(|slot| {
-                !matches!(slot.as_str(), "primary" | "second")
+                !matches!(slot.as_str(), "primary" | "second" | "validation")
                     || !reused_slots.insert(slot.as_str())
                     || self
                         .payload_hashes

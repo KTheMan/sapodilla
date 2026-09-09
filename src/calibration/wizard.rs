@@ -93,7 +93,7 @@ impl WizardStep {
     pub const fn skip_label(self) -> Option<&'static str> {
         match self {
             Self::Prepare => Some("Skip preparation walkthrough"),
-            Self::PrintCalibration | Self::PrintSecondCalibration => {
+            Self::PrintCalibration | Self::PrintSecondCalibration | Self::PrintValidation => {
                 Some("Use an existing compatible printed sheet")
             }
             Self::PrintArea => Some("Skip print-area measurements"),
@@ -556,11 +556,6 @@ impl CalibrationWizard {
     /// exactly as it is for a reprint.
     fn use_existing_sheet(&mut self, slot: JobSlot, now: u64) -> Result<(), WizardError> {
         self.ensure_active()?;
-        if slot == JobSlot::Validation {
-            return Err(WizardError::TransitionBlocked(
-                "validation requires a sheet printed for the current candidate".into(),
-            ));
-        }
         let status = match slot {
             JobSlot::Primary => self.primary_job,
             JobSlot::Second => self.second_job,
@@ -575,8 +570,11 @@ impl CalibrationWizard {
         *match slot {
             JobSlot::Primary => &mut self.primary_job,
             JobSlot::Second => &mut self.second_job,
-            JobSlot::Validation => unreachable!(),
+            JobSlot::Validation => &mut self.validation_job,
         } = JobStatus::ExistingSheet;
+        if slot == JobSlot::Validation {
+            self.validation = ValidationStatus::Collecting;
+        }
         self.touch(now);
         Ok(())
     }
@@ -638,6 +636,18 @@ impl CalibrationWizard {
             file_name: bounded_calibration_text(file_name),
         };
         self.touch(now);
+    }
+
+    pub fn update_scan_import_file_name(&mut self, slot: ScanSlot, file_name: &str, now: u64) {
+        if matches!(
+            self.scan_status_mut(slot),
+            ScanImportStatus::Importing { .. }
+        ) {
+            *self.scan_status_mut(slot) = ScanImportStatus::Importing {
+                file_name: bounded_calibration_text(file_name),
+            };
+            self.touch(now);
+        }
     }
 
     pub fn complete_scan_import(
@@ -981,6 +991,9 @@ impl CalibrationWizard {
             WizardStep::PrintSecondCalibration => {
                 self.use_existing_sheet(JobSlot::Second, now)?;
             }
+            WizardStep::PrintValidation => {
+                self.use_existing_sheet(JobSlot::Validation, now)?;
+            }
             WizardStep::PrintArea => {
                 self.mark_print_area_reviewed([None; 4], now)?;
             }
@@ -1143,8 +1156,8 @@ impl CalibrationWizard {
                 }
             }
             WizardStep::PrintValidation => {
-                if self.validation_job != JobStatus::Completed {
-                    return blocked("the new validation sheet has not completed");
+                if !self.validation_job.has_physical_output() {
+                    return blocked("the validation sheet is not ready");
                 }
                 match method {
                     Some(CalibrationMethod::FlatbedScanner) => {
@@ -1781,6 +1794,31 @@ mod tests {
         let resumed = CalibrationWizard::resume_json(&json).unwrap();
         assert_eq!(resumed.second_job, JobStatus::ExistingSheet);
         assert_eq!(resumed.step, WizardStep::SecondPrintScale);
+    }
+
+    #[test]
+    fn existing_validation_sheet_enters_flatbed_scan_flow_and_resumes() {
+        let mut wizard = CalibrationWizard::new("flatbed-existing-validation", 0).unwrap();
+        wizard.method = Some(CalibrationMethod::FlatbedScanner);
+        wizard.step = WizardStep::PrintValidation;
+
+        wizard.validation_job = JobStatus::Queued;
+        assert!(wizard.skip_current_step(1).is_err());
+        assert_eq!(wizard.step, WizardStep::PrintValidation);
+
+        wizard.validation_job = JobStatus::Failed;
+        assert_eq!(
+            wizard.skip_current_step(2).unwrap(),
+            WizardStep::RemoveValidationCenters
+        );
+        assert_eq!(wizard.validation_job, JobStatus::ExistingSheet);
+        assert_eq!(wizard.validation, ValidationStatus::Collecting);
+        assert_eq!(wizard.history.last(), Some(&WizardStep::PrintValidation));
+
+        let json = wizard.save_json(3).unwrap();
+        let resumed = CalibrationWizard::resume_json(&json).unwrap();
+        assert_eq!(resumed.validation_job, JobStatus::ExistingSheet);
+        assert_eq!(resumed.step, WizardStep::RemoveValidationCenters);
     }
 
     #[test]
