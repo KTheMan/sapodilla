@@ -48,7 +48,7 @@ jobs:
           test -f dist/coi-serviceworker.js
           test -f dist/icons/sapodilla-192.png
           test -f dist/icons/sapodilla-512.png
-          grep -q 'rel="manifest"' dist/index.html
+          grep -Eq 'rel="?manifest"?([[:space:]>])' dist/index.html
 
       - name: Test browser persistence and cache ownership
         run: node --test tests/web_persistence.test.mjs
