@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbImage};
+use image::{ImageFormat, ImageReader, Limits, RgbImage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -185,6 +185,62 @@ pub fn analyze_flatbed_scan(
     manifest: &TargetManifest,
     config: ScanAnalysisConfig,
 ) -> Result<ScanAnalysisReport, ScanAnalysisError> {
+    let (image, format) = decode_flatbed_scan(encoded)?;
+    analyze_decoded(&image, format, manifest, config)
+}
+
+/// Analyze a scan and derive its bounded review preview from the same decoded
+/// pixels. Browser callers should prefer this over decoding the original scan
+/// a second time solely to create a thumbnail.
+pub fn analyze_flatbed_scan_with_preview(
+    encoded: &[u8],
+    manifest: &TargetManifest,
+    config: ScanAnalysisConfig,
+    maximum_preview_side: u32,
+) -> Result<(ScanAnalysisReport, RgbImage), ScanAnalysisError> {
+    let (image, format) = decode_flatbed_scan(encoded)?;
+    let report = analyze_decoded(&image, format, manifest, config)?;
+    let maximum_preview_side = maximum_preview_side.max(1);
+    let longest = image.width().max(image.height()).max(1);
+    let preview = if longest <= maximum_preview_side {
+        image.clone()
+    } else {
+        let scale = f64::from(maximum_preview_side) / f64::from(longest);
+        image::imageops::resize(
+            &image,
+            (f64::from(image.width()) * scale).round().max(1.0) as u32,
+            (f64::from(image.height()) * scale).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+    Ok((report, preview))
+}
+
+fn decode_flatbed_scan(encoded: &[u8]) -> Result<(RgbImage, ScanImageFormat), ScanAnalysisError> {
+    let (guessed, format, _) = inspect_flatbed_scan(encoded)?;
+    let mut reader = ImageReader::with_format(Cursor::new(encoded), guessed);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_SCAN_PIXELS.min(u64::from(u32::MAX)) as u32);
+    limits.max_image_height = Some(MAX_SCAN_PIXELS.min(u64::from(u32::MAX)) as u32);
+    // Covers the largest supported decoded representation (RGBA16). The
+    // independently checked pixel product remains the authoritative limit.
+    limits.max_alloc = Some(MAX_SCAN_PIXELS * 8);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(ScanAnalysisError::Decode)?;
+    Ok((decoded.into_rgb8(), format))
+}
+
+/// Validate an encoded scan's format and declared dimensions without decoding
+/// its pixel buffer. Browser callers use this before handing compressed data to
+/// an image decoder so oversized files fail before a large allocation.
+pub fn flatbed_scan_dimensions(encoded: &[u8]) -> Result<[u32; 2], ScanAnalysisError> {
+    let (_, _, dimensions) = inspect_flatbed_scan(encoded)?;
+    Ok([dimensions.0, dimensions.1])
+}
+
+fn inspect_flatbed_scan(
+    encoded: &[u8],
+) -> Result<(ImageFormat, ScanImageFormat, (u32, u32)), ScanAnalysisError> {
     let guessed = image::guess_format(encoded).map_err(|_| ScanAnalysisError::UnsupportedFormat)?;
     let format = match guessed {
         ImageFormat::Png => ScanImageFormat::Png,
@@ -198,17 +254,7 @@ pub fn analyze_flatbed_scan(
         .into_dimensions()
         .map_err(ScanAnalysisError::Decode)?;
     validate_scan_dimensions(dimensions.0, dimensions.1)?;
-
-    let mut reader = ImageReader::with_format(Cursor::new(encoded), guessed);
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_SCAN_PIXELS.min(u64::from(u32::MAX)) as u32);
-    limits.max_image_height = Some(MAX_SCAN_PIXELS.min(u64::from(u32::MAX)) as u32);
-    // Covers the largest supported decoded representation (RGBA16). The
-    // independently checked pixel product remains the authoritative limit.
-    limits.max_alloc = Some(MAX_SCAN_PIXELS * 8);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(ScanAnalysisError::Decode)?;
-    analyze_decoded(decoded, format, manifest, config)
+    Ok((guessed, format, dimensions))
 }
 
 fn validate_scan_dimensions(width: u32, height: u32) -> Result<(), ScanAnalysisError> {
@@ -222,12 +268,11 @@ fn validate_scan_dimensions(width: u32, height: u32) -> Result<(), ScanAnalysisE
 }
 
 fn analyze_decoded(
-    decoded: DynamicImage,
+    image: &RgbImage,
     format: ScanImageFormat,
     manifest: &TargetManifest,
     config: ScanAnalysisConfig,
 ) -> Result<ScanAnalysisReport, ScanAnalysisError> {
-    let image = decoded.to_rgb8();
     validate_scan_dimensions(image.width(), image.height())?;
     let targets: Vec<_> = manifest
         .targets
@@ -241,7 +286,7 @@ fn analyze_decoded(
         return Err(ScanAnalysisError::MissingFiducials);
     }
 
-    let located = locate_fiducials(&image, manifest)?;
+    let located = locate_fiducials(image, manifest)?;
     let print_to_scanner = fit_affine(
         &manifest
             .fiducials
@@ -264,19 +309,19 @@ fn analyze_decoded(
         &located.centers,
     );
     let run_binding_sha1 = verify_run_binding(
-        &image,
+        image,
         manifest,
         print_to_scanner,
         config.accept_compatible_sheet_binding,
     )?;
-    let backing_rgb = sample_backing(&image, manifest, print_to_scanner)
+    let backing_rgb = sample_backing(image, manifest, print_to_scanner)
         .ok_or(ScanAnalysisError::MissingBackingSample)?;
 
     let targets = targets
         .into_iter()
         .map(|target| {
             detect_aperture(
-                &image,
+                image,
                 target,
                 print_to_scanner,
                 scanner_to_print,
@@ -1832,6 +1877,32 @@ mod tests {
     }
 
     #[test]
+    fn preview_analysis_matches_single_report_and_bounds_thumbnail() {
+        let manifest = manifest();
+        let image = fixture(&manifest, FixtureOptions::default());
+        let encoded = encode_png(&image);
+        assert_eq!(
+            flatbed_scan_dimensions(&encoded).unwrap(),
+            [image.width(), image.height()]
+        );
+        let expected =
+            analyze_flatbed_scan(&encoded, &manifest, ScanAnalysisConfig::default()).unwrap();
+        let (actual, preview) = analyze_flatbed_scan_with_preview(
+            &encoded,
+            &manifest,
+            ScanAnalysisConfig::default(),
+            320,
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(preview.width().max(preview.height()) <= 320);
+        let original_ratio = f64::from(image.width()) / f64::from(image.height());
+        let preview_ratio = f64::from(preview.width()) / f64::from(preview.height());
+        assert!((preview_ratio - original_ratio).abs() < 0.01);
+    }
+
+    #[test]
     fn uncropped_full_bed_scan_with_asymmetric_margins_is_localized() {
         let manifest = manifest();
         let sheet = fixture(
@@ -2044,6 +2115,28 @@ mod tests {
 
         assert!(report.run_binding_sha1.starts_with("compatible:"));
         assert!(report.accepted_count() >= 8);
+    }
+
+    #[test]
+    fn compatible_binding_policy_reuses_an_earlier_validation_sheet() {
+        let printed = flatbed_validation(ManifestIdentity::stock("older-validation-run")).unwrap();
+        let image = fixture(&printed, FixtureOptions::default());
+        let current =
+            flatbed_validation(ManifestIdentity::stock("current-validation-run")).unwrap();
+        let (report, preview) = analyze_flatbed_scan_with_preview(
+            &encode_png(&image),
+            &current,
+            ScanAnalysisConfig {
+                accept_compatible_sheet_binding: true,
+                ..ScanAnalysisConfig::default()
+            },
+            320,
+        )
+        .unwrap();
+
+        assert!(report.run_binding_sha1.starts_with("compatible:"));
+        assert_eq!(report.accepted_count(), 6);
+        assert!(preview.width().max(preview.height()) <= 320);
     }
 
     #[test]

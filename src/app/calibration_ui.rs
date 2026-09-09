@@ -343,7 +343,7 @@ fn render_step(
                 ui,
                 wizard,
                 JobSlot::Validation,
-                "Print and cut a new validation sheet",
+                "Prepare the validation sheet",
                 CalibrationUiEvent::PrintValidation,
                 state,
                 events,
@@ -584,9 +584,11 @@ fn render_print_job(
     ui.heading(heading);
     ui.label("Keep scaling at 100% / Actual size and use the production print-and-cut settings.");
     if slot == JobSlot::Primary && wizard.method == Some(CalibrationMethod::FlatbedScanner) {
-        ui.weak("You can reuse an earlier flatbed calibration sheet when it has the same 12-aperture target layout. Validation sheets are not interchangeable.");
+        ui.weak("You can reuse an earlier flatbed calibration sheet when it has the same 12-aperture target layout.");
     } else if slot == JobSlot::Second {
         ui.weak("You can reuse an earlier manual measurement sheet with the same target layout. Use a different physical sheet from the first set of measurements.");
+    } else if slot == JobSlot::Validation {
+        ui.weak("You can reuse an earlier validation sheet when it has the same six-aperture target layout.");
     }
     ui.add_space(8.0);
     ui.label(format!("Job status: {}", job_status_label(status)));
@@ -1697,6 +1699,7 @@ fn render_footer(
         let existing_sheet_slot = match wizard.step {
             WizardStep::PrintCalibration => Some(JobSlot::Primary),
             WizardStep::PrintSecondCalibration => Some(JobSlot::Second),
+            WizardStep::PrintValidation => Some(JobSlot::Validation),
             _ => None,
         };
         let existing_sheet_job_active = existing_sheet_slot.is_some_and(|slot| {
@@ -1959,7 +1962,7 @@ fn step_summary(step: WizardStep, method: Option<CalibrationMethod>) -> &'static
         }
         WizardStep::Candidate => "Fit the smallest correction model supported by the observations.",
         WizardStep::PrintValidation => {
-            "Test the candidate on fresh output that is excluded from fitting."
+            "Use validation measurements that remain excluded from fitting."
         }
         WizardStep::ReviewValidation => {
             "The held-out sheet decides whether the profile can be activated."

@@ -27,8 +27,9 @@ use crate::{
         CalibrationWizard, CanvasToPlotter, CutPathDirection, JobSlot as CalibrationJobSlot,
         ManifestIdentity, PrinterCalibrationKey, ScanAnalysisConfig, ScanAnalysisReport, ScanSlot,
         StablePrinterIdentity, TargetCutMode, TargetManifest, TransformBounds, ValidationMetrics,
-        analyze_flatbed_scan, flatbed_calibration, flatbed_validation, manual_calibration,
-        manual_validation, observation_error_metrics, render_print_raster, solve_calibration,
+        analyze_flatbed_scan_with_preview, flatbed_calibration, flatbed_validation,
+        manual_calibration, manual_validation, observation_error_metrics, render_print_raster,
+        solve_calibration,
     },
     cut::{CutAction, CutGenerator, CutImage, CutTuning, OvercutSettings, apply_overcut},
     export::{ToolpathStats, cut_svg, jpeg_pdf, toolpath_debug_svg},
@@ -189,6 +190,7 @@ pub struct CalibrationScanImport {
 #[derive(derive_more::Debug)]
 pub enum Action {
     Error(anyhow::Error),
+    DocumentSaveFinished(#[debug(skip)] anyhow::Result<()>),
     DiscoveredDevices {
         transport_index: usize,
         result: anyhow::Result<Vec<DiscoveredDevice>>,
@@ -283,6 +285,14 @@ pub enum Action {
         file_name: String,
         #[debug(skip)]
         result: Result<CalibrationScanImport, String>,
+    },
+    CalibrationScanStarted {
+        run_id: String,
+        validation_generation: u32,
+        physical_sheet_attempt: u32,
+        scan_request_generation: u32,
+        slot: ScanSlot,
+        file_name: String,
     },
     CalibrationCandidateSolved {
         run_id: String,
@@ -430,6 +440,7 @@ pub struct SapodillaApp {
     pub active_queue_jobs: BTreeMap<String, u64>,
     pending_print_jobs: BTreeMap<u64, PendingPrintJob>,
     print_preparing: bool,
+    document_saving: bool,
     pub send_progress: Option<f32>,
 
     pub packets: VecDeque<AvocadoPacket>,
@@ -482,6 +493,7 @@ pub struct SapodillaApp {
     #[cfg(target_arch = "wasm32")]
     next_external_calibration_request_id: u64,
     calibration_session: Option<CalibrationSession>,
+    calibration_scan_started_at: [Option<std::time::Instant>; 2],
     calibration_ui_state: calibration_ui::CalibrationUiState,
     show_calibration_profiles: bool,
     calibration_message: Option<String>,
@@ -685,6 +697,13 @@ impl<A> ContextSender<A> {
         self.ctx.request_repaint();
         Ok(())
     }
+
+    /// Enqueue from a browser worker without invoking egui's Window-backed
+    /// repaint callback on that worker. The UI polls while background work is
+    /// active and performs the repaint request on the main thread.
+    pub fn send_background(&self, action: A) -> Result<(), mpsc::SendError<A>> {
+        self.tx.send(action)
+    }
 }
 
 #[derive(Clone)]
@@ -694,8 +713,8 @@ pub struct LoadedImage {
     /// relationships from their artwork.
     pub id: String,
     pub name: String,
-    pub image: image::RgbaImage,
-    pub original_image: image::RgbaImage,
+    pub image: Arc<image::RgbaImage>,
+    pub original_image: Arc<image::RgbaImage>,
     pub sized_texture: egui::load::SizedTexture,
 
     pub offset: Pos2,
@@ -972,9 +991,6 @@ impl CalibrationSession {
     }
 
     fn sanitize_after_load(mut self) -> Option<Self> {
-        if !self.is_resumable() {
-            return None;
-        }
         let now = self.wizard.updated_at;
         for slot in [
             CalibrationJobSlot::Primary,
@@ -1005,6 +1021,37 @@ impl CalibrationSession {
                     .set_job_status(slot, crate::calibration::JobStatus::Failed, now);
             }
         }
+        for slot in [ScanSlot::Training, ScanSlot::Validation] {
+            let interrupted = matches!(
+                match slot {
+                    ScanSlot::Training => &self.wizard.training_scan,
+                    ScanSlot::Validation => &self.wizard.validation_scan,
+                },
+                crate::calibration::ScanImportStatus::Importing { .. }
+            );
+            if interrupted {
+                self.wizard.fail_scan_import(
+                    slot,
+                    "The previous scan analysis was interrupted. Choose the image again.",
+                    now,
+                );
+                match slot {
+                    ScanSlot::Training => {
+                        self.training_scan_report = None;
+                        self.training_scan_preview_png = None;
+                        self.training_scan_preview_sha1 = None;
+                    }
+                    ScanSlot::Validation => {
+                        self.validation_scan_report = None;
+                        self.validation_scan_preview_png = None;
+                        self.validation_scan_preview_sha1 = None;
+                    }
+                }
+            }
+        }
+        if !self.is_resumable() {
+            return None;
+        }
         self.primary_queue_job = None;
         self.second_queue_job = None;
         self.validation_queue_job = None;
@@ -1018,7 +1065,7 @@ const fn default_calibration_profile_version() -> u16 {
 
 #[derive(Clone)]
 struct RenderLayer {
-    image: image::RgbaImage,
+    image: Arc<image::RgbaImage>,
     size: Vec2,
     rotation_degrees: f32,
     visual_offset: Pos2,
@@ -1029,6 +1076,46 @@ struct RenderSnapshot {
     canvas: Vec2,
     background: [u8; 4],
     layers: Vec<RenderLayer>,
+}
+
+#[derive(Clone)]
+struct DocumentSaveSnapshot {
+    document: StudioDocument,
+    /// Pixel buffers stay shared with the live document until a mutation uses
+    /// `Arc::make_mut`; taking a save snapshot is therefore O(layer count).
+    images: Vec<Arc<image::RgbaImage>>,
+}
+
+impl DocumentSaveSnapshot {
+    fn encode(mut self) -> anyhow::Result<StudioDocument> {
+        anyhow::ensure!(
+            self.document.images.len() == self.images.len(),
+            "document image snapshot is inconsistent"
+        );
+        for (saved, image) in self.document.images.iter_mut().zip(self.images) {
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png).write_image(
+                image.as_bytes(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            )?;
+            let mut encoded = SavedImage::from_png(
+                &saved.name,
+                &png,
+                Pos2::from(saved.offset),
+                Vec2::from(saved.scale),
+                saved.rotation_degrees,
+                saved.cutting_enabled,
+                saved.locked,
+                saved.visible,
+            );
+            encoded.id.clone_from(&saved.id);
+            encoded.template_fit = saved.template_fit;
+            *saved = encoded;
+        }
+        Ok(self.document)
+    }
 }
 
 impl RenderSnapshot {
@@ -1053,7 +1140,7 @@ impl LoadedImage {
         let (width, height) = im.dimensions();
         trace!(width, height, "got image size");
 
-        let im = im.to_rgba8();
+        let im = Arc::new(im.into_rgba8());
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
             [width as usize, height as usize],
             im.as_bytes(),
@@ -1124,13 +1211,13 @@ impl LoadedImage {
     }
 
     pub fn apply_adjustments(&mut self) {
-        self.image = studio::adjust_image(&self.original_image, self.adjustments);
+        self.image = Arc::new(studio::adjust_image(&self.original_image, self.adjustments));
         self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 
     pub fn remove_background(&mut self, tolerance: u16, feather: u16) {
-        self.image = studio::remove_background(&self.image, tolerance, feather);
+        self.image = Arc::new(studio::remove_background(&self.image, tolerance, feather));
         self.original_image = self.image.clone();
         self.adjustments = ImageAdjustments::default();
         self.content_revision = self.content_revision.wrapping_add(1);
@@ -1138,15 +1225,15 @@ impl LoadedImage {
     }
 
     pub fn flip_horizontal(&mut self) {
-        image::imageops::flip_horizontal_in_place(&mut self.image);
-        image::imageops::flip_horizontal_in_place(&mut self.original_image);
+        image::imageops::flip_horizontal_in_place(Arc::make_mut(&mut self.image));
+        image::imageops::flip_horizontal_in_place(Arc::make_mut(&mut self.original_image));
         self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
 
     pub fn flip_vertical(&mut self) {
-        image::imageops::flip_vertical_in_place(&mut self.image);
-        image::imageops::flip_vertical_in_place(&mut self.original_image);
+        image::imageops::flip_vertical_in_place(Arc::make_mut(&mut self.image));
+        image::imageops::flip_vertical_in_place(Arc::make_mut(&mut self.original_image));
         self.content_revision = self.content_revision.wrapping_add(1);
         self.refresh_texture();
     }
@@ -1327,6 +1414,7 @@ impl SapodillaApp {
             active_queue_jobs: BTreeMap::new(),
             pending_print_jobs: BTreeMap::new(),
             print_preparing: false,
+            document_saving: false,
             send_progress: None,
 
             packets: Default::default(),
@@ -1379,6 +1467,7 @@ impl SapodillaApp {
             #[cfg(target_arch = "wasm32")]
             next_external_calibration_request_id: 1,
             calibration_session,
+            calibration_scan_started_at: [None, None],
             calibration_ui_state: calibration_ui::CalibrationUiState::default(),
             show_calibration_profiles: false,
             calibration_message: None,
@@ -1927,8 +2016,9 @@ impl SapodillaApp {
         );
     }
 
-    fn document(&self, kind: DocumentKind) -> anyhow::Result<StudioDocument> {
+    fn document_snapshot(&self, kind: DocumentKind) -> anyhow::Result<DocumentSaveSnapshot> {
         let mut document = StudioDocument::new(kind, self.get_canvas().size, self.background_color);
+        let mut snapshot_images = Vec::new();
         document.material = self.material_profiles[self.selected_material].clone();
         document.settings = DocumentSettings {
             selected_device: self.selected_device,
@@ -1959,26 +2049,19 @@ impl SapodillaApp {
             if sticker_selection.is_some_and(|selected| selected != index) {
                 continue;
             }
-            let mut png = Vec::new();
-            image::codecs::png::PngEncoder::new(&mut png).write_image(
-                image.image.as_bytes(),
-                image.image.width(),
-                image.image.height(),
-                image::ExtendedColorType::Rgba8,
-            )?;
-            let mut saved = SavedImage::from_png(
-                &image.name,
-                &png,
-                image.offset,
-                image.scale,
-                image.rotation_degrees,
-                image.enable_cutting,
-                image.locked || kind == DocumentKind::Template,
-                image.visible,
-            );
-            saved.template_fit = image.template_fit;
-            saved.id.clone_from(&image.id);
-            document.images.push(saved);
+            snapshot_images.push(image.image.clone());
+            document.images.push(SavedImage {
+                id: image.id.clone(),
+                name: image.name.clone(),
+                png: String::new(),
+                offset: image.offset.into(),
+                scale: image.scale.into(),
+                rotation_degrees: image.rotation_degrees,
+                cutting_enabled: image.enable_cutting,
+                locked: image.locked || kind == DocumentKind::Template,
+                visible: image.visible,
+                template_fit: image.template_fit,
+            });
         }
         document.ensure_object_ids();
         let saved_image_sources = self
@@ -2122,13 +2205,27 @@ impl SapodillaApp {
                     .flatten();
             }
         }
-        Ok(document)
+        Ok(DocumentSaveSnapshot {
+            document,
+            images: snapshot_images,
+        })
+    }
+
+    #[cfg(test)]
+    fn document(&self, kind: DocumentKind) -> anyhow::Result<StudioDocument> {
+        self.document_snapshot(kind)?.encode()
     }
 
     fn save_document(&mut self, kind: DocumentKind) {
-        let document = match self.document(kind) {
-            Ok(document) => document,
+        if self.document_saving {
+            return;
+        }
+        self.document_saving = true;
+
+        let snapshot = match self.document_snapshot(kind) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
+                self.document_saving = false;
                 self.error = Some(error);
                 return;
             }
@@ -2147,15 +2244,20 @@ impl SapodillaApp {
                 .save_file()
                 .await
             else {
+                let _ = tx.send(Action::DocumentSaveFinished(Ok(())));
                 return;
             };
-            let result = match document.to_json() {
-                Ok(data) => file.write(&data).await.map_err(anyhow::Error::from),
-                Err(error) => Err(error),
+            let (result_tx, result_rx) = futures::channel::oneshot::channel();
+            spawn_blocking(move || {
+                let result = snapshot.encode().and_then(|document| document.to_json());
+                let _ = result_tx.send(result);
+            });
+            let result = match result_rx.await {
+                Ok(Ok(data)) => file.write(&data).await.map_err(anyhow::Error::from),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow::anyhow!("document encoder stopped before saving")),
             };
-            if let Err(error) = result {
-                let _ = tx.send(Action::Error(error));
-            }
+            let _ = tx.send(Action::DocumentSaveFinished(result));
         });
     }
 
@@ -2752,12 +2854,13 @@ impl SapodillaApp {
 
         for loaded_image in self.loaded_images.iter().filter(|image| image.visible) {
             let image_size = loaded_image.size();
+            let source = loaded_image.image.as_ref();
 
             let resized_image = if loaded_image.scale == Vec2::ONE {
-                Cow::Borrowed(&loaded_image.image)
+                Cow::Borrowed(source)
             } else {
                 Cow::Owned(image::imageops::resize(
-                    &loaded_image.image,
+                    source,
                     image_size.x as u32,
                     image_size.y as u32,
                     image::imageops::FilterType::Lanczos3,
@@ -2861,6 +2964,12 @@ impl SapodillaApp {
                                 error!("could not disconnect from transport after error: {err}");
                             }
                         });
+                    }
+                }
+                Action::DocumentSaveFinished(result) => {
+                    self.document_saving = false;
+                    if let Err(error) = result {
+                        self.error = Some(error);
                     }
                 }
                 Action::DiscoveredDevices {
@@ -3102,7 +3211,7 @@ impl SapodillaApp {
                                 continue;
                             };
                             let loaded = &mut self.loaded_images[index];
-                            loaded.image = image;
+                            loaded.image = Arc::new(image);
                             loaded.original_image = loaded.image.clone();
                             loaded.adjustments = ImageAdjustments::default();
                             loaded.content_revision = loaded.content_revision.wrapping_add(1);
@@ -3127,7 +3236,7 @@ impl SapodillaApp {
                                 && loaded.adjustments == adjustments
                         })
                     {
-                        loaded.image = image;
+                        loaded.image = Arc::new(image);
                         loaded.adjustments = adjustments;
                         loaded.content_revision = loaded.content_revision.wrapping_add(1);
                         loaded.refresh_texture();
@@ -3145,7 +3254,7 @@ impl SapodillaApp {
                         .find(|loaded| loaded.id == image_id)
                         .filter(|loaded| loaded.content_revision == source_revision)
                     {
-                        loaded.image = image;
+                        loaded.image = Arc::new(image);
                         loaded.original_image = loaded.image.clone();
                         loaded.adjustments = ImageAdjustments::default();
                         loaded.content_revision = loaded.content_revision.wrapping_add(1);
@@ -3539,6 +3648,33 @@ impl SapodillaApp {
                         }
                     }
                 }
+                Action::CalibrationScanStarted {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name,
+                } => {
+                    let Some(session) = self.calibration_session.as_mut().filter(|session| {
+                        session.accepts_scan_result(
+                            &run_id,
+                            validation_generation,
+                            slot,
+                            physical_sheet_attempt,
+                            scan_request_generation,
+                        )
+                    }) else {
+                        continue;
+                    };
+                    session.wizard.update_scan_import_file_name(
+                        slot,
+                        &file_name,
+                        current_timestamp_millis(),
+                    );
+                    self.calibration_scan_started_at[CalibrationSession::scan_slot_index(slot)] =
+                        Some(std::time::Instant::now());
+                }
                 Action::CalibrationScanAnalyzed {
                     run_id,
                     validation_generation,
@@ -3559,6 +3695,8 @@ impl SapodillaApp {
                     }) else {
                         continue;
                     };
+                    self.calibration_scan_started_at[CalibrationSession::scan_slot_index(slot)] =
+                        None;
                     let now = current_timestamp_millis();
                     match result {
                         Ok(import) => {
@@ -4065,7 +4203,19 @@ impl SapodillaApp {
         if method != CalibrationMethod::FlatbedScanner {
             return;
         }
-        let scan_config = calibration_scan_analysis_config(slot, session.wizard.primary_job);
+        if cfg!(all(target_arch = "wasm32", not(feature = "web-workers"))) {
+            let message = "Calibration scan analysis requires the high-performance browser build. Reload the published app or use the desktop app, then try again.";
+            session
+                .wizard
+                .fail_scan_import(slot, message, current_timestamp_millis());
+            self.calibration_message = Some(message.into());
+            return;
+        }
+        let scan_config = calibration_scan_analysis_config(
+            slot,
+            session.wizard.primary_job,
+            session.wizard.validation_job,
+        );
         session
             .wizard
             .begin_scan_import(slot, "choosing file…", current_timestamp_millis());
@@ -4110,18 +4260,48 @@ impl SapodillaApp {
                 return;
             };
             let file_name = file.file_name();
+            let _ = tx.send(Action::CalibrationScanStarted {
+                run_id: run_id.clone(),
+                validation_generation,
+                physical_sheet_attempt,
+                scan_request_generation,
+                slot,
+                file_name: file_name.clone(),
+            });
             let bytes = file.read().await;
+            #[cfg(target_arch = "wasm32")]
+            let bytes = match browser_downsample_calibration_scan(&bytes).await {
+                Ok(Some(downsampled)) => downsampled,
+                Ok(None) => bytes,
+                Err(message) => {
+                    let _ = tx.send(Action::CalibrationScanAnalyzed {
+                        run_id,
+                        validation_generation,
+                        physical_sheet_attempt,
+                        scan_request_generation,
+                        slot,
+                        file_name,
+                        result: Err(message),
+                    });
+                    return;
+                }
+            };
             spawn_blocking(move || {
                 let manifest =
                     calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
                 let result = manifest
                     .map_err(|error| error.to_string())
                     .and_then(|manifest| {
-                        analyze_flatbed_scan(&bytes, &manifest, scan_config)
-                            .map_err(|error| error.to_string())
+                        analyze_flatbed_scan_with_preview(
+                            &bytes,
+                            &manifest,
+                            scan_config,
+                            CALIBRATION_SCAN_PREVIEW_MAX_SIDE,
+                        )
+                        .map_err(|error| error.to_string())
                     })
-                    .and_then(|report| {
-                        calibration_scan_preview(&bytes)
+                    .and_then(|(report, preview)| {
+                        calibration_scan_preview(&preview)
                             .map(|preview_png| CalibrationScanImport {
                                 report,
                                 preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
@@ -4129,7 +4309,7 @@ impl SapodillaApp {
                             })
                             .map_err(|error| error.to_string())
                     });
-                let _ = tx.send(Action::CalibrationScanAnalyzed {
+                let _ = tx.send_background(Action::CalibrationScanAnalyzed {
                     run_id,
                     validation_generation,
                     physical_sheet_attempt,
@@ -4140,6 +4320,29 @@ impl SapodillaApp {
                 });
             });
         });
+    }
+
+    fn expire_stalled_calibration_scans(&mut self) {
+        const SCAN_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        for slot in [ScanSlot::Training, ScanSlot::Validation] {
+            let index = CalibrationSession::scan_slot_index(slot);
+            let timed_out = self.calibration_scan_started_at[index]
+                .is_some_and(|started| started.elapsed() >= SCAN_IMPORT_TIMEOUT);
+            if !timed_out {
+                continue;
+            }
+            self.calibration_scan_started_at[index] = None;
+            let Some(session) = self.calibration_session.as_mut() else {
+                continue;
+            };
+            session.scan_request_generations[index] =
+                session.scan_request_generations[index].saturating_add(1);
+            let message = "Scan analysis stopped responding. Choose the image again to retry.";
+            session
+                .wizard
+                .fail_scan_import(slot, message, current_timestamp_millis());
+            self.calibration_message = Some(message.into());
+        }
     }
 
     fn compute_calibration_candidate(&mut self) {
@@ -6484,6 +6687,20 @@ impl eframe::App for SapodillaApp {
             // next repaint continues draining the bounded action backlog.
             ctx.request_repaint();
         }
+        self.expire_stalled_calibration_scans();
+        if self.calibration_session.as_ref().is_some_and(|session| {
+            matches!(
+                session.wizard.training_scan,
+                crate::calibration::ScanImportStatus::Importing { .. }
+            ) || matches!(
+                session.wizard.validation_scan,
+                crate::calibration::ScanImportStatus::Importing { .. }
+            )
+        }) {
+            // Worker-side egui repaint callbacks are not Window-safe on the
+            // web. Poll from the main thread while analysis is outstanding.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         #[cfg(target_arch = "wasm32")]
         if let Some(pending) = self.ready_external_calibration_commit.take() {
             let candidate_store = pending.candidate_store;
@@ -6698,6 +6915,10 @@ impl eframe::App for SapodillaApp {
                             "Edit cut nodes",
                             "Edit cut-path nodes",
                         );
+                    }
+
+                    if self.document_saving {
+                        ui.spinner().on_hover_text("Saving project…");
                     }
 
                     if theme::toolbar_icon_toggle(
@@ -8388,11 +8609,12 @@ fn persisted_calibration_run(
     let reused_sheet_slots = [
         ("primary", session.wizard.primary_job),
         ("second", session.wizard.second_job),
+        ("validation", session.wizard.validation_job),
     ]
     .into_iter()
     .filter(|(slot, status)| {
         *status == crate::calibration::JobStatus::ExistingSheet
-            && (*slot == "primary" || second_required)
+            && (*slot == "primary" || *slot == "validation" || second_required)
     })
     .map(|(slot, _)| slot.to_owned())
     .collect::<Vec<_>>();
@@ -8505,17 +8727,83 @@ fn scan_report_observations(
         .collect()
 }
 
-fn calibration_scan_preview(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
-    const MAX_PREVIEW_SIDE: u32 = 1_200;
-    let preview = image::load_from_memory(encoded)?
-        .thumbnail(MAX_PREVIEW_SIDE, MAX_PREVIEW_SIDE)
-        .to_rgba8();
+const CALIBRATION_SCAN_PREVIEW_MAX_SIDE: u32 = 1_200;
+#[cfg(target_arch = "wasm32")]
+const CALIBRATION_SCAN_ANALYSIS_MAX_SIDE: u32 = 6_000;
+
+#[cfg(target_arch = "wasm32")]
+async fn browser_downsample_calibration_scan(encoded: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use wasm_bindgen::JsCast as _;
+
+    let [declared_width, declared_height] =
+        crate::calibration::flatbed_scan_dimensions(encoded).map_err(|error| error.to_string())?;
+    if declared_width.max(declared_height) <= CALIBRATION_SCAN_ANALYSIS_MAX_SIDE {
+        return Ok(None);
+    }
+    let parts = js_sys::Array::new();
+    parts.push(&js_sys::Uint8Array::from(encoded));
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)
+        .map_err(|error| format!("could not prepare scan image: {error:?}"))?;
+    let window = web_sys::window().ok_or("browser window is unavailable")?;
+    let bitmap = wasm_bindgen_futures::JsFuture::from(
+        window
+            .create_image_bitmap_with_blob(&blob)
+            .map_err(|error| format!("could not decode scan image: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| format!("could not decode scan image: {error:?}"))?
+    .dyn_into::<web_sys::ImageBitmap>()
+    .map_err(|_| "browser returned an invalid decoded scan image".to_owned())?;
+    let result = async {
+        let source_width = bitmap.width();
+        let source_height = bitmap.height();
+        let longest = source_width.max(source_height).max(1);
+        let scale = f64::from(CALIBRATION_SCAN_ANALYSIS_MAX_SIDE) / f64::from(longest);
+        let width = (f64::from(source_width) * scale).round().max(1.0) as u32;
+        let height = (f64::from(source_height) * scale).round().max(1.0) as u32;
+        let canvas = web_sys::OffscreenCanvas::new(width, height)
+            .map_err(|error| format!("could not prepare scan canvas: {error:?}"))?;
+        let context = canvas
+            .get_context("2d")
+            .map_err(|error| format!("could not prepare scan canvas: {error:?}"))?
+            .ok_or("browser did not provide a scan canvas")?
+            .dyn_into::<web_sys::OffscreenCanvasRenderingContext2d>()
+            .map_err(|_| "browser returned an invalid scan canvas".to_owned())?;
+        context
+            .draw_image_with_image_bitmap_and_dw_and_dh(
+                &bitmap,
+                0.0,
+                0.0,
+                f64::from(width),
+                f64::from(height),
+            )
+            .map_err(|error| format!("could not resize scan image: {error:?}"))?;
+        let resized_blob = wasm_bindgen_futures::JsFuture::from(
+            canvas
+                .convert_to_blob()
+                .map_err(|error| format!("could not encode resized scan: {error:?}"))?,
+        )
+        .await
+        .map_err(|error| format!("could not encode resized scan: {error:?}"))?
+        .dyn_into::<web_sys::Blob>()
+        .map_err(|_| "browser returned an invalid resized scan".to_owned())?;
+        let buffer = wasm_bindgen_futures::JsFuture::from(resized_blob.array_buffer())
+            .await
+            .map_err(|error| format!("could not read resized scan: {error:?}"))?;
+        Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+    }
+    .await;
+    bitmap.close();
+    result.map(Some)
+}
+
+fn calibration_scan_preview(preview: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png).write_image(
         preview.as_bytes(),
         preview.width(),
         preview.height(),
-        image::ExtendedColorType::Rgba8,
+        image::ExtendedColorType::Rgb8,
     )?;
     Ok(png)
 }
@@ -8523,10 +8811,13 @@ fn calibration_scan_preview(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
 fn calibration_scan_analysis_config(
     slot: ScanSlot,
     primary_job: crate::calibration::JobStatus,
+    validation_job: crate::calibration::JobStatus,
 ) -> ScanAnalysisConfig {
     ScanAnalysisConfig {
-        accept_compatible_sheet_binding: slot == ScanSlot::Training
-            && primary_job == crate::calibration::JobStatus::ExistingSheet,
+        accept_compatible_sheet_binding: match slot {
+            ScanSlot::Training => primary_job == crate::calibration::JobStatus::ExistingSheet,
+            ScanSlot::Validation => validation_job == crate::calibration::JobStatus::ExistingSheet,
+        },
         ..ScanAnalysisConfig::default()
     }
 }
@@ -8884,11 +9175,12 @@ fn place_image_in_placeholder(image: &mut LoadedImage, placeholder: &TemplatePla
 }
 
 fn composite_layer(buffer: &mut image::RgbaImage, layer: &RenderLayer) {
-    let resized = if layer.image.dimensions() == (layer.size.x as u32, layer.size.y as u32) {
-        Cow::Borrowed(&layer.image)
+    let source = layer.image.as_ref();
+    let resized = if source.dimensions() == (layer.size.x as u32, layer.size.y as u32) {
+        Cow::Borrowed(source)
     } else {
         Cow::Owned(image::imageops::resize(
-            &layer.image,
+            source,
             layer.size.x as u32,
             layer.size.y as u32,
             image::imageops::FilterType::Lanczos3,
@@ -9374,24 +9666,74 @@ mod tests {
     }
 
     #[test]
-    fn only_the_existing_primary_sheet_accepts_a_compatible_binding() {
-        let existing = calibration_scan_analysis_config(
+    fn existing_training_or_validation_sheets_accept_a_compatible_binding() {
+        let existing_training = calibration_scan_analysis_config(
             ScanSlot::Training,
             crate::calibration::JobStatus::ExistingSheet,
+            crate::calibration::JobStatus::NotStarted,
         );
-        assert!(existing.accept_compatible_sheet_binding);
+        assert!(existing_training.accept_compatible_sheet_binding);
 
-        let newly_printed = calibration_scan_analysis_config(
+        let newly_printed_training = calibration_scan_analysis_config(
             ScanSlot::Training,
             crate::calibration::JobStatus::Completed,
+            crate::calibration::JobStatus::NotStarted,
         );
-        assert!(!newly_printed.accept_compatible_sheet_binding);
+        assert!(!newly_printed_training.accept_compatible_sheet_binding);
 
-        let validation = calibration_scan_analysis_config(
+        let existing_validation = calibration_scan_analysis_config(
             ScanSlot::Validation,
+            crate::calibration::JobStatus::NotStarted,
             crate::calibration::JobStatus::ExistingSheet,
         );
-        assert!(!validation.accept_compatible_sheet_binding);
+        assert!(existing_validation.accept_compatible_sheet_binding);
+
+        let newly_printed_validation = calibration_scan_analysis_config(
+            ScanSlot::Validation,
+            crate::calibration::JobStatus::NotStarted,
+            crate::calibration::JobStatus::Completed,
+        );
+        assert!(!newly_printed_validation.accept_compatible_sheet_binding);
+    }
+
+    #[test]
+    fn document_save_snapshot_shares_pixels_until_background_encoding() {
+        let pixels = Arc::new(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([17, 34, 51, 255]),
+        ));
+        let mut document = StudioDocument::new(
+            DocumentKind::Sheet,
+            Vec2::new(300.0, 500.0),
+            [255, 255, 255],
+        );
+        document.images.push(SavedImage {
+            id: "artwork-1".into(),
+            name: "artwork.png".into(),
+            png: String::new(),
+            offset: [12.0, 34.0],
+            scale: [1.5, 2.0],
+            rotation_degrees: 15.0,
+            cutting_enabled: true,
+            locked: false,
+            visible: true,
+            template_fit: crate::studio::PlaceholderFit::Contain,
+        });
+        let snapshot = DocumentSaveSnapshot {
+            document,
+            images: vec![pixels.clone()],
+        };
+
+        assert!(Arc::ptr_eq(&snapshot.images[0], &pixels));
+        let encoded = snapshot.encode().unwrap();
+        let saved = &encoded.images[0];
+        assert_eq!(saved.id, "artwork-1");
+        assert_eq!(saved.template_fit, crate::studio::PlaceholderFit::Contain);
+        let decoded = image::load_from_memory(&saved.png_bytes().unwrap())
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(decoded, *pixels);
     }
 
     /// Opt-in native-USB end-to-end harness for a real PixCut. It is ignored
@@ -10704,7 +11046,7 @@ mod tests {
             Pos2::new(9.0, 7.0),
         ] {
             let layer = RenderLayer {
-                image: source.clone(),
+                image: Arc::new(source.clone()),
                 size: Vec2::new(7.0, 5.0),
                 rotation_degrees: 0.0,
                 visual_offset: offset,
@@ -11445,6 +11787,30 @@ mod tests {
                 .all(|payload| payload.slot != "second")
         );
 
+        let mut reused_validation = session.clone();
+        reused_validation.wizard.validation_job = crate::calibration::JobStatus::ExistingSheet;
+        reused_validation.validation_queue_job = None;
+        reused_validation.historical_queue_job_ids[2] = None;
+        reused_validation.image_sha1[2] = None;
+        reused_validation.plotter_sha1[2] = None;
+        reused_validation.plotter_commands[2].clear();
+        reused_validation.device_job_ids.retain(|id| *id != 80);
+        reused_validation.device_job_ids_by_slot[2].clear();
+        let mut reused_validation_run =
+            persisted_calibration_run(&reused_validation, &solution, metrics.clone()).unwrap();
+        reused_validation_run.validate_and_sanitize().unwrap();
+        assert_eq!(reused_validation_run.reused_sheet_slots, ["validation"]);
+        assert_eq!(
+            reused_validation_run
+                .payload_hashes
+                .iter()
+                .map(|payload| payload.slot.as_str())
+                .collect::<Vec<_>>(),
+            ["primary"]
+        );
+        assert_eq!(reused_validation_run.queue_job_ids, [7]);
+        assert_eq!(reused_validation_run.device_job_ids, [70]);
+
         let mut saved_session = session.clone();
         saved_session.material.blade_pressure = 30;
         saved_session.material.perf_pressure = 80;
@@ -11453,6 +11819,36 @@ mod tests {
         assert!(resumed.primary_queue_job.is_none());
         assert!(resumed.validation_queue_job.is_none());
         assert_eq!(resumed.historical_queue_job_ids, [Some(7), None, Some(8)]);
+
+        let mut interrupted_scan = session.clone();
+        let mut interrupted_wizard = CalibrationWizard::new("interrupted-scan", 1).unwrap();
+        interrupted_wizard
+            .select_method(CalibrationMethod::FlatbedScanner, 2)
+            .unwrap();
+        interrupted_wizard.next(3).unwrap();
+        interrupted_wizard.confirm_prepared(true, 4);
+        interrupted_wizard.next(5).unwrap();
+        interrupted_wizard.skip_current_step(6).unwrap();
+        interrupted_wizard.confirm_centers_removed(false, 7);
+        interrupted_wizard.next(8).unwrap();
+        interrupted_wizard.begin_scan_import(ScanSlot::Training, "large-scan.png", 9);
+        interrupted_scan.wizard = interrupted_wizard;
+        interrupted_scan.candidate = None;
+        interrupted_scan.candidate_mapping = None;
+        interrupted_scan.validation_metrics = None;
+        interrupted_scan.material.blade_pressure = 30;
+        interrupted_scan.material.perf_pressure = 80;
+        interrupted_scan.material.passes = 1;
+        interrupted_scan.training_scan_preview_png = Some(vec![1, 2, 3].into());
+        interrupted_scan.training_scan_preview_sha1 = Some("e".repeat(40));
+        let repaired = interrupted_scan.sanitize_after_load().unwrap();
+        assert!(matches!(
+            repaired.wizard.training_scan,
+            crate::calibration::ScanImportStatus::Failed { ref message }
+                if message.contains("interrupted")
+        ));
+        assert!(repaired.training_scan_preview_png.is_none());
+        assert!(repaired.training_scan_preview_sha1.is_none());
 
         let mut missing_validation_evidence = session.clone();
         missing_validation_evidence.image_sha1[2] = None;

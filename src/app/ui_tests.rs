@@ -474,6 +474,49 @@ fn manual_second_sheet_can_reuse_an_earlier_print() {
     assert!(session.device_job_ids_by_slot[1].is_empty());
 }
 
+#[test]
+fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
+    let mut harness = app_harness(Vec2::new(560.0, 520.0));
+    open_calibration_fixture(&mut harness);
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.method = Some(crate::calibration::CalibrationMethod::FlatbedScanner);
+        session.wizard.step = crate::calibration::WizardStep::PrintValidation;
+        session.wizard.validation_job = crate::calibration::JobStatus::Failed;
+        session.validation_queue_job = Some(6262);
+        session.historical_queue_job_ids[2] = Some(6262);
+        session.image_sha1[2] = Some("a".repeat(40));
+        session.plotter_sha1[2] = Some("b".repeat(40));
+        session.plotter_commands[2].push(crate::calibration::CalibrationPlotterCommand {
+            kind: crate::calibration::CalibrationPlotterCommandKind::Draw,
+            plotter_units: [10, 20],
+        });
+        session.device_job_ids.push(111);
+        session.device_job_ids_by_slot[2].push(111);
+    }
+    harness.run();
+    harness.get_by_label("Prepare the validation sheet");
+    harness.get_by_label("Use existing sheet").click_accesskit();
+    harness.run();
+
+    let session = harness.state().calibration_session.as_ref().unwrap();
+    assert_eq!(
+        session.wizard.step,
+        crate::calibration::WizardStep::RemoveValidationCenters
+    );
+    assert_eq!(
+        session.wizard.validation_job,
+        crate::calibration::JobStatus::ExistingSheet
+    );
+    assert_eq!(session.validation_queue_job, None);
+    assert_eq!(session.historical_queue_job_ids[2], None);
+    assert_eq!(session.image_sha1[2], None);
+    assert_eq!(session.plotter_sha1[2], None);
+    assert!(session.plotter_commands[2].is_empty());
+    assert!(!session.device_job_ids.contains(&111));
+    assert!(session.device_job_ids_by_slot[2].is_empty());
+}
+
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {
     let ctx = harness.ctx.clone();
     let fixture = include_bytes!("../../docs/review-evidence/transform-fixture.png");
