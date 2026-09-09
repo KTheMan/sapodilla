@@ -1782,24 +1782,26 @@ fn absolute(abs: bool, current: Coord<f32>, x: f64, y: f64) -> Coord<f32> {
     }
 }
 
-/// Split a contour into alternating cut dashes for perf-cut output.
-pub fn perf_cut(path: &LineString<f32>, dash: f32, gap: f32) -> Vec<LineString<f32>> {
+/// Split a contour into a continuous sequence of alternating through-cut and
+/// kiss-cut segments. The boolean is true for through-cut segments.
+pub fn perf_segments(path: &LineString<f32>, dash: f32, gap: f32) -> Vec<(bool, LineString<f32>)> {
     let mut output = Vec::new();
     if !dash.is_finite() || dash <= 0.0 || !gap.is_finite() || path.0.len() < 2 {
         return output;
     }
     let gap = gap.max(0.0);
     if gap <= f32::EPSILON {
-        return vec![path.clone()];
+        return vec![(true, path.clone())];
     }
 
-    // Keep a dash open across source vertices. Contours extracted from rasters
-    // commonly contain thousands of one-pixel edges; emitting a separate
-    // LineString for every edge multiplied preview and plotter overhead even
-    // though the blade was meant to stay down for the whole dash.
-    let mut cutting = true;
-    let mut remaining = dash;
-    let mut current_dash = Vec::new();
+    // Keep each pressure segment open across source vertices. Contours
+    // extracted from rasters commonly contain thousands of one-pixel edges;
+    // splitting at every source edge would multiply preview and plotter work.
+    // Start closed contours with a kiss segment so the final through segment
+    // can never meet the first through segment across the contour seam.
+    let mut cutting = path.0.first() != path.0.last();
+    let mut remaining = if cutting { dash } else { gap };
+    let mut current_segment = Vec::new();
     for segment in path.lines() {
         let dx = segment.end.x - segment.start.x;
         let dy = segment.end.y - segment.start.y;
@@ -1814,8 +1816,11 @@ pub fn perf_cut(path: &LineString<f32>, dash: f32, gap: f32) -> Vec<LineString<f
                 // At very large coordinates f32 addition can stop advancing.
                 // Transitioning here prevents malformed contours from hanging
                 // the worker indefinitely.
-                if cutting && current_dash.len() >= 2 {
-                    output.push(LineString::new(std::mem::take(&mut current_dash)));
+                if current_segment.len() >= 2 {
+                    output.push((
+                        cutting,
+                        LineString::new(std::mem::take(&mut current_segment)),
+                    ));
                 }
                 cutting = !cutting;
                 remaining = if cutting { dash } else { gap };
@@ -1824,34 +1829,37 @@ pub fn perf_cut(path: &LineString<f32>, dash: f32, gap: f32) -> Vec<LineString<f
                 }
                 continue;
             }
-            if cutting && end > local {
+            if end > local {
                 let point = |at: f32| Coord {
                     x: segment.start.x + dx * at / length,
                     y: segment.start.y + dy * at / length,
                 };
                 let start = point(local);
-                if current_dash.last().copied() != Some(start) {
-                    current_dash.push(start);
+                if current_segment.last().copied() != Some(start) {
+                    current_segment.push(start);
                 }
                 let end = point(end);
-                if current_dash.last().copied() != Some(end) {
-                    current_dash.push(end);
+                if current_segment.last().copied() != Some(end) {
+                    current_segment.push(end);
                 }
             }
             let consumed = end - local;
             local = end;
             remaining -= consumed;
             if remaining <= f32::EPSILON {
-                if cutting && current_dash.len() >= 2 {
-                    output.push(LineString::new(std::mem::take(&mut current_dash)));
+                if current_segment.len() >= 2 {
+                    output.push((
+                        cutting,
+                        LineString::new(std::mem::take(&mut current_segment)),
+                    ));
                 }
                 cutting = !cutting;
                 remaining = if cutting { dash } else { gap };
             }
         }
     }
-    if current_dash.len() >= 2 {
-        output.push(LineString::new(current_dash));
+    if current_segment.len() >= 2 {
+        output.push((cutting, LineString::new(current_segment)));
     }
     output
 }
@@ -2212,17 +2220,68 @@ mod tests {
     }
 
     #[test]
-    fn perf_cut_splits_path() {
+    fn perf_segments_alternate_pressure_without_geometry_gaps() {
         let path = LineString::from(vec![(0.0, 0.0), (30.0, 0.0)]);
-        let segments = perf_cut(&path, 5.0, 5.0);
-        assert_eq!(segments.len(), 3);
-        assert!((segments.iter().map(|p| p.0[1].x - p.0[0].x).sum::<f32>() - 15.0).abs() < 0.001);
+        let segments = perf_segments(&path, 5.0, 5.0);
+        assert_eq!(segments.len(), 6);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(through, _)| *through)
+                .collect::<Vec<_>>(),
+            [true, false, true, false, true, false]
+        );
+        assert!(
+            segments
+                .windows(2)
+                .all(|pair| { pair[0].1.0.last().copied() == pair[1].1.0.first().copied() })
+        );
+        let length = segments
+            .iter()
+            .map(|(_, segment)| segment.0[1].x - segment.0[0].x)
+            .sum::<f32>();
+        assert!((length - 30.0).abs() < 0.001);
     }
 
     #[test]
-    fn perf_cut_keeps_each_dash_connected_across_dense_vertices() {
+    fn closed_perforation_has_a_kiss_segment_across_the_contour_seam() {
+        let path = LineString::from(vec![
+            (0.0, 0.0),
+            (5.0, 0.0),
+            (5.0, 5.0),
+            (0.0, 5.0),
+            (0.0, 0.0),
+        ]);
+        let segments = perf_segments(&path, 5.0, 2.0);
+        let modes = segments
+            .iter()
+            .map(|(through, _)| *through)
+            .collect::<Vec<_>>();
+
+        assert_eq!(modes, [false, true, false, true, false, true]);
+        assert!(
+            modes
+                .iter()
+                .zip(modes.iter().cycle().skip(1))
+                .take(modes.len())
+                .all(|(current, next)| !(*current && *next))
+        );
+        assert!(
+            segments
+                .windows(2)
+                .all(|pair| { pair[0].1.0.last().copied() == pair[1].1.0.first().copied() })
+        );
+        assert_eq!(segments.first().unwrap().1.0.first(), path.0.first());
+        assert_eq!(segments.last().unwrap().1.0.last(), path.0.last());
+    }
+
+    #[test]
+    fn through_segments_keep_each_dash_connected_across_dense_vertices() {
         let path = LineString::from((0..=1_000).map(|x| (x as f32, 0.0)).collect::<Vec<_>>());
-        let segments = perf_cut(&path, 25.0, 5.0);
+        let segments = perf_segments(&path, 25.0, 5.0)
+            .into_iter()
+            .filter_map(|(through, segment)| through.then_some(segment))
+            .collect::<Vec<_>>();
         assert_eq!(segments.len(), 34);
         assert_eq!(segments[0].0.len(), 26);
         assert_eq!(segments[0].0.first().unwrap().x, 0.0);
@@ -2233,13 +2292,16 @@ mod tests {
     #[test]
     fn zero_gap_preserves_the_original_contour_as_one_toolpath() {
         let path = LineString::from(vec![(0.0, 0.0), (5.0, 0.0), (5.0, 5.0)]);
-        assert_eq!(perf_cut(&path, 2.0, 0.0), vec![path]);
+        assert_eq!(perf_segments(&path, 2.0, 0.0), vec![(true, path)]);
     }
 
     #[test]
     fn perforation_dash_traverses_contour_vertices_instead_of_chording() {
         let path = LineString::from(vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)]);
-        let dashes = perf_cut(&path, 6.0, 2.0);
+        let dashes = perf_segments(&path, 6.0, 2.0)
+            .into_iter()
+            .filter_map(|(through, segment)| through.then_some(segment))
+            .collect::<Vec<_>>();
         assert_eq!(
             dashes,
             vec![LineString::from(vec![(0.0, 0.0), (4.0, 0.0), (4.0, 2.0)])]
@@ -2258,16 +2320,19 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let started = Instant::now();
-        let dashes = perf_cut(black_box(&path), 25.0, 5.0);
+        let segments = perf_segments(black_box(&path), 25.0, 5.0);
         println!(
-            "dense perforation: {:?}, {} source nodes -> {} dash paths / {} output nodes",
+            "dense perforation: {:?}, {} source nodes -> {} pressure paths / {} output nodes",
             started.elapsed(),
             path.0.len(),
-            dashes.len(),
-            dashes.iter().map(|dash| dash.0.len()).sum::<usize>()
+            segments.len(),
+            segments
+                .iter()
+                .map(|(_, segment)| segment.0.len())
+                .sum::<usize>()
         );
-        assert!(dashes.len() < 5_000);
-        black_box(dashes);
+        assert!(segments.len() < 10_000);
+        black_box(segments);
     }
 
     #[test]

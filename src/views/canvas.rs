@@ -1597,7 +1597,10 @@ fn preview_cut_phases(
             .map(|(_, tab)| tab.path.clone())
             .collect::<Vec<_>>();
         if !tabs.is_empty() {
-            if let Some(kiss) = phases.iter_mut().find(|phase| phase.mode == CutMode::Kiss) {
+            if let Some(kiss) = phases
+                .iter_mut()
+                .find(|phase| phase.mode == CutMode::Kiss && !phase.continue_from_previous)
+            {
                 kiss.paths.extend(tabs);
             } else {
                 phases.insert(
@@ -1606,6 +1609,7 @@ fn preview_cut_phases(
                         mode: CutMode::Kiss,
                         pressure: 1,
                         paths: tabs,
+                        continue_from_previous: false,
                     },
                 );
             }
@@ -2066,10 +2070,24 @@ mod tests {
             crate::cut::OvercutSettings::default(),
             &[],
         );
-        assert_eq!(phases.len(), 2);
+        assert_eq!(phases.len(), 7);
         assert_eq!(phases[0].mode, CutMode::Kiss);
         assert_eq!(phases[0].paths, [line(0.0)]);
         assert_eq!(phases[1].mode, CutMode::Perforation);
+        assert_eq!(
+            phases[1..]
+                .iter()
+                .map(|phase| phase.mode)
+                .collect::<Vec<_>>(),
+            [
+                CutMode::Perforation,
+                CutMode::Kiss,
+                CutMode::Perforation,
+                CutMode::Kiss,
+                CutMode::Perforation,
+                CutMode::Kiss,
+            ]
+        );
         assert!(
             phases
                 .iter()

@@ -8263,6 +8263,7 @@ fn build_calibration_print_job(
             mode: CutMode::Kiss,
             pressure: material.blade_pressure,
             paths: kiss_paths,
+            continue_from_previous: false,
         });
     }
     if !through_paths.is_empty() {
@@ -8270,6 +8271,7 @@ fn build_calibration_print_job(
             mode: CutMode::Perforation,
             pressure: material.perf_pressure,
             paths: through_paths,
+            continue_from_previous: false,
         });
     }
     if calibration_phases.is_empty() {
@@ -9016,7 +9018,10 @@ fn encode_plt(
             .map(|(_, tab)| tab.path)
             .collect::<Vec<_>>();
         if !tabs.is_empty() {
-            if let Some(kiss) = phases.iter_mut().find(|phase| phase.mode == CutMode::Kiss) {
+            if let Some(kiss) = phases
+                .iter_mut()
+                .find(|phase| phase.mode == CutMode::Kiss && !phase.continue_from_previous)
+            {
                 kiss.paths.extend(tabs);
             } else {
                 phases.insert(
@@ -9025,28 +9030,47 @@ fn encode_plt(
                         mode: CutMode::Kiss,
                         pressure: material.blade_pressure,
                         paths: tabs,
+                        continue_from_previous: false,
                     },
                 );
             }
         }
     }
 
-    let mut buf = b"IN VER0.1.0".to_vec();
-    for phase in phases {
-        write!(buf, " KP{}", phase.pressure).unwrap();
-        let mut ordered = phase.paths;
-        ordered.sort_by(|a, b| {
+    for phase in &mut phases {
+        if phase.continue_from_previous {
+            continue;
+        }
+        phase.paths.sort_by(|a, b| {
             let a_start = *a.0.first().unwrap();
             let b_start = *b.0.first().unwrap();
             (canvas_size.size.y - a_start.y)
                 .total_cmp(&(canvas_size.size.y - b_start.y))
                 .then(a_start.x.total_cmp(&b_start.x))
         });
+    }
+
+    let mut buf = b"IN VER0.1.0".to_vec();
+    let mut group_start = 0;
+    while group_start < phases.len() {
+        let group_end = phases[group_start + 1..]
+            .iter()
+            .position(|phase| !phase.continue_from_previous)
+            .map_or(phases.len(), |offset| group_start + 1 + offset);
         for _ in 0..material.passes {
-            for line in &ordered {
-                write_line_string(plotter_mapping, &mut buf, line);
+            for phase in &phases[group_start..group_end] {
+                write!(buf, " KP{}", phase.pressure).unwrap();
+                for (path_index, line) in phase.paths.iter().enumerate() {
+                    write_line_string_with_lift(
+                        plotter_mapping,
+                        &mut buf,
+                        line,
+                        !phase.continue_from_previous || path_index > 0,
+                    );
+                }
             }
         }
+        group_start = group_end;
     }
 
     write!(buf, " U6476,0  @ ").unwrap();
@@ -9082,8 +9106,19 @@ fn write_line_string(
     buf: &mut Vec<u8>,
     line_shape: &geo::LineString<f32>,
 ) {
-    let first = plotter_mapping.apply(line_shape.0[0]);
-    write!(buf, " U{:.0},{:.0}", first[0], first[1]).unwrap();
+    write_line_string_with_lift(plotter_mapping, buf, line_shape, true);
+}
+
+fn write_line_string_with_lift(
+    plotter_mapping: PlotterMapping,
+    buf: &mut Vec<u8>,
+    line_shape: &geo::LineString<f32>,
+    lift_before: bool,
+) {
+    if lift_before {
+        let first = plotter_mapping.apply(line_shape.0[0]);
+        write!(buf, " U{:.0},{:.0}", first[0], first[1]).unwrap();
+    }
 
     for point in line_shape.coords() {
         let mapped = plotter_mapping.apply(*point);
@@ -10305,12 +10340,12 @@ mod tests {
     }
 
     #[test]
-    fn perf_output_has_multiple_blade_up_moves() {
-        let path = LineString::from(vec![(0.0, 0.0), (30.0, 0.0)]);
+    fn perforation_alternates_through_and_kiss_pressure_without_lifting() {
+        let path = LineString::from(vec![(0.0, 0.0), (25.0, 0.0)]);
         let canvas = canvas();
         let material = MaterialProfile {
             name: "test".into(),
-            blade_pressure: 53,
+            blade_pressure: 42,
             perf_pressure: 63,
             passes: 1,
             speed: 5,
@@ -10332,8 +10367,46 @@ mod tests {
             },
         );
         let text = String::from_utf8(data).unwrap();
-        assert!(text.starts_with("IN VER0.1.0 KP63"));
-        assert!(text.matches(" U").count() >= 4); // three dashes plus park
+        let mut pressure = None;
+        let mut position = None;
+        let mut pressure_runs = Vec::new();
+        let mut non_park_lifts = 0;
+        for token in text.split_ascii_whitespace() {
+            if let Some(value) = token.strip_prefix("KP") {
+                pressure = Some(value.parse::<u8>().unwrap());
+                continue;
+            }
+            let Some((command, coordinates)) = token.split_at_checked(1) else {
+                continue;
+            };
+            if command != "U" && command != "D" {
+                continue;
+            }
+            let (x, y) = coordinates.split_once(',').unwrap();
+            let next = (x.parse::<i32>().unwrap(), y.parse::<i32>().unwrap());
+            if command == "U" {
+                if next != (6476, 0) {
+                    non_park_lifts += 1;
+                }
+            } else if position != Some(next)
+                && pressure_runs.last().copied() != pressure
+                && let Some(pressure) = pressure
+            {
+                pressure_runs.push(pressure);
+            }
+            position = Some(next);
+        }
+
+        assert_eq!(
+            non_park_lifts, 1,
+            "perforation should lift only to reach its start: {text}"
+        );
+        assert_eq!(
+            text.matches(" U").count(),
+            2,
+            "only the initial move and park may lift: {text}"
+        );
+        assert_eq!(pressure_runs, [63, 42, 63, 42, 63]);
     }
 
     #[test]
@@ -10341,19 +10414,25 @@ mod tests {
         let paths = vec![
             LineString::from(vec![(10.0, 10.0), (20.0, 10.0), (10.0, 10.0)]),
             LineString::from(vec![(30.0, 30.0), (60.0, 30.0)]),
+            LineString::from(vec![(70.0, 30.0), (84.0, 30.0)]),
             LineString::from(vec![(999.0, 999.0), (1000.0, 999.0)]),
         ];
         let material = MaterialProfile {
             name: "test".into(),
             blade_pressure: 42,
             perf_pressure: 53,
-            passes: 1,
+            passes: 2,
             speed: 5,
         };
         let canvas = canvas();
         let text = String::from_utf8(encode_plt(
             &paths,
-            &[CutMode::Kiss, CutMode::Perforation, CutMode::Disabled],
+            &[
+                CutMode::Kiss,
+                CutMode::Perforation,
+                CutMode::Perforation,
+                CutMode::Disabled,
+            ],
             unscaled_test_mapping(&canvas),
             &canvas,
             &material,
@@ -10368,7 +10447,32 @@ mod tests {
             },
         ))
         .unwrap();
-        assert!(text.find("KP42").unwrap() < text.find("KP53").unwrap());
+        let first_through = text.find("KP53").unwrap();
+        assert_eq!(
+            text[..first_through].matches(" U").count(),
+            2,
+            "both standalone kiss passes must finish before through-cutting: {text}"
+        );
+        assert_eq!(
+            text.matches(" U").count(),
+            7,
+            "two kiss passes, two passes per perforation contour, and park should lift: {text}"
+        );
+        let pressures = text
+            .split_ascii_whitespace()
+            .filter_map(|token| token.strip_prefix("KP"))
+            .map(|value| value.parse::<u8>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pressures,
+            [
+                42, 42, // standalone kiss path, both passes first
+                53, 42, 53, 42, 53, 42, 53, 42, 53, // contour 1, pass 1
+                53, 42, 53, 42, 53, 42, 53, 42, 53, // contour 1, pass 2
+                53, 42, 53, 42, // contour 2, pass 1
+                53, 42, 53, 42, // contour 2, pass 2
+            ]
+        );
         assert!(!text.contains("999"));
     }
 
