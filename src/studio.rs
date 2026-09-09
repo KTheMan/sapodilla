@@ -666,12 +666,30 @@ pub struct PackedItem {
     pub rotated: bool,
 }
 
+/// An occupied rectangle that movable items must pack around.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PackObstacle {
+    pub offset: Pos2,
+    pub size: Vec2,
+}
+
 /// Deterministic MaxRects/Best-Short-Side-Fit packing for sticker sheets.
 pub fn auto_pack(
     items: &[PackItem],
     bounds: Vec2,
     gap: f32,
     allow_rotation: bool,
+) -> Vec<PackedItem> {
+    auto_pack_with_obstacles(items, bounds, gap, allow_rotation, &[])
+}
+
+/// Deterministic MaxRects packing with pre-existing occupied sheet regions.
+pub fn auto_pack_with_obstacles(
+    items: &[PackItem],
+    bounds: Vec2,
+    gap: f32,
+    allow_rotation: bool,
+    obstacles: &[PackObstacle],
 ) -> Vec<PackedItem> {
     #[derive(Clone, Copy, Debug)]
     struct FreeRect {
@@ -701,6 +719,61 @@ pub fn auto_pack(
         }
     }
 
+    fn subtract_used(free: Vec<FreeRect>, used: FreeRect) -> Vec<FreeRect> {
+        let mut split = Vec::new();
+        for rect in free {
+            if !rect.intersects(used) {
+                split.push(rect);
+                continue;
+            }
+            if used.x > rect.x {
+                split.push(FreeRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: used.x - rect.x,
+                    h: rect.h,
+                });
+            }
+            if used.right() < rect.right() {
+                split.push(FreeRect {
+                    x: used.right(),
+                    y: rect.y,
+                    w: rect.right() - used.right(),
+                    h: rect.h,
+                });
+            }
+            if used.y > rect.y {
+                split.push(FreeRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: used.y - rect.y,
+                });
+            }
+            if used.bottom() < rect.bottom() {
+                split.push(FreeRect {
+                    x: rect.x,
+                    y: used.bottom(),
+                    w: rect.w,
+                    h: rect.bottom() - used.bottom(),
+                });
+            }
+        }
+        split.retain(|rect| rect.w > 0.0 && rect.h > 0.0);
+        split
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, rect)| {
+                (!split
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| index != other_index && other.contains(rect)))
+                .then_some(rect)
+            })
+            .collect()
+    }
+
     let mut sorted = items.to_vec();
     sorted.sort_by(|a, b| {
         (b.size.x * b.size.y)
@@ -715,6 +788,18 @@ pub fn auto_pack(
         w: bounds.x + gap,
         h: bounds.y + gap,
     }];
+    for obstacle in obstacles {
+        if !obstacle.offset.is_finite() || !obstacle.size.is_finite() {
+            continue;
+        }
+        let used = FreeRect {
+            x: obstacle.offset.x,
+            y: obstacle.offset.y,
+            w: obstacle.size.x.max(0.0) + gap,
+            h: obstacle.size.y.max(0.0) + gap,
+        };
+        free = subtract_used(free, used);
+    }
     let mut packed = Vec::new();
 
     for item in sorted {
@@ -754,58 +839,7 @@ pub fn auto_pack(
             rotated,
         });
 
-        let mut split = Vec::new();
-        for rect in free.drain(..) {
-            if !rect.intersects(used) {
-                split.push(rect);
-                continue;
-            }
-            if used.x > rect.x {
-                split.push(FreeRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: used.x - rect.x,
-                    h: rect.h,
-                });
-            }
-            if used.right() < rect.right() {
-                split.push(FreeRect {
-                    x: used.right(),
-                    y: rect.y,
-                    w: rect.right() - used.right(),
-                    h: rect.h,
-                });
-            }
-            if used.y > rect.y {
-                split.push(FreeRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.w,
-                    h: used.y - rect.y,
-                });
-            }
-            if used.bottom() < rect.bottom() {
-                split.push(FreeRect {
-                    x: rect.x,
-                    y: used.bottom(),
-                    w: rect.w,
-                    h: rect.bottom() - used.bottom(),
-                });
-            }
-        }
-        split.retain(|rect| rect.w > 0.0 && rect.h > 0.0);
-        free = split
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, rect)| {
-                (!split
-                    .iter()
-                    .enumerate()
-                    .any(|(other_index, other)| index != other_index && other.contains(rect)))
-                .then_some(rect)
-            })
-            .collect();
+        free = subtract_used(free, used);
     }
 
     packed.sort_by_key(|item| item.index);
@@ -1980,6 +2014,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pack_routes_around_existing_obstacles_with_the_requested_gap() {
+        let items = [PackItem {
+            index: 0,
+            size: Vec2::new(40.0, 40.0),
+        }];
+        let obstacles = [PackObstacle {
+            offset: Pos2::ZERO,
+            size: Vec2::new(50.0, 100.0),
+        }];
+        let packed =
+            auto_pack_with_obstacles(&items, Vec2::new(100.0, 100.0), 5.0, false, &obstacles);
+
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].offset, Pos2::new(55.0, 0.0));
+        let item = egui::Rect::from_min_size(packed[0].offset, items[0].size);
+        let inflated_obstacle = egui::Rect::from_min_max(
+            obstacles[0].offset - Vec2::splat(4.99),
+            obstacles[0].offset + obstacles[0].size + Vec2::splat(4.99),
+        );
+        assert!(!inflated_obstacle.intersects(item));
     }
 
     #[test]
