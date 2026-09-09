@@ -333,6 +333,11 @@ pub struct CalibrationRun {
     pub device_job_ids: Vec<u32>,
     #[serde(default)]
     pub payload_hashes: Vec<CalibrationPayloadHashes>,
+    /// Required physical sheets reused from an earlier compatible print. Such
+    /// sheets truthfully have no queue, device-job, or payload record owned by
+    /// this run.
+    #[serde(default)]
+    pub reused_sheet_slots: Vec<String>,
     pub observations: Vec<CalibrationObservation>,
     pub excluded_target_ids: Vec<String>,
     /// Optional [top, right, bottom, left] printable-area insets recorded by
@@ -361,6 +366,11 @@ impl CalibrationRun {
         self.queue_job_ids.truncate(MAX_RUN_JOB_IDS);
         self.device_job_ids.truncate(MAX_RUN_JOB_IDS);
         self.payload_hashes.truncate(3);
+        self.reused_sheet_slots.truncate(2);
+        for slot in &mut self.reused_sheet_slots {
+            *slot = bounded_trim(slot);
+        }
+        let mut reused_slots = BTreeSet::new();
         let mut payload_slots = BTreeSet::new();
         for payload in &mut self.payload_hashes {
             payload.slot = bounded_trim(&payload.slot);
@@ -398,14 +408,15 @@ impl CalibrationRun {
                 .payload_hashes
                 .iter()
                 .find(|payload| payload.slot == "validation");
+            let primary_reused = self.reused_sheet_slots.iter().any(|slot| slot == "primary");
             !validation.activation_passed(self.method)
                 || !self
                     .fit_candidates
                     .iter()
                     .any(|candidate| candidate.model == selected_model)
-                || self.queue_job_ids.len() < 2
-                || self.device_job_ids.len() < 2
-                || primary.is_none()
+                || self.queue_job_ids.len() < self.payload_hashes.len()
+                || self.device_job_ids.len() < self.payload_hashes.len()
+                || (!primary_reused && primary.is_none())
                 || validation_payload.is_none()
                 || primary.is_some_and(|payload| {
                     self.manifest.jpeg_sha1.as_deref() != Some(payload.jpeg_sha1.as_str())
@@ -448,6 +459,14 @@ impl CalibrationRun {
                             .into_iter()
                             .any(|value| !(-1_000_000..=1_000_000).contains(&value))
                     })
+            })
+            || self.reused_sheet_slots.iter().any(|slot| {
+                !matches!(slot.as_str(), "primary" | "second")
+                    || !reused_slots.insert(slot.as_str())
+                    || self
+                        .payload_hashes
+                        .iter()
+                        .any(|payload| payload.slot == *slot)
             })
             || passed_state_invalid
         {
@@ -1015,6 +1034,7 @@ mod tests {
             queue_job_ids: vec![],
             device_job_ids: vec![],
             payload_hashes: vec![],
+            reused_sheet_slots: vec![],
             observations: vec![CalibrationObservation {
                 target_id: long.clone(),
                 sheet_id: long,
