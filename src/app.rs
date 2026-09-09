@@ -2218,8 +2218,7 @@ impl SapodillaApp {
         let path_assignments = if cut_aware {
             assign_cut_paths_to_images(
                 &self.loaded_images,
-                &image_bounds,
-                &self.cut_shapes,
+                self.cut_shapes.len(),
                 &self.cutline_owners,
                 &self.template_placeholders,
             )
@@ -2643,6 +2642,9 @@ impl SapodillaApp {
             let previous_manual_cut_shapes = self.manual_cut_shapes.clone();
             let previous_cutline_owners = self.cutline_owners.clone();
             let previous_cut_geometry_snapshot = self.cut_geometry_snapshot.clone();
+            let previous_cut_validation_snapshot = self.cut_validation_snapshot.clone();
+            let previous_cut_progress = self.cut_progress;
+            let previous_active_cut_generation = self.active_cut_generation;
             let mut image = if let Some(image) = self.library.get(library_index) {
                 image.clone()
             } else {
@@ -2679,12 +2681,11 @@ impl SapodillaApp {
             image.offset = Pos2::ZERO;
             self.loaded_images.push(image);
             let candidate_index = self.loaded_images.len() - 1;
-            let required_count = self
-                .loaded_images
-                .iter()
-                .filter(|image| image.visible && !image.locked)
-                .count();
             let packed = self.auto_pack();
+            // `auto_pack` intentionally excludes fixed artwork (including art
+            // pinned by an enabled locked cutline). Only movable items can
+            // overflow, so derive the trial population from its result.
+            let required_count = packed.len() + self.pack_overflow;
             if fill_trial_succeeded(&packed, candidate_index, required_count) {
                 commit_library_position(
                     &mut self.pack_cycle,
@@ -2709,7 +2710,9 @@ impl SapodillaApp {
                 self.manual_cut_shapes = previous_manual_cut_shapes;
                 self.cutline_owners = previous_cutline_owners;
                 self.cut_geometry_snapshot = previous_cut_geometry_snapshot;
-                self.cut_validation_snapshot = None;
+                self.cut_validation_snapshot = previous_cut_validation_snapshot;
+                self.cut_progress = previous_cut_progress;
+                self.active_cut_generation = previous_active_cut_generation;
                 if intrinsically_oversized {
                     commit_library_position(
                         &mut self.pack_cycle,
@@ -8735,15 +8738,12 @@ fn union_rect(left: egui::Rect, right: egui::Rect) -> egui::Rect {
 
 fn assign_cut_paths_to_images(
     images: &[LoadedImage],
-    image_bounds: &[egui::Rect],
-    cut_shapes: &[LineString<f32>],
+    path_count: usize,
     owners: &[Option<CutlineOwner>],
     placeholders: &[TemplatePlaceholder],
 ) -> Vec<Option<usize>> {
-    cut_shapes
-        .iter()
-        .enumerate()
-        .map(|(path_index, path)| {
+    (0..path_count)
+        .map(|path_index| {
             match owners.get(path_index).and_then(Option::as_ref) {
                 Some(CutlineOwner::Image(id)) => images.iter().position(|image| image.id == *id),
                 Some(CutlineOwner::TemplatePlaceholder(id)) => placeholders
@@ -8751,18 +8751,11 @@ fn assign_cut_paths_to_images(
                     .find(|placeholder| placeholder.id == *id)
                     .and_then(|placeholder| placeholder.assigned_image_id.as_deref())
                     .and_then(|id| images.iter().position(|image| image.id == id)),
-                None => {
-                    let bounds = cut_path_rect(path)?;
-                    let center = bounds.center();
-                    // Prefer the smallest containing artwork when layers overlap;
-                    // it is the least ambiguous owner for an internal contour.
-                    image_bounds
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, image)| image.contains(center))
-                        .min_by(|(_, left), (_, right)| left.area().total_cmp(&right.area()))
-                        .map(|(index, _)| index)
-                }
+                // Generated contours carry stable owner IDs. Legacy, imported,
+                // and manually drawn paths without one remain fixed obstacles;
+                // inferring ownership from overlapping bounds can move the
+                // wrong path when artwork is rotated or layered.
+                None => None,
             }
         })
         .collect()

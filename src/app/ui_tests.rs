@@ -400,6 +400,13 @@ fn rect_path(rect: egui::Rect) -> LineString<f32> {
     ])
 }
 
+fn set_fixture_size(image: &mut LoadedImage, size: Vec2) {
+    image.scale = Vec2::new(
+        size.x / image.sized_texture.size.x,
+        size.y / image.sized_texture.size.y,
+    );
+}
+
 #[test]
 fn print_and_cut_auto_pack_moves_owned_cutlines_and_keeps_their_gap() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
@@ -519,6 +526,208 @@ fn disabled_locked_cutline_does_not_pin_its_artwork_during_print_and_cut_pack() 
 
     assert_eq!(state.auto_pack(), vec![0]);
     assert_ne!(state.loaded_images[0].offset, old_offset);
+}
+
+#[test]
+fn enabled_locked_cutline_does_not_reject_a_packable_library_candidate() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut pinned = fixture_image(&harness, "Pinned", Pos2::new(500.0, 500.0));
+    let mut candidate = fixture_image(&harness, "Candidate", Pos2::new(700.0, 700.0));
+    set_fixture_size(&mut pinned, Vec2::splat(100.0));
+    set_fixture_size(&mut candidate, Vec2::splat(100.0));
+    let pinned_id = pinned.id.clone();
+    let pinned_path = rect_path(egui::Rect::from_min_size(
+        pinned.visual_offset(),
+        pinned.rotated_size(),
+    ));
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    state.loaded_images = vec![pinned, candidate];
+    state.cut_shapes = vec![pinned_path.clone()];
+    state.manual_cut_shapes = vec![pinned_path];
+    state.auto_cut_count = 0;
+    state.cut_modes = vec![CutMode::Kiss];
+    state.cutline_owners = vec![Some(CutlineOwner::Image(pinned_id))];
+    state.cutline_locked = vec![true];
+    state.peel_tab_positions = vec![None];
+    state.pack_allow_rotation = false;
+    state.pack_gap_mm = 0.0;
+
+    let packed = state.auto_pack();
+    let required_count = packed.len() + state.pack_overflow;
+    assert_eq!(packed, vec![1]);
+    assert!(fill_trial_succeeded(&packed, 1, required_count));
+}
+
+#[test]
+fn unowned_cutline_inside_artwork_stays_fixed_during_auto_pack() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut image = fixture_image(&harness, "Artwork", Pos2::new(500.0, 500.0));
+    set_fixture_size(&mut image, Vec2::new(180.0, 100.0));
+    image.rotation_degrees = 35.0;
+    let old_offset = image.offset;
+    let path = rect_path(egui::Rect::from_center_size(
+        image.offset + image.size() / 2.0,
+        Vec2::splat(30.0),
+    ));
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    state.loaded_images = vec![image];
+    state.cut_shapes = vec![path.clone()];
+    state.manual_cut_shapes = vec![path.clone()];
+    state.auto_cut_count = 0;
+    state.cut_modes = vec![CutMode::Kiss];
+    state.cutline_owners = vec![None];
+    state.cutline_locked = vec![false];
+    state.peel_tab_positions = vec![None];
+    state.pack_allow_rotation = false;
+    state.pack_gap_mm = 0.0;
+
+    assert_eq!(state.auto_pack(), vec![0]);
+    assert_ne!(state.loaded_images[0].offset, old_offset);
+    assert_eq!(state.cut_shapes, [path]);
+    assert_eq!(state.cutline_owners, [None]);
+}
+
+#[test]
+fn rotated_auto_pack_keeps_owned_cutline_aligned() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut image = fixture_image(&harness, "Rotating", Pos2::new(500.0, 500.0));
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    let canvas = state.get_canvas();
+    let safe_offset = (canvas.size - canvas.safe_area) / 2.0;
+    set_fixture_size(&mut image, Vec2::new(180.0, 80.0));
+    let image_id = image.id.clone();
+    let owned_path = rect_path(egui::Rect::from_min_size(
+        image.visual_offset(),
+        image.rotated_size(),
+    ));
+    let obstacle = rect_path(egui::Rect::from_min_size(
+        safe_offset.to_pos2(),
+        Vec2::new(canvas.safe_area.x - 85.0, canvas.safe_area.y),
+    ));
+    state.loaded_images = vec![image];
+    state.cut_shapes = vec![owned_path, obstacle.clone()];
+    state.manual_cut_shapes = state.cut_shapes.clone();
+    state.auto_cut_count = 0;
+    state.cut_modes = vec![CutMode::Kiss; 2];
+    state.cutline_owners = vec![Some(CutlineOwner::Image(image_id)), None];
+    state.cutline_locked = vec![false; 2];
+    state.peel_tab_positions = vec![None; 2];
+    state.pack_allow_rotation = true;
+    state.pack_gap_mm = 0.0;
+
+    assert_eq!(state.auto_pack(), vec![0]);
+    assert_eq!(state.loaded_images[0].rotation_degrees, 90.0);
+    let image_bounds = egui::Rect::from_min_size(
+        state.loaded_images[0].visual_offset(),
+        state.loaded_images[0].rotated_size(),
+    );
+    let path_bounds = cut_path_rect(&state.cut_shapes[0]).unwrap();
+    assert!((image_bounds.min.x - path_bounds.min.x).abs() < 0.001);
+    assert!((image_bounds.min.y - path_bounds.min.y).abs() < 0.001);
+    assert!((image_bounds.max.x - path_bounds.max.x).abs() < 0.001);
+    assert!((image_bounds.max.y - path_bounds.max.y).abs() < 0.001);
+    assert_eq!(state.cut_shapes[1], obstacle);
+}
+
+#[test]
+fn rejected_library_fill_restores_cut_generation_state_and_geometry() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut movable = fixture_image(&harness, "Existing", Pos2::new(500.0, 500.0));
+    let mut obstacle = fixture_image(&harness, "Locked obstacle", Pos2::ZERO);
+    let mut lower_obstacle = fixture_image(&harness, "Lower obstacle", Pos2::ZERO);
+    let mut candidate = fixture_image(&harness, "Candidate", Pos2::ZERO);
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    let canvas = state.get_canvas();
+    let safe_offset = (canvas.size - canvas.safe_area) / 2.0;
+
+    obstacle.offset = safe_offset.to_pos2();
+    set_fixture_size(&mut movable, Vec2::splat(100.0));
+    set_fixture_size(
+        &mut obstacle,
+        Vec2::new(canvas.safe_area.x - 110.0, canvas.safe_area.y),
+    );
+    set_fixture_size(
+        &mut lower_obstacle,
+        Vec2::new(110.0, canvas.safe_area.y - 110.0),
+    );
+    set_fixture_size(&mut candidate, Vec2::splat(100.0));
+    obstacle.locked = true;
+    lower_obstacle.locked = true;
+    lower_obstacle.offset = safe_offset.to_pos2() + Vec2::new(canvas.safe_area.x - 110.0, 110.0);
+    let movable_id = movable.id.clone();
+    let path = rect_path(egui::Rect::from_min_size(
+        movable.visual_offset(),
+        movable.rotated_size(),
+    ));
+    state.loaded_images = vec![movable, obstacle, lower_obstacle];
+    state.library = vec![candidate];
+    state.cut_shapes = vec![path.clone()];
+    state.manual_cut_shapes = vec![path];
+    state.auto_cut_count = 0;
+    state.cut_modes = vec![CutMode::Kiss];
+    state.cutline_owners = vec![Some(CutlineOwner::Image(movable_id))];
+    state.cutline_locked = vec![false];
+    state.peel_tab_positions = vec![None];
+    state.pack_allow_rotation = false;
+    state.pack_gap_mm = 0.0;
+    state.cut_geometry_snapshot = Some(state.current_cut_geometry());
+    state.cut_validation_snapshot = Some(CutValidationSnapshot {
+        geometry_hash: 77,
+        canvas_size: [101, 202],
+        safe_area: [99, 199],
+    });
+    state.cut_progress = Some((2, 5));
+    state.active_cut_generation = Some(42);
+
+    let old_transforms = state
+        .loaded_images
+        .iter()
+        .map(|image| (image.offset, image.rotation_degrees))
+        .collect::<Vec<_>>();
+    let old_paths = state.cut_shapes.clone();
+    let old_manual_paths = state.manual_cut_shapes.clone();
+    let old_owners = state.cutline_owners.clone();
+    let old_geometry_snapshot = state.cut_geometry_snapshot.clone();
+    let old_validation_snapshot = state.cut_validation_snapshot.clone();
+
+    state.add_library_to_sheet(false);
+
+    assert_eq!(state.loaded_images.len(), 3);
+    assert_eq!(
+        state
+            .loaded_images
+            .iter()
+            .map(|image| (image.offset, image.rotation_degrees))
+            .collect::<Vec<_>>(),
+        old_transforms
+    );
+    assert_eq!(state.cut_shapes, old_paths);
+    assert_eq!(state.manual_cut_shapes, old_manual_paths);
+    assert_eq!(state.cutline_owners, old_owners);
+    assert_eq!(state.cut_geometry_snapshot, old_geometry_snapshot);
+    assert_eq!(state.cut_validation_snapshot, old_validation_snapshot);
+    assert_eq!(state.cut_progress, Some((2, 5)));
+    assert_eq!(state.active_cut_generation, Some(42));
 }
 
 #[test]
