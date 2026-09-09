@@ -30,7 +30,7 @@ const CALIBRATION_NON_BODY_HEIGHT: f32 = 340.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibrationUiEvent {
     PrintPrimary,
-    UseExistingPrimarySheet,
+    UseExistingSheet(JobSlot),
     PrintSecond,
     PrintValidation,
     ImportTrainingScan,
@@ -575,6 +575,8 @@ fn render_print_job(
     ui.label("Keep scaling at 100% / Actual size and use the production print-and-cut settings.");
     if slot == JobSlot::Primary && wizard.method == Some(CalibrationMethod::FlatbedScanner) {
         ui.weak("You can reuse an earlier flatbed calibration sheet when it has the same 12-aperture target layout. Validation sheets are not interchangeable.");
+    } else if slot == JobSlot::Second {
+        ui.weak("You can reuse an earlier manual measurement sheet with the same target layout. Use a different physical sheet from the first set of measurements.");
     }
     ui.add_space(8.0);
     ui.label(format!("Job status: {}", job_status_label(status)));
@@ -1617,23 +1619,33 @@ fn render_footer(
         }
 
         let skip_label = wizard.step.skip_label();
-        let primary_job_active = wizard.step == WizardStep::PrintCalibration
-            && matches!(
-                wizard.primary_job,
+        let existing_sheet_slot = match wizard.step {
+            WizardStep::PrintCalibration => Some(JobSlot::Primary),
+            WizardStep::PrintSecondCalibration => Some(JobSlot::Second),
+            _ => None,
+        };
+        let existing_sheet_job_active = existing_sheet_slot.is_some_and(|slot| {
+            matches!(
+                match slot {
+                    JobSlot::Primary => wizard.primary_job,
+                    JobSlot::Second => wizard.second_job,
+                    JobSlot::Validation => wizard.validation_job,
+                },
                 JobStatus::Queued | JobStatus::InProgress
-            );
-        let skip_button_label = if wizard.step == WizardStep::PrintCalibration {
+            )
+        });
+        let skip_button_label = if existing_sheet_slot.is_some() {
             "Use existing sheet"
         } else {
             "Skip step"
         };
         let skip_response = ui.add_enabled(
-            skip_label.is_some() && !primary_job_active,
+            skip_label.is_some() && !existing_sheet_job_active,
             egui::Button::new(skip_button_label),
         );
         if skip_response.clicked() {
-            if wizard.step == WizardStep::PrintCalibration {
-                events.push(CalibrationUiEvent::UseExistingPrimarySheet);
+            if let Some(slot) = existing_sheet_slot {
+                events.push(CalibrationUiEvent::UseExistingSheet(slot));
             } else {
                 match wizard.skip_current_step(now) {
                     Ok(step) => {
@@ -1648,7 +1660,7 @@ fn render_footer(
                 }
             }
         }
-        if primary_job_active {
+        if existing_sheet_job_active {
             skip_response.on_hover_text("Wait for or cancel the active print job first");
         } else if let Some(label) = skip_label {
             skip_response.on_hover_text(label);

@@ -331,6 +331,16 @@ fn manual_calibration_can_continue_with_an_existing_printed_sheet() {
         let session = harness.state_mut().calibration_session.as_mut().unwrap();
         session.wizard.primary_job = crate::calibration::JobStatus::Failed;
         session.primary_queue_job = Some(4242);
+        session.second_queue_job = Some(4243);
+        session.historical_queue_job_ids[1] = Some(4243);
+        session.image_sha1[1] = Some("c".repeat(40));
+        session.plotter_sha1[1] = Some("d".repeat(40));
+        session.plotter_commands[1].push(crate::calibration::CalibrationPlotterCommand {
+            kind: crate::calibration::CalibrationPlotterCommandKind::Draw,
+            plotter_units: [30, 40],
+        });
+        session.device_job_ids.push(101);
+        session.device_job_ids_by_slot[1].push(101);
     }
     harness.run();
     harness.get_by_label("Use existing sheet").click_accesskit();
@@ -351,6 +361,59 @@ fn manual_calibration_can_continue_with_an_existing_printed_sheet() {
             .primary_queue_job,
         None
     );
+    let session = harness.state().calibration_session.as_ref().unwrap();
+    assert_eq!(session.second_queue_job, None);
+    assert_eq!(session.historical_queue_job_ids[1], None);
+    assert_eq!(session.image_sha1[1], None);
+    assert_eq!(session.plotter_sha1[1], None);
+    assert!(session.plotter_commands[1].is_empty());
+    assert!(!session.device_job_ids.contains(&101));
+    assert!(session.device_job_ids_by_slot[1].is_empty());
+}
+
+#[test]
+fn manual_second_sheet_can_reuse_an_earlier_print() {
+    let mut harness = app_harness(Vec2::new(560.0, 520.0));
+    open_calibration_fixture(&mut harness);
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.method = Some(crate::calibration::CalibrationMethod::ManualEastBay);
+        session.wizard.step = crate::calibration::WizardStep::PrintSecondCalibration;
+        session.wizard.second_sheet_choice =
+            Some(crate::calibration::SecondSheetChoice::MeasureAnotherSheet);
+        session.wizard.second_job = crate::calibration::JobStatus::Failed;
+        session.second_queue_job = Some(5252);
+        session.historical_queue_job_ids[1] = Some(5252);
+        session.image_sha1[1] = Some("a".repeat(40));
+        session.plotter_sha1[1] = Some("b".repeat(40));
+        session.plotter_commands[1].push(crate::calibration::CalibrationPlotterCommand {
+            kind: crate::calibration::CalibrationPlotterCommandKind::Draw,
+            plotter_units: [10, 20],
+        });
+        session.device_job_ids.push(99);
+        session.device_job_ids_by_slot[1].push(99);
+    }
+    harness.run();
+    harness.get_by_label("Print and cut a freshly loaded second sheet");
+    harness.get_by_label("Use existing sheet").click_accesskit();
+    harness.run();
+
+    let session = harness.state().calibration_session.as_ref().unwrap();
+    assert_eq!(
+        session.wizard.step,
+        crate::calibration::WizardStep::SecondPrintScale
+    );
+    assert_eq!(
+        session.wizard.second_job,
+        crate::calibration::JobStatus::ExistingSheet
+    );
+    assert_eq!(session.second_queue_job, None);
+    assert_eq!(session.historical_queue_job_ids[1], None);
+    assert_eq!(session.image_sha1[1], None);
+    assert_eq!(session.plotter_sha1[1], None);
+    assert!(session.plotter_commands[1].is_empty());
+    assert!(!session.device_job_ids.contains(&99));
+    assert!(session.device_job_ids_by_slot[1].is_empty());
 }
 
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {

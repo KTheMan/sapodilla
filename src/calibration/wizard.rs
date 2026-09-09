@@ -93,7 +93,9 @@ impl WizardStep {
     pub const fn skip_label(self) -> Option<&'static str> {
         match self {
             Self::Prepare => Some("Skip preparation walkthrough"),
-            Self::PrintCalibration => Some("Use existing printed sheet"),
+            Self::PrintCalibration | Self::PrintSecondCalibration => {
+                Some("Use an existing compatible printed sheet")
+            }
             Self::PrintArea => Some("Skip print-area measurements"),
             Self::PrintScale | Self::SecondPrintScale => Some("Assume 1:1 print scale"),
             Self::SecondSheetChoice => Some("Skip the second sheet"),
@@ -536,9 +538,52 @@ impl CalibrationWizard {
     /// reprinted so an intentionally re-imported old scan cannot bind again.
     pub fn begin_print_job(&mut self, slot: JobSlot, now: u64) -> Result<(), WizardError> {
         self.ensure_active()?;
+        self.reset_physical_sheet_evidence(slot);
+        *match slot {
+            JobSlot::Primary => &mut self.primary_job,
+            JobSlot::Second => &mut self.second_job,
+            JobSlot::Validation => &mut self.validation_job,
+        } = JobStatus::Queued;
+        if slot == JobSlot::Validation {
+            self.validation = ValidationStatus::Collecting;
+        }
+        self.touch(now);
+        Ok(())
+    }
+
+    /// Replaces a print step with a compatible physical sheet from an earlier
+    /// run. Evidence belonging to the previous sheet in this slot is cleared
+    /// exactly as it is for a reprint.
+    fn use_existing_sheet(&mut self, slot: JobSlot, now: u64) -> Result<(), WizardError> {
+        self.ensure_active()?;
+        if slot == JobSlot::Validation {
+            return Err(WizardError::TransitionBlocked(
+                "validation requires a sheet printed for the current candidate".into(),
+            ));
+        }
+        let status = match slot {
+            JobSlot::Primary => self.primary_job,
+            JobSlot::Second => self.second_job,
+            JobSlot::Validation => self.validation_job,
+        };
+        if matches!(status, JobStatus::Queued | JobStatus::InProgress) {
+            return Err(WizardError::TransitionBlocked(
+                "wait for or cancel the active calibration job before using another sheet".into(),
+            ));
+        }
+        self.reset_physical_sheet_evidence(slot);
+        *match slot {
+            JobSlot::Primary => &mut self.primary_job,
+            JobSlot::Second => &mut self.second_job,
+            JobSlot::Validation => unreachable!(),
+        } = JobStatus::ExistingSheet;
+        self.touch(now);
+        Ok(())
+    }
+
+    fn reset_physical_sheet_evidence(&mut self, slot: JobSlot) {
         match slot {
             JobSlot::Primary => {
-                self.primary_job = JobStatus::Queued;
                 self.primary_centers_removed = false;
                 self.training_scan = ScanImportStatus::NotImported;
                 self.training_scan_reviewed = false;
@@ -552,12 +597,10 @@ impl CalibrationWizard {
                 self.invalidate_candidate();
             }
             JobSlot::Second => {
-                self.second_job = JobStatus::Queued;
                 self.manual_second = ManualSheetDraft::primary(format!("{}-sheet-2", self.run_id));
                 self.invalidate_candidate();
             }
             JobSlot::Validation => {
-                self.validation_job = JobStatus::Queued;
                 self.validation_centers_removed = false;
                 self.validation_scan = ScanImportStatus::NotImported;
                 self.validation_scan_reviewed = false;
@@ -568,8 +611,6 @@ impl CalibrationWizard {
                 self.validation = ValidationStatus::Collecting;
             }
         }
-        self.touch(now);
-        Ok(())
     }
 
     pub fn confirm_centers_removed(&mut self, validation: bool, now: u64) {
@@ -925,13 +966,10 @@ impl CalibrationWizard {
                 self.confirm_prepared(true, now);
             }
             WizardStep::PrintCalibration => {
-                if matches!(self.primary_job, JobStatus::Queued | JobStatus::InProgress) {
-                    return Err(WizardError::TransitionBlocked(
-                        "wait for or cancel the active calibration job before using another sheet"
-                            .into(),
-                    ));
-                }
-                self.set_job_status(JobSlot::Primary, JobStatus::ExistingSheet, now);
+                self.use_existing_sheet(JobSlot::Primary, now)?;
+            }
+            WizardStep::PrintSecondCalibration => {
+                self.use_existing_sheet(JobSlot::Second, now)?;
             }
             WizardStep::PrintArea => {
                 self.mark_print_area_reviewed([None; 4], now)?;
@@ -1065,10 +1103,10 @@ impl CalibrationWizard {
                 None => blocked("choose whether to measure another sheet"),
             },
             WizardStep::PrintSecondCalibration => {
-                if self.second_job == JobStatus::Completed {
+                if self.second_job.has_physical_output() {
                     Ok(WizardStep::SecondPrintScale)
                 } else {
-                    blocked("the second independently loaded sheet has not completed")
+                    blocked("the second independently loaded sheet is not ready")
                 }
             }
             WizardStep::SecondPrintScale => {
@@ -1688,6 +1726,125 @@ mod tests {
             WizardStep::RemoveCenters
         );
         assert_eq!(wizard.primary_job, JobStatus::ExistingSheet);
+    }
+
+    #[test]
+    fn existing_second_sheet_enters_manual_measurement_flow() {
+        let mut wizard = CalibrationWizard::new("manual-existing-second", 0).unwrap();
+        wizard.method = Some(CalibrationMethod::ManualEastBay);
+        wizard.prepared = true;
+        wizard.primary_job = JobStatus::ExistingSheet;
+        wizard.second_sheet_choice = Some(SecondSheetChoice::MeasureAnotherSheet);
+        wizard.step = WizardStep::PrintSecondCalibration;
+
+        wizard.second_job = JobStatus::Queued;
+        assert!(wizard.skip_current_step(1).is_err());
+        assert_eq!(wizard.step, WizardStep::PrintSecondCalibration);
+        assert_eq!(wizard.second_job, JobStatus::Queued);
+
+        wizard.second_job = JobStatus::Failed;
+        assert_eq!(
+            wizard.skip_current_step(2).unwrap(),
+            WizardStep::SecondPrintScale
+        );
+        assert_eq!(wizard.second_job, JobStatus::ExistingSheet);
+        assert_eq!(
+            wizard.history.last(),
+            Some(&WizardStep::PrintSecondCalibration)
+        );
+
+        let json = wizard.save_json(3).unwrap();
+        let resumed = CalibrationWizard::resume_json(&json).unwrap();
+        assert_eq!(resumed.second_job, JobStatus::ExistingSheet);
+        assert_eq!(resumed.step, WizardStep::SecondPrintScale);
+    }
+
+    #[test]
+    fn existing_sheet_replacement_clears_evidence_from_the_replaced_sheet() {
+        let mut primary = CalibrationWizard::new("existing-primary-reset", 0).unwrap();
+        primary.method = Some(CalibrationMethod::FlatbedScanner);
+        primary.step = WizardStep::PrintCalibration;
+        primary.primary_job = JobStatus::Completed;
+        primary.primary_centers_removed = true;
+        primary.complete_scan_import(
+            ScanSlot::Training,
+            "old-primary.png",
+            true,
+            (1..=8).map(|id| observation(id, "old-primary")).collect(),
+            1,
+        );
+        primary.accept_scan_review(ScanSlot::Training, 2);
+        primary.second_job = JobStatus::Completed;
+        primary.mark_candidate_ready("translation", 3);
+        primary.validation_job = JobStatus::Completed;
+        primary.validation_centers_removed = true;
+        primary.complete_scan_import(
+            ScanSlot::Validation,
+            "old-validation.png",
+            true,
+            (1..=6)
+                .map(|id| observation(id, "old-validation"))
+                .collect(),
+            4,
+        );
+        primary.accept_scan_review(ScanSlot::Validation, 5);
+        primary.set_validation_result(true, "passed", 6);
+        primary.set_kiss_cut_inspection(true, 7);
+
+        assert_eq!(
+            primary.skip_current_step(8).unwrap(),
+            WizardStep::RemoveCenters
+        );
+        assert_eq!(primary.primary_job, JobStatus::ExistingSheet);
+        assert!(!primary.primary_centers_removed);
+        assert_eq!(primary.training_scan, ScanImportStatus::NotImported);
+        assert!(primary.scan_training_observations.is_empty());
+        assert!(!primary.training_scan_reviewed);
+        assert_eq!(primary.second_job, JobStatus::NotStarted);
+        assert_eq!(primary.second_sheet_choice, None);
+        assert_eq!(primary.candidate, CandidateStatus::NotStarted);
+        assert_eq!(primary.validation_job, JobStatus::NotStarted);
+        assert_eq!(primary.validation, ValidationStatus::NotStarted);
+        assert!(primary.validation_observations.is_empty());
+        assert_eq!(primary.normal_kiss_cut_passed, None);
+
+        let mut second = CalibrationWizard::new("existing-second-reset", 0).unwrap();
+        second.method = Some(CalibrationMethod::ManualEastBay);
+        second.step = WizardStep::PrintSecondCalibration;
+        second.second_sheet_choice = Some(SecondSheetChoice::MeasureAnotherSheet);
+        second.second_job = JobStatus::Completed;
+        second
+            .set_print_scale(ManualSheetSlot::Second, Some([80.0, 150.0]), 1)
+            .unwrap();
+        second
+            .set_manual_target(ManualSheetSlot::Second, "C1", complete_edges(), false, 2)
+            .unwrap();
+        second.mark_candidate_ready("translation", 3);
+        second.validation_job = JobStatus::Completed;
+        second
+            .set_manual_target(
+                ManualSheetSlot::Validation,
+                "V1",
+                complete_edges(),
+                false,
+                4,
+            )
+            .unwrap();
+        second.set_validation_result(true, "passed", 5);
+
+        assert_eq!(
+            second.skip_current_step(6).unwrap(),
+            WizardStep::SecondPrintScale
+        );
+        assert_eq!(second.second_job, JobStatus::ExistingSheet);
+        assert_eq!(
+            second.manual_second,
+            ManualSheetDraft::primary("existing-second-reset-sheet-2".into())
+        );
+        assert_eq!(second.candidate, CandidateStatus::NotStarted);
+        assert_eq!(second.validation_job, JobStatus::NotStarted);
+        assert_eq!(second.validation, ValidationStatus::NotStarted);
+        assert!(second.manual_validation.accepted_count() == 0);
     }
 
     #[test]

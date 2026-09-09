@@ -3988,36 +3988,54 @@ impl SapodillaApp {
         });
     }
 
-    fn use_existing_primary_calibration_sheet(&mut self) {
-        let active_queue_job = self
-            .calibration_session
-            .as_ref()
-            .and_then(|session| session.queue_job(CalibrationJobSlot::Primary))
-            .filter(|job_id| {
-                self.job_queue.job(*job_id).is_some_and(|job| {
-                    matches!(job.status, QueueJobStatus::Queued | QueueJobStatus::Running)
+    fn use_existing_calibration_sheet(&mut self, slot: CalibrationJobSlot) {
+        let reset_slots = match slot {
+            CalibrationJobSlot::Primary => {
+                vec![CalibrationJobSlot::Primary, CalibrationJobSlot::Second]
+            }
+            CalibrationJobSlot::Second => vec![CalibrationJobSlot::Second],
+            CalibrationJobSlot::Validation => vec![CalibrationJobSlot::Validation],
+        };
+        let active_queue_job = self.calibration_session.as_ref().is_some_and(|session| {
+            reset_slots.iter().any(|reset_slot| {
+                session.queue_job(*reset_slot).is_some_and(|job_id| {
+                    self.job_queue.job(job_id).is_some_and(|job| {
+                        matches!(job.status, QueueJobStatus::Queued | QueueJobStatus::Running)
+                    })
                 })
-            });
-        if active_queue_job.is_some() {
+            })
+        });
+        if active_queue_job {
             self.calibration_message =
-                Some("Wait for or cancel the active calibration job first.".into());
+                Some("Wait for or cancel active calibration jobs first.".into());
             return;
         }
 
         let now = current_timestamp_millis();
-        let (result, stale_queue_job) = {
+        let (result, stale_queue_jobs) = {
             let Some(session) = self.calibration_session.as_mut() else {
                 return;
             };
             let result = session.wizard.skip_current_step(now);
-            let stale_queue_job = if result.is_ok() {
-                session.take_queue_job(CalibrationJobSlot::Primary)
-            } else {
-                None
-            };
-            (result, stale_queue_job)
+            let mut stale_queue_jobs = Vec::new();
+            if result.is_ok() {
+                for reset_slot in &reset_slots {
+                    let index = CalibrationSession::slot_index(*reset_slot);
+                    stale_queue_jobs.extend(session.take_queue_job(*reset_slot));
+                    session.historical_queue_job_ids[index] = None;
+                    session.image_sha1[index] = None;
+                    session.plotter_sha1[index] = None;
+                    session.plotter_commands[index].clear();
+                    let stale_device_ids =
+                        std::mem::take(&mut session.device_job_ids_by_slot[index]);
+                    session
+                        .device_job_ids
+                        .retain(|id| !stale_device_ids.contains(id));
+                }
+            }
+            (result, stale_queue_jobs)
         };
-        if let Some(job_id) = stale_queue_job {
+        for job_id in stale_queue_jobs {
             self.pending_print_jobs.remove(&job_id);
             self.active_queue_jobs
                 .retain(|_, active_job_id| *active_job_id != job_id);
@@ -7855,8 +7873,8 @@ impl eframe::App for SapodillaApp {
                 calibration_ui::CalibrationUiEvent::PrintPrimary => {
                     self.prepare_calibration_job(CalibrationJobSlot::Primary)
                 }
-                calibration_ui::CalibrationUiEvent::UseExistingPrimarySheet => {
-                    self.use_existing_primary_calibration_sheet()
+                calibration_ui::CalibrationUiEvent::UseExistingSheet(slot) => {
+                    self.use_existing_calibration_sheet(slot)
                 }
                 calibration_ui::CalibrationUiEvent::PrintSecond => {
                     self.prepare_calibration_job(CalibrationJobSlot::Second)
@@ -8367,6 +8385,17 @@ fn persisted_calibration_run(
     let second_required = session.wizard.method == Some(CalibrationMethod::ManualEastBay)
         && session.wizard.second_sheet_choice
             == Some(crate::calibration::SecondSheetChoice::MeasureAnotherSheet);
+    let reused_sheet_slots = [
+        ("primary", session.wizard.primary_job),
+        ("second", session.wizard.second_job),
+    ]
+    .into_iter()
+    .filter(|(slot, status)| {
+        *status == crate::calibration::JobStatus::ExistingSheet
+            && (*slot == "primary" || second_required)
+    })
+    .map(|(slot, _)| slot.to_owned())
+    .collect::<Vec<_>>();
     let payload_hashes = ["primary", "second", "validation"]
         .into_iter()
         .enumerate()
@@ -8376,8 +8405,10 @@ fn persisted_calibration_run(
                     session.image_sha1[index].clone(),
                     session.plotter_sha1[index].clone(),
                 ) else {
-                    if matches!(slot, "primary" | "validation")
-                        || (slot == "second" && second_required)
+                    let reused = reused_sheet_slots.iter().any(|reused| reused == slot);
+                    if (matches!(slot, "primary" | "validation")
+                        || (slot == "second" && second_required))
+                        && !reused
                     {
                         anyhow::bail!("{slot} payload hashes were not captured");
                     }
@@ -8429,6 +8460,7 @@ fn persisted_calibration_run(
         .collect(),
         device_job_ids: session.device_job_ids.clone(),
         payload_hashes,
+        reused_sheet_slots,
         observations,
         excluded_target_ids,
         printability_insets_mm: session.wizard.printability_insets_mm,
@@ -11339,7 +11371,7 @@ mod tests {
             0,
             0,
         ));
-        let mut run = persisted_calibration_run(&session, &solution, metrics).unwrap();
+        let mut run = persisted_calibration_run(&session, &solution, metrics.clone()).unwrap();
         run.validate_and_sanitize().unwrap();
         assert_eq!(run.queue_job_ids, [7, 8]);
         assert_eq!(run.device_job_ids, [70, 80]);
@@ -11372,6 +11404,45 @@ mod tests {
         assert_eq!(
             run.manifest.plt_sha1.as_deref(),
             Some("c".repeat(40).as_str())
+        );
+
+        let mut reused_primary = session.clone();
+        reused_primary.wizard.primary_job = crate::calibration::JobStatus::ExistingSheet;
+        reused_primary.primary_queue_job = None;
+        reused_primary.historical_queue_job_ids[0] = None;
+        reused_primary.image_sha1[0] = None;
+        reused_primary.plotter_sha1[0] = None;
+        reused_primary.plotter_commands[0].clear();
+        reused_primary.device_job_ids.retain(|id| *id != 70);
+        reused_primary.device_job_ids_by_slot[0].clear();
+        let mut reused_primary_run =
+            persisted_calibration_run(&reused_primary, &solution, metrics.clone()).unwrap();
+        reused_primary_run.validate_and_sanitize().unwrap();
+        assert_eq!(reused_primary_run.reused_sheet_slots, ["primary"]);
+        assert_eq!(
+            reused_primary_run
+                .payload_hashes
+                .iter()
+                .map(|payload| payload.slot.as_str())
+                .collect::<Vec<_>>(),
+            ["validation"]
+        );
+        assert_eq!(reused_primary_run.queue_job_ids, [8]);
+        assert_eq!(reused_primary_run.device_job_ids, [80]);
+
+        let mut reused_second = session.clone();
+        reused_second.wizard.second_sheet_choice =
+            Some(crate::calibration::SecondSheetChoice::MeasureAnotherSheet);
+        reused_second.wizard.second_job = crate::calibration::JobStatus::ExistingSheet;
+        let mut reused_second_run =
+            persisted_calibration_run(&reused_second, &solution, metrics.clone()).unwrap();
+        reused_second_run.validate_and_sanitize().unwrap();
+        assert_eq!(reused_second_run.reused_sheet_slots, ["second"]);
+        assert!(
+            reused_second_run
+                .payload_hashes
+                .iter()
+                .all(|payload| payload.slot != "second")
         );
 
         let mut saved_session = session.clone();
