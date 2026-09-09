@@ -27,6 +27,10 @@ pub struct CutResult {
     pub has_intersections: bool,
     pub off_canvas: bool,
     pub line_strings: Vec<LineString<f32>>,
+    /// Stable artwork identity for each generated path, parallel to
+    /// `line_strings`. Keeping this relationship avoids geometry guesses when
+    /// cut-aware layout later moves a complete artwork/cutline group.
+    pub owners: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -183,6 +187,7 @@ pub struct CutGenerator {
 /// source/original raster and GPU texture handle along with every current
 /// raster when a generation starts.
 pub(crate) struct CutImage {
+    id: String,
     image: image::RgbaImage,
     size: Vec2,
     offset: Pos2,
@@ -192,6 +197,7 @@ pub(crate) struct CutImage {
 impl From<&LoadedImage> for CutImage {
     fn from(image: &LoadedImage) -> Self {
         Self {
+            id: image.id.clone(),
             image: image.image.clone(),
             size: image.size(),
             offset: image.offset,
@@ -233,9 +239,11 @@ impl CutGenerator {
         })?;
 
         let mut line_strings = Vec::new();
+        let mut owners = Vec::new();
 
         for (index, image) in self.images.iter().enumerate() {
             let paths = self.image(image);
+            owners.extend(std::iter::repeat_n(image.id.clone(), paths.len()));
             line_strings.extend(paths);
 
             self.tx.unbounded_send(CutAction::Progress {
@@ -262,6 +270,7 @@ impl CutGenerator {
             has_intersections,
             off_canvas,
             line_strings,
+            owners,
         }))?;
 
         Ok(())
@@ -574,6 +583,7 @@ mod tests {
             }
         });
         let image = CutImage {
+            id: "test-image".into(),
             image: pixels,
             size: Vec2::new(64.0, 48.0),
             offset: Pos2::new(10.0, 20.0),
@@ -606,5 +616,23 @@ mod tests {
         let bounds = paths[0].bounding_rect().unwrap();
         assert!(bounds.min().x >= 19.0 && bounds.max().x <= 65.0);
         assert!(bounds.min().y >= 27.0 && bounds.max().y <= 61.0);
+
+        let (tx, mut rx) = unbounded();
+        CutGenerator {
+            tx,
+            images: vec![image],
+            tuning: generator.tuning,
+            canvas_size: canvas,
+        }
+        .process()
+        .unwrap();
+        let result = loop {
+            match rx.try_recv() {
+                Ok(CutAction::Done(result)) => break result,
+                Ok(CutAction::Progress { .. }) => {}
+                Err(error) => panic!("cut worker did not return a result: {error}"),
+            }
+        };
+        assert_eq!(result.owners, vec!["test-image"; result.line_strings.len()]);
     }
 }

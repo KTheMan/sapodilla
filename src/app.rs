@@ -40,7 +40,7 @@ use crate::{
     spawn, spawn_blocking,
     studio::{
         self, CutlineOwner, DocumentKind, DocumentSettings, ImageAdjustments, MaterialProfile,
-        PackItem, PlaceholderFit, SavedImage, StudioDocument, TemplatePlaceholder,
+        PackItem, PackObstacle, PlaceholderFit, SavedImage, StudioDocument, TemplatePlaceholder,
     },
     theme,
     toolpath::{CutMode, CutPhase, effective_cut_modes, plan_cut_phases},
@@ -2207,81 +2207,192 @@ impl SapodillaApp {
         let canvas = self.get_canvas();
         let safe_offset = (canvas.size - canvas.safe_area) / 2.0;
         let gap = self.pack_gap_mm * DEVICES[self.selected_device].dpi / 25.4;
+        let cut_aware = DEVICES[self.selected_device].modes[self.selected_mode]
+            .mode_type
+            .has_cutting();
+        let image_bounds = self
+            .loaded_images
+            .iter()
+            .map(|image| egui::Rect::from_min_size(image.visual_offset(), image.rotated_size()))
+            .collect::<Vec<_>>();
+        let path_assignments = if cut_aware {
+            assign_cut_paths_to_images(
+                &self.loaded_images,
+                self.cut_shapes.len(),
+                &self.cutline_owners,
+                &self.template_placeholders,
+            )
+        } else {
+            vec![None; self.cut_shapes.len()]
+        };
+        // Persist sound geometry-based associations so imported/unowned paths
+        // continue to travel with the same artwork on later arrangements.
+        if cut_aware {
+            for (path_index, image_index) in path_assignments.iter().copied().enumerate() {
+                if self.cutline_owners.get(path_index) == Some(&None)
+                    && let Some(image_index) = image_index
+                {
+                    self.cutline_owners[path_index] = Some(CutlineOwner::Image(
+                        self.loaded_images[image_index].id.clone(),
+                    ));
+                }
+            }
+        }
+        let packing_modes =
+            effective_cut_modes(self.cut_shapes.len(), &self.cut_modes, self.perf_cut);
+        let enabled_paths = packing_modes
+            .iter()
+            .map(|mode| *mode != CutMode::Disabled)
+            .collect::<Vec<_>>();
+        let mut footprints = image_bounds.clone();
+        if cut_aware {
+            for (path_index, image_index) in path_assignments.iter().copied().enumerate() {
+                if !enabled_paths[path_index] {
+                    continue;
+                }
+                let bounds = layout_cut_rect(
+                    &self.cut_shapes[path_index],
+                    packing_modes[path_index],
+                    self.overcut,
+                );
+                if let (Some(image_index), Some(bounds)) = (image_index, bounds) {
+                    footprints[image_index] = union_rect(footprints[image_index], bounds);
+                }
+            }
+            if self.peel_tabs {
+                for (path_index, tab) in
+                    build_peel_tabs(&self.cut_shapes, &enabled_paths, &self.peel_tab_positions)
+                {
+                    if let (Some(image_index), Some(bounds)) = (
+                        path_assignments.get(path_index).copied().flatten(),
+                        cut_path_rect(&tab.path),
+                    ) {
+                        footprints[image_index] = union_rect(footprints[image_index], bounds);
+                    }
+                }
+            }
+        }
+        let path_locks_image = |image_index: usize| {
+            cut_aware
+                && path_assignments
+                    .iter()
+                    .enumerate()
+                    .any(|(path_index, assigned)| {
+                        enabled_paths[path_index]
+                            && *assigned == Some(image_index)
+                            && self.cutline_locked.get(path_index) == Some(&true)
+                    })
+        };
         let items = self
             .loaded_images
             .iter()
             .enumerate()
-            .filter(|(_, image)| image.visible && !image.locked)
-            .map(|(index, image)| PackItem {
+            .filter(|(index, image)| image.visible && !image.locked && !path_locks_image(*index))
+            .map(|(index, _)| PackItem {
                 index,
-                size: image.rotated_size(),
+                size: footprints[index].size(),
             })
             .collect::<Vec<_>>();
-        let placements = studio::auto_pack(&items, canvas.safe_area, gap, self.pack_allow_rotation);
-        let locked_obstacles = self
+        let movable = items.iter().map(|item| item.index).collect::<BTreeSet<_>>();
+        let mut obstacle_rects = self
             .loaded_images
             .iter()
-            .filter(|image| image.visible && image.locked)
-            .map(|image| egui::Rect::from_min_size(image.visual_offset(), image.rotated_size()))
+            .enumerate()
+            .filter(|(index, image)| image.visible && !movable.contains(index))
+            .map(|(index, _)| footprints[index])
             .collect::<Vec<_>>();
-        let mut rejected = placements
-            .iter()
-            .filter(|placement| {
-                let mut size = self.loaded_images[placement.index].rotated_size();
-                if placement.rotated {
-                    size = Vec2::new(size.y, size.x);
-                }
-                let target = egui::Rect::from_min_size(placement.offset + safe_offset, size);
-                locked_obstacles
-                    .iter()
-                    .any(|obstacle| obstacle.intersects(target))
-            })
-            .map(|placement| placement.index)
-            .collect::<Vec<_>>();
-        loop {
-            let old_obstacles = rejected
-                .iter()
-                .map(|index| {
-                    let image = &self.loaded_images[*index];
-                    egui::Rect::from_min_size(image.visual_offset(), image.rotated_size())
-                })
-                .collect::<Vec<_>>();
-            let before = rejected.len();
-            for placement in &placements {
-                let mut size = self.loaded_images[placement.index].rotated_size();
-                if placement.rotated {
-                    size = Vec2::new(size.y, size.x);
-                }
-                let target = egui::Rect::from_min_size(placement.offset + safe_offset, size);
-                if !rejected.contains(&placement.index)
-                    && old_obstacles
-                        .iter()
-                        .any(|obstacle| obstacle.intersects(target))
+        if cut_aware {
+            for (path_index, assignment) in path_assignments.iter().enumerate() {
+                if enabled_paths[path_index]
+                    && assignment.is_none_or(|image_index| !movable.contains(&image_index))
                 {
-                    rejected.push(placement.index);
+                    let bounds = layout_cut_rect(
+                        &self.cut_shapes[path_index],
+                        packing_modes[path_index],
+                        self.overcut,
+                    );
+                    if let Some(bounds) = bounds {
+                        obstacle_rects.push(bounds);
+                    }
                 }
             }
-            if rejected.len() == before {
-                break;
+            if self.peel_tabs {
+                for (path_index, tab) in
+                    build_peel_tabs(&self.cut_shapes, &enabled_paths, &self.peel_tab_positions)
+                {
+                    if path_assignments
+                        .get(path_index)
+                        .copied()
+                        .flatten()
+                        .is_none_or(|image_index| !movable.contains(&image_index))
+                        && let Some(bounds) = cut_path_rect(&tab.path)
+                    {
+                        obstacle_rects.push(bounds);
+                    }
+                }
             }
         }
+        let obstacles = obstacle_rects
+            .into_iter()
+            .map(|bounds| PackObstacle {
+                offset: bounds.min - safe_offset,
+                size: bounds.size(),
+            })
+            .collect::<Vec<_>>();
+        let placements = if obstacles.is_empty() {
+            studio::auto_pack(&items, canvas.safe_area, gap, self.pack_allow_rotation)
+        } else {
+            studio::auto_pack_with_obstacles(
+                &items,
+                canvas.safe_area,
+                gap,
+                self.pack_allow_rotation,
+                &obstacles,
+            )
+        };
         let packed = placements
             .iter()
-            .filter(|placement| !rejected.contains(&placement.index))
             .map(|placement| placement.index)
             .collect::<Vec<_>>();
         self.pack_overflow = items.len().saturating_sub(packed.len());
-        for placement in placements
-            .into_iter()
-            .filter(|placement| packed.contains(&placement.index))
-        {
-            let image = &mut self.loaded_images[placement.index];
+        for placement in placements {
+            let image_index = placement.index;
+            let image_center = self.loaded_images[image_index].offset
+                + self.loaded_images[image_index].size() / 2.0;
+            let mut footprint = footprints[image_index];
             if placement.rotated {
+                for (path_index, assignment) in path_assignments.iter().copied().enumerate() {
+                    if assignment == Some(image_index) {
+                        rotate_path_quarter_turn(&mut self.cut_shapes[path_index], image_center);
+                    }
+                }
+                let image = &mut self.loaded_images[image_index];
                 image.rotation_degrees = (image.rotation_degrees + 90.0).rem_euclid(360.0);
+                footprint = rotate_rect_quarter_turn(footprint, image_center);
             }
-            image.offset =
-                placement.offset + safe_offset + (image.rotated_size() - image.size()) / 2.0;
+            let translation = placement.offset + safe_offset - footprint.min;
+            self.loaded_images[image_index].offset += translation;
+            for (path_index, assignment) in path_assignments.iter().copied().enumerate() {
+                if assignment == Some(image_index) {
+                    translate_path(&mut self.cut_shapes[path_index], translation);
+                }
+            }
         }
+        for path_index in self.auto_cut_count..self.cut_shapes.len() {
+            if let Some(manual) = self
+                .manual_cut_shapes
+                .get_mut(path_index - self.auto_cut_count)
+            {
+                manual.clone_from(&self.cut_shapes[path_index]);
+            }
+        }
+        self.cut_progress = None;
+        self.active_cut_generation = None;
+        self.cut_validation_snapshot = None;
+        // Auto-generated contours were transformed with their source artwork,
+        // so they still describe the new geometry and need not be discarded by
+        // the next synchronization pass.
+        self.cut_geometry_snapshot = Some(self.current_cut_geometry());
         packed
     }
 
@@ -2527,6 +2638,13 @@ impl SapodillaApp {
                 .iter()
                 .map(|image| (image.offset, image.rotation_degrees))
                 .collect::<Vec<_>>();
+            let previous_cut_shapes = self.cut_shapes.clone();
+            let previous_manual_cut_shapes = self.manual_cut_shapes.clone();
+            let previous_cutline_owners = self.cutline_owners.clone();
+            let previous_cut_geometry_snapshot = self.cut_geometry_snapshot.clone();
+            let previous_cut_validation_snapshot = self.cut_validation_snapshot.clone();
+            let previous_cut_progress = self.cut_progress;
+            let previous_active_cut_generation = self.active_cut_generation;
             let mut image = if let Some(image) = self.library.get(library_index) {
                 image.clone()
             } else {
@@ -2563,12 +2681,11 @@ impl SapodillaApp {
             image.offset = Pos2::ZERO;
             self.loaded_images.push(image);
             let candidate_index = self.loaded_images.len() - 1;
-            let required_count = self
-                .loaded_images
-                .iter()
-                .filter(|image| image.visible && !image.locked)
-                .count();
             let packed = self.auto_pack();
+            // `auto_pack` intentionally excludes fixed artwork (including art
+            // pinned by an enabled locked cutline). Only movable items can
+            // overflow, so derive the trial population from its result.
+            let required_count = packed.len() + self.pack_overflow;
             if fill_trial_succeeded(&packed, candidate_index, required_count) {
                 commit_library_position(
                     &mut self.pack_cycle,
@@ -2589,6 +2706,13 @@ impl SapodillaApp {
                     image.offset = offset;
                     image.rotation_degrees = rotation;
                 }
+                self.cut_shapes = previous_cut_shapes;
+                self.manual_cut_shapes = previous_manual_cut_shapes;
+                self.cutline_owners = previous_cutline_owners;
+                self.cut_geometry_snapshot = previous_cut_geometry_snapshot;
+                self.cut_validation_snapshot = previous_cut_validation_snapshot;
+                self.cut_progress = previous_cut_progress;
+                self.active_cut_generation = previous_active_cut_generation;
                 if intrinsically_oversized {
                     commit_library_position(
                         &mut self.pack_cycle,
@@ -3308,7 +3432,12 @@ impl SapodillaApp {
                             self.auto_cut_count = result.line_strings.len();
                             self.cut_shapes = result.line_strings;
                             self.cut_modes = next_modes;
-                            self.cutline_owners = vec![None; self.auto_cut_count];
+                            self.cutline_owners = result
+                                .owners
+                                .into_iter()
+                                .map(|id| Some(CutlineOwner::Image(id)))
+                                .collect();
+                            self.cutline_owners.resize(self.auto_cut_count, None);
                             self.cutline_locked = vec![false; self.auto_cut_count];
                             self.peel_tab_positions = vec![None; self.auto_cut_count];
                             self.cut_shapes.extend(self.manual_cut_shapes.clone());
@@ -8562,6 +8691,110 @@ fn modes_after_regeneration(
             .unwrap_or_default()
     }));
     modes
+}
+
+fn layout_cut_rect(
+    path: &LineString<f32>,
+    mode: CutMode,
+    overcut: OvercutSettings,
+) -> Option<egui::Rect> {
+    if mode == CutMode::Kiss && overcut.enabled && path.0.first() == path.0.last() {
+        let bounds = cut_path_rect(&apply_overcut(path, overcut))?;
+        // Pixel snapping happens again after placement. A one-pixel margin
+        // covers the possible floor-quantization change after translation or
+        // a quarter turn.
+        Some(if overcut.snap_to_pixels {
+            bounds.expand(1.0)
+        } else {
+            bounds
+        })
+    } else {
+        cut_path_rect(path)
+    }
+}
+
+fn cut_path_rect(path: &LineString<f32>) -> Option<egui::Rect> {
+    (path.0.len() >= 2
+        && path
+            .0
+            .iter()
+            .all(|point| point.x.is_finite() && point.y.is_finite()))
+    .then(|| path.bounding_rect())
+    .flatten()
+    .map(|bounds| {
+        egui::Rect::from_min_max(
+            Pos2::new(bounds.min().x, bounds.min().y),
+            Pos2::new(bounds.max().x, bounds.max().y),
+        )
+    })
+}
+
+fn union_rect(left: egui::Rect, right: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        Pos2::new(left.min.x.min(right.min.x), left.min.y.min(right.min.y)),
+        Pos2::new(left.max.x.max(right.max.x), left.max.y.max(right.max.y)),
+    )
+}
+
+fn assign_cut_paths_to_images(
+    images: &[LoadedImage],
+    path_count: usize,
+    owners: &[Option<CutlineOwner>],
+    placeholders: &[TemplatePlaceholder],
+) -> Vec<Option<usize>> {
+    (0..path_count)
+        .map(|path_index| {
+            match owners.get(path_index).and_then(Option::as_ref) {
+                Some(CutlineOwner::Image(id)) => images.iter().position(|image| image.id == *id),
+                Some(CutlineOwner::TemplatePlaceholder(id)) => placeholders
+                    .iter()
+                    .find(|placeholder| placeholder.id == *id)
+                    .and_then(|placeholder| placeholder.assigned_image_id.as_deref())
+                    .and_then(|id| images.iter().position(|image| image.id == id)),
+                // Generated contours carry stable owner IDs. Legacy, imported,
+                // and manually drawn paths without one remain fixed obstacles;
+                // inferring ownership from overlapping bounds can move the
+                // wrong path when artwork is rotated or layered.
+                None => None,
+            }
+        })
+        .collect()
+}
+
+fn rotate_point_quarter_turn(point: Pos2, center: Pos2) -> Pos2 {
+    let relative = point - center;
+    center + Vec2::new(-relative.y, relative.x)
+}
+
+fn rotate_rect_quarter_turn(rect: egui::Rect, center: Pos2) -> egui::Rect {
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    corners
+        .into_iter()
+        .map(|point| rotate_point_quarter_turn(point, center))
+        .fold(egui::Rect::NOTHING, |mut bounds, point| {
+            bounds.extend_with(point);
+            bounds
+        })
+}
+
+fn rotate_path_quarter_turn(path: &mut LineString<f32>, center: Pos2) {
+    for point in &mut path.0 {
+        let rotated = rotate_point_quarter_turn(Pos2::new(point.x, point.y), center);
+        point.x = rotated.x;
+        point.y = rotated.y;
+    }
+}
+
+fn translate_path(path: &mut LineString<f32>, translation: Vec2) {
+    for point in &mut path.0 {
+        point.x += translation.x;
+        point.y += translation.y;
+    }
 }
 
 fn center_path_in_rect(path: &mut LineString<f32>, target: egui::Rect, fit: bool) {
