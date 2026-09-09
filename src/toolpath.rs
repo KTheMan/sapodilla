@@ -48,6 +48,9 @@ pub struct CutPhase {
     pub mode: CutMode,
     pub pressure: u8,
     pub paths: Vec<LineString<f32>>,
+    /// The first path starts exactly where the previous phase ended, so its
+    /// pressure can change without lifting or repositioning the blade.
+    pub continue_from_previous: bool,
 }
 
 pub fn plan_cut_phases(
@@ -65,7 +68,23 @@ pub fn plan_cut_phases(
         match modes.get(index).copied().unwrap_or_default() {
             CutMode::Kiss if path.0.len() >= 2 => kiss.push(path.clone()),
             CutMode::Perforation if path.0.len() >= 2 => {
-                perforation.extend(studio::perf_cut(path, dash, gap));
+                let segments = studio::perf_segments(path, dash, gap);
+                perforation.extend(segments.into_iter().enumerate().map(
+                    |(index, (through, segment))| CutPhase {
+                        mode: if through {
+                            CutMode::Perforation
+                        } else {
+                            CutMode::Kiss
+                        },
+                        pressure: if through {
+                            perforation_pressure
+                        } else {
+                            kiss_pressure
+                        },
+                        paths: vec![segment],
+                        continue_from_previous: index > 0,
+                    },
+                ));
             }
             CutMode::Kiss | CutMode::Perforation | CutMode::Disabled => {}
         }
@@ -77,15 +96,10 @@ pub fn plan_cut_phases(
             mode: CutMode::Kiss,
             pressure: kiss_pressure,
             paths: kiss,
+            continue_from_previous: false,
         });
     }
-    if !perforation.is_empty() {
-        phases.push(CutPhase {
-            mode: CutMode::Perforation,
-            pressure: perforation_pressure,
-            paths: perforation,
-        });
-    }
+    phases.extend(perforation);
     phases
 }
 
@@ -107,13 +121,28 @@ mod tests {
             5.0,
             2.0,
         );
-        assert_eq!(phases.len(), 2);
+        assert_eq!(phases.len(), 7);
         assert_eq!(phases[0].mode, CutMode::Kiss);
         assert_eq!(phases[0].pressure, 42);
         assert_eq!(phases[0].paths, vec![line(1.0)]);
-        assert_eq!(phases[1].mode, CutMode::Perforation);
-        assert_eq!(phases[1].pressure, 53);
-        assert!(phases[1].paths.len() > 1);
+        assert!(!phases[0].continue_from_previous);
+        assert_eq!(
+            phases[1..]
+                .iter()
+                .map(|phase| (phase.mode, phase.pressure, phase.continue_from_previous))
+                .collect::<Vec<_>>(),
+            [
+                (CutMode::Perforation, 53, false),
+                (CutMode::Kiss, 42, true),
+                (CutMode::Perforation, 53, true),
+                (CutMode::Kiss, 42, true),
+                (CutMode::Perforation, 53, true),
+                (CutMode::Kiss, 42, true),
+            ]
+        );
+        assert!(phases[1..].windows(2).all(|pair| {
+            pair[0].paths[0].0.last().copied() == pair[1].paths[0].0.first().copied()
+        }));
     }
 
     #[test]
@@ -129,6 +158,7 @@ mod tests {
         assert_eq!(phases.len(), 1);
         assert_eq!(phases[0].mode, CutMode::Kiss);
         assert_eq!(phases[0].paths, vec![line(1.0)]);
+        assert!(!phases[0].continue_from_previous);
     }
 
     #[test]
