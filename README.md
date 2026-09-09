@@ -38,7 +38,7 @@ are recorded in the [UI accessibility claims](docs/ui-accessibility-claims.md).
     - [x] Brightness, contrast, saturation, and hue controls
     - [x] One-click in-process edge-background removal (no upload)
     - [x] Native-only on-device neural background removal with first-use model download and caching
-    - [x] MaxRects auto-pack with gaps and optional rotation
+    - [x] Cut-aware MaxRects auto-pack with gaps, fixed obstacles, and optional rotation
     - [x] Cutline preview
     - [x] Cutline generation
     - [x] Editable cutline nodes and multiple paths

@@ -390,6 +390,137 @@ fn fixture_image(harness: &Harness<'_, SapodillaApp>, name: &str, offset: Pos2) 
     image
 }
 
+fn rect_path(rect: egui::Rect) -> LineString<f32> {
+    LineString::from(vec![
+        (rect.min.x, rect.min.y),
+        (rect.max.x, rect.min.y),
+        (rect.max.x, rect.max.y),
+        (rect.min.x, rect.max.y),
+        (rect.min.x, rect.min.y),
+    ])
+}
+
+#[test]
+fn print_and_cut_auto_pack_moves_owned_cutlines_and_keeps_their_gap() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut first = fixture_image(&harness, "First", Pos2::new(500.0, 500.0));
+    let mut second = fixture_image(&harness, "Second", Pos2::new(520.0, 520.0));
+    first.scale *= 0.35;
+    second.scale *= 0.35;
+    let first_id = first.id.clone();
+    let second_id = second.id.clone();
+    let first_bounds = egui::Rect::from_min_size(first.visual_offset(), first.rotated_size());
+    let second_bounds = egui::Rect::from_min_size(second.visual_offset(), second.rotated_size());
+    let paths = vec![
+        rect_path(first_bounds.expand(24.0)),
+        rect_path(second_bounds.expand(36.0)),
+    ];
+    let old_offsets = [first.offset, second.offset];
+    let old_path_starts = [paths[0].0[0], paths[1].0[0]];
+
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    state.loaded_images = vec![first, second];
+    state.cut_shapes = paths.clone();
+    state.manual_cut_shapes = paths;
+    state.auto_cut_count = 0;
+    state.cut_modes = vec![CutMode::Kiss; 2];
+    state.cutline_owners = vec![
+        Some(CutlineOwner::Image(first_id)),
+        Some(CutlineOwner::Image(second_id)),
+    ];
+    state.cutline_locked = vec![false; 2];
+    state.peel_tab_positions = vec![None; 2];
+    state.pack_allow_rotation = false;
+    state.pack_gap_mm = 2.0;
+
+    assert_eq!(state.auto_pack().len(), 2);
+    let canvas = state.get_canvas();
+    let safe_offset = (canvas.size - canvas.safe_area) / 2.0;
+    let safe_rect = egui::Rect::from_min_size(safe_offset.to_pos2(), canvas.safe_area);
+    let cut_bounds = state
+        .cut_shapes
+        .iter()
+        .map(cut_path_rect)
+        .collect::<Option<Vec<_>>>()
+        .unwrap();
+    assert!(
+        cut_bounds
+            .iter()
+            .all(|bounds| safe_rect.contains_rect(*bounds))
+    );
+    let gap = state.pack_gap_mm * DEVICES[state.selected_device].dpi / 25.4;
+    assert!(!cut_bounds[0].expand(gap - 0.01).intersects(cut_bounds[1]));
+    for index in 0..2 {
+        let image_delta = state.loaded_images[index].offset - old_offsets[index];
+        let path_delta = state.cut_shapes[index].0[0] - old_path_starts[index];
+        assert!((image_delta.x - path_delta.x).abs() < 0.001);
+        assert!((image_delta.y - path_delta.y).abs() < 0.001);
+        assert_eq!(state.manual_cut_shapes[index], state.cut_shapes[index]);
+    }
+}
+
+#[test]
+fn print_only_auto_pack_ignores_and_does_not_move_cutlines() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut image = fixture_image(&harness, "Print only", Pos2::new(500.0, 500.0));
+    image.scale *= 0.35;
+    let path = rect_path(egui::Rect::from_min_size(
+        Pos2::new(900.0, 1_200.0),
+        Vec2::new(120.0, 120.0),
+    ));
+    let state = harness.state_mut();
+    assert!(
+        !DEVICES[state.selected_device].modes[state.selected_mode]
+            .mode_type
+            .has_cutting()
+    );
+    state.loaded_images = vec![image];
+    state.cut_shapes = vec![path.clone()];
+    state.manual_cut_shapes = vec![path.clone()];
+    state.cut_modes = vec![CutMode::Kiss];
+    state.cutline_owners = vec![None];
+    state.cutline_locked = vec![false];
+    state.peel_tab_positions = vec![None];
+
+    assert_eq!(state.auto_pack(), vec![0]);
+    assert_eq!(state.cut_shapes, [path]);
+}
+
+#[test]
+fn disabled_locked_cutline_does_not_pin_its_artwork_during_print_and_cut_pack() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let mut image = fixture_image(&harness, "Movable", Pos2::new(500.0, 500.0));
+    image.scale *= 0.35;
+    let image_id = image.id.clone();
+    let old_offset = image.offset;
+    let path = rect_path(egui::Rect::from_min_size(
+        image.visual_offset(),
+        image.rotated_size(),
+    ));
+    let state = harness.state_mut();
+    state.selected_mode = DEVICES[state.selected_device]
+        .modes
+        .iter()
+        .position(|mode| mode.mode_type.has_cutting())
+        .unwrap();
+    state.loaded_images = vec![image];
+    state.cut_shapes = vec![path.clone()];
+    state.manual_cut_shapes = vec![path];
+    state.cut_modes = vec![CutMode::Disabled];
+    state.cutline_owners = vec![Some(CutlineOwner::Image(image_id))];
+    state.cutline_locked = vec![true];
+    state.peel_tab_positions = vec![None];
+    state.pack_allow_rotation = false;
+
+    assert_eq!(state.auto_pack(), vec![0]);
+    assert_ne!(state.loaded_images[0].offset, old_offset);
+}
+
 #[test]
 fn fresh_workspace_exposes_primary_and_contextual_entry_points() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
