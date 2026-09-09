@@ -9655,8 +9655,7 @@ mod ui_tests;
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn background_worker_launch_schedules_poll_without_external_input() {
+    fn assert_background_worker_launch_schedules_poll() {
         let context = egui::Context::default();
         let (action_tx, _action_rx) = mpsc::channel::<Action>();
         let tx = ContextSender::new(action_tx, context.clone());
@@ -9669,6 +9668,18 @@ mod tests {
             .get(&egui::ViewportId::ROOT)
             .expect("root viewport output");
         assert!(root.repaint_delay <= BACKGROUND_POLL_INTERVAL);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_worker_launch_schedules_poll_without_external_input() {
+        assert_background_worker_launch_schedules_poll();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn background_worker_launch_schedules_poll_without_external_input() {
+        assert_background_worker_launch_schedules_poll();
     }
 
     #[derive(Default)]
