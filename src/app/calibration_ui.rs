@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use egui::{Color32, RichText, ScrollArea, Ui};
 
 use crate::calibration::{
-    CalibrationMethod, CalibrationSolution, CalibrationWizard, CandidateStatus,
+    ApertureDetection, CalibrationMethod, CalibrationSolution, CalibrationWizard, CandidateStatus,
     EAST_BAY_METHOD_COPY, EAST_BAY_RESULTS_CREDIT, EAST_BAY_SOURCE_URL, JobSlot, JobStatus,
     ManifestIdentity, ManualEdgeDraft, ManualSheetDraft, ManualSheetSlot, OptionalMeasurementState,
     ScanAnalysisReport, ScanFailureReason, ScanImportStatus, ScanSlot, ScanTargetStatus,
@@ -286,7 +286,13 @@ fn render_step(
             )
         }
         WizardStep::RemoveCenters => render_remove_centers(ui, wizard, false, now),
-        WizardStep::ImportScan => render_scan_import(ui, &wizard.training_scan, false, events),
+        WizardStep::ImportScan => render_scan_import(
+            ui,
+            &wizard.training_scan,
+            false,
+            diagnostics.training_scan,
+            events,
+        ),
         WizardStep::ReviewScan => render_scan_review(
             ui,
             wizard,
@@ -344,9 +350,13 @@ fn render_step(
             )
         }
         WizardStep::RemoveValidationCenters => render_remove_centers(ui, wizard, true, now),
-        WizardStep::ImportValidationScan => {
-            render_scan_import(ui, &wizard.validation_scan, true, events)
-        }
+        WizardStep::ImportValidationScan => render_scan_import(
+            ui,
+            &wizard.validation_scan,
+            true,
+            diagnostics.validation_scan,
+            events,
+        ),
         WizardStep::ReviewValidation => render_validation_review(
             ui,
             wizard,
@@ -635,6 +645,7 @@ fn render_scan_import(
     ui: &mut Ui,
     status: &ScanImportStatus,
     validation: bool,
+    report: Option<&ScanAnalysisReport>,
     events: &mut Vec<CalibrationUiEvent>,
 ) {
     ui.heading(if validation {
@@ -646,6 +657,11 @@ fn render_scan_import(
     ui.label("Scan the complete sheet at 600 DPI in color. PNG is preferred; JPEG is accepted. Disable automatic cropping, deskewing, cleanup, sharpening, and perspective correction.");
     ui.add_space(8.0);
     render_scan_status(ui, status, validation);
+    if let Some(report) = report
+        && matches!(status, ScanImportStatus::Imported { .. })
+    {
+        render_import_target_diagnostics(ui, report, validation);
+    }
     let event = if validation {
         CalibrationUiEvent::ImportValidationScan
     } else {
@@ -659,6 +675,65 @@ fn render_scan_import(
         .clicked()
     {
         events.push(event);
+    }
+}
+
+fn render_import_target_diagnostics(ui: &mut Ui, report: &ScanAnalysisReport, validation: bool) {
+    ui.add_space(8.0);
+    ui.strong("Target-by-target detection");
+    ui.small(format!(
+        "Orientation: {:?} · fiducial fit RMS {:.2} px · backing RGB {:.0}/{:.0}/{:.0}",
+        report.orientation,
+        report.fiducial_rms_px,
+        report.backing_rgb[0],
+        report.backing_rgb[1],
+        report.backing_rgb[2]
+    ));
+    egui::Grid::new(if validation {
+        "validation_scan_import_target_table"
+    } else {
+        "training_scan_import_target_table"
+    })
+    .striped(true)
+    .show(ui, |ui| {
+        ui.strong("Target");
+        ui.strong("Result");
+        ui.strong("Confidence");
+        ui.strong("Radius / fit RMS");
+        ui.strong("Edge samples");
+        ui.end_row();
+        for target in &report.targets {
+            ui.label(&target.target_id);
+            ui.label(scan_target_status_label(target.status));
+            ui.label(format!("{:.0}%", target.confidence * 100.0));
+            ui.label(scan_target_fit_label(target));
+            ui.label(if target.boundary_points_used == 0 {
+                "—".into()
+            } else {
+                target.boundary_points_used.to_string()
+            });
+            ui.end_row();
+        }
+    });
+    let mut reasons = report
+        .targets
+        .iter()
+        .filter_map(|target| match target.status {
+            ScanTargetStatus::Accepted => None,
+            ScanTargetStatus::Review(reason) | ScanTargetStatus::Missing(reason) => Some(reason),
+        })
+        .collect::<Vec<_>>();
+    reasons.sort_by_key(|reason| *reason as u8);
+    reasons.dedup();
+    for reason in reasons {
+        ui.weak(scan_failure_remediation(reason));
+    }
+}
+
+fn scan_target_fit_label(target: &ApertureDetection) -> String {
+    match (target.radius_mm, target.circle_rms_mm) {
+        (Some(radius), Some(rms)) => format!("{radius:.2} / {rms:.3} mm"),
+        _ => "—".into(),
     }
 }
 
@@ -1795,6 +1870,9 @@ fn scan_target_status_label(status: ScanTargetStatus) -> &'static str {
         ScanTargetStatus::Accepted => "Accepted",
         ScanTargetStatus::Review(ScanFailureReason::RetainedSlug) => "Review — center may remain",
         ScanTargetStatus::Review(ScanFailureReason::LowContrast) => "Review — low contrast",
+        ScanTargetStatus::Review(ScanFailureReason::LowConfidence) => {
+            "Review — marginal fit confidence"
+        }
         ScanTargetStatus::Review(ScanFailureReason::InsufficientBoundary) => {
             "Review — incomplete edge"
         }
@@ -1807,6 +1885,9 @@ fn scan_target_status_label(status: ScanTargetStatus) -> &'static str {
         ScanTargetStatus::Review(ScanFailureReason::RegionOutsideScan) => "Review — outside scan",
         ScanTargetStatus::Missing(ScanFailureReason::RetainedSlug) => "Missing — center retained",
         ScanTargetStatus::Missing(ScanFailureReason::LowContrast) => "Missing — low contrast",
+        ScanTargetStatus::Missing(ScanFailureReason::LowConfidence) => {
+            "Missing — marginal fit confidence"
+        }
         ScanTargetStatus::Missing(ScanFailureReason::InsufficientBoundary) => {
             "Missing — incomplete edge"
         }
@@ -1827,6 +1908,9 @@ fn scan_failure_remediation(reason: ScanFailureReason) -> &'static str {
         }
         ScanFailureReason::LowContrast => {
             "Low contrast: use clean opaque white backing directly behind the liner and disable scanner cleanup."
+        }
+        ScanFailureReason::LowConfidence => {
+            "Marginal fit: inspect the target's radius, fit RMS, and edge-sample count below; flatten or rescan only if the cut edge is torn or obscured."
         }
         ScanFailureReason::InsufficientBoundary => {
             "Incomplete edge: flatten the sheet with light lid pressure and check for torn or partly removed centers."
@@ -2032,5 +2116,17 @@ mod tests {
             scan_failure_remediation(ScanFailureReason::RegionOutsideScan)
                 .contains("automatic cropping")
         );
+        let target = ApertureDetection {
+            target_id: "VA1".into(),
+            status: ScanTargetStatus::Review(ScanFailureReason::LowContrast),
+            expected_center_mm: [15.0, 25.0],
+            observed_center_mm: Some([14.92, 24.80]),
+            radius_mm: Some(4.6721),
+            circle_rms_mm: Some(0.0776),
+            confidence: 0.4319,
+            covariance: None,
+            boundary_points_used: 119,
+        };
+        assert_eq!(scan_target_fit_label(&target), "4.67 / 0.078 mm");
     }
 }
