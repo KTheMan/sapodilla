@@ -712,6 +712,16 @@ impl CalibrationWizard {
             .ok_or_else(|| WizardError::UnknownTarget(target_id.into()))?;
         if observation.included != included {
             observation.included = included;
+            let (accepted_targets, all_quadrants) = scan_observation_coverage(observations);
+            if let ScanImportStatus::Imported {
+                accepted_targets: cached_accepted,
+                all_quadrants: cached_quadrants,
+                ..
+            } = self.scan_status_mut(slot)
+            {
+                *cached_accepted = accepted_targets;
+                *cached_quadrants = all_quadrants;
+            }
             match slot {
                 ScanSlot::Training => {
                     self.training_scan_reviewed = false;
@@ -1415,6 +1425,20 @@ fn scan_state_consistent(
     }
 }
 
+fn scan_observation_coverage(observations: &[CalibrationObservation]) -> (usize, bool) {
+    let included = observations
+        .iter()
+        .filter(|observation| observation.included)
+        .collect::<Vec<_>>();
+    let mut quadrants = 0u8;
+    for observation in &included {
+        let right = observation.nominal_print_mm[0] >= 101.6 / 2.0;
+        let bottom = observation.nominal_print_mm[1] >= 177.8 / 2.0;
+        quadrants |= 1 << (usize::from(bottom) * 2 + usize::from(right));
+    }
+    (included.len(), quadrants == 0b1111)
+}
+
 fn validate_sheet<const N: usize>(
     sheet: &ManualSheetDraft,
     expected_ids: &[&str; N],
@@ -1877,6 +1901,58 @@ mod tests {
             validation
                 .iter()
                 .all(|value| value.sheet_id == "validation")
+        );
+    }
+
+    #[test]
+    fn excluding_scan_target_refreshes_cached_coverage_and_remains_resumable() {
+        let mut wizard = CalibrationWizard::new("scan-toggle", 0).unwrap();
+        wizard
+            .select_method(CalibrationMethod::FlatbedScanner, 1)
+            .unwrap();
+        wizard.complete_scan_import(
+            ScanSlot::Validation,
+            "validation.png",
+            true,
+            (1..=6).map(|id| observation(id, "validation")).collect(),
+            2,
+        );
+
+        wizard
+            .set_scan_target_included(ScanSlot::Validation, "A01", false, 3)
+            .unwrap();
+        assert_eq!(
+            wizard.validation_scan,
+            ScanImportStatus::Imported {
+                file_name: "validation.png".into(),
+                accepted_targets: 5,
+                all_quadrants: true,
+            }
+        );
+        assert!(
+            wizard
+                .scan_review_coverage_issue(ScanSlot::Validation)
+                .is_some()
+        );
+        let json = wizard.save_json(4).unwrap();
+        let resumed = CalibrationWizard::resume_json(&json).unwrap();
+        assert_eq!(resumed.validation_scan, wizard.validation_scan);
+
+        wizard
+            .set_scan_target_included(ScanSlot::Validation, "A01", true, 5)
+            .unwrap();
+        assert_eq!(
+            wizard.validation_scan,
+            ScanImportStatus::Imported {
+                file_name: "validation.png".into(),
+                accepted_targets: 6,
+                all_quadrants: true,
+            }
+        );
+        assert!(
+            wizard
+                .scan_review_coverage_issue(ScanSlot::Validation)
+                .is_none()
         );
     }
 
