@@ -494,7 +494,14 @@ fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
         session.device_job_ids.push(111);
         session.device_job_ids_by_slot[2].push(111);
     }
-    harness.state_mut().calibration_scan_started_at[1] = Some(std::time::Instant::now());
+    harness.state_mut().calibration_scan_watchdogs[1] = Some(CalibrationScanWatchdog {
+        started_at: std::time::Instant::now(),
+        run_id: "ui-calibration".into(),
+        validation_generation: 0,
+        physical_sheet_attempt: 0,
+        scan_request_generation: 0,
+        slot: crate::calibration::ScanSlot::Validation,
+    });
     harness.run();
     harness.get_by_label("Prepare the validation sheet");
     harness.get_by_label("Use existing sheet").click_accesskit();
@@ -525,7 +532,48 @@ fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
         0,
         0,
     ));
-    assert!(harness.state().calibration_scan_started_at[1].is_none());
+    assert!(harness.state().calibration_scan_watchdogs[1].is_none());
+}
+
+#[test]
+fn discarded_run_watchdog_cannot_expire_a_new_scan() {
+    let mut harness = app_harness(Vec2::new(1024.0, 768.0));
+    open_calibration_fixture(&mut harness);
+    harness
+        .state_mut()
+        .calibration_session
+        .as_mut()
+        .unwrap()
+        .wizard
+        .run_id = "discarded-run".into();
+    harness.state_mut().calibration_scan_watchdogs[0] = Some(CalibrationScanWatchdog {
+        started_at: std::time::Instant::now() - std::time::Duration::from_secs(301),
+        run_id: "discarded-run".into(),
+        validation_generation: 0,
+        physical_sheet_attempt: 0,
+        scan_request_generation: 0,
+        slot: crate::calibration::ScanSlot::Training,
+    });
+
+    harness.state_mut().calibration_session = None;
+    open_calibration_fixture(&mut harness);
+    let session = harness
+        .state_mut()
+        .calibration_session
+        .as_mut()
+        .expect("fixture has a session");
+    session
+        .wizard
+        .begin_scan_import(crate::calibration::ScanSlot::Training, "new-scan.png", 2);
+    harness.state_mut().expire_stalled_calibration_scans();
+
+    let session = harness.state().calibration_session.as_ref().unwrap();
+    assert_eq!(session.scan_request_generations[0], 0);
+    assert!(matches!(
+        session.wizard.training_scan,
+        crate::calibration::ScanImportStatus::Importing { .. }
+    ));
+    assert!(harness.state().calibration_scan_watchdogs[0].is_none());
 }
 
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {

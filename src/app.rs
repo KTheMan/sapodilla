@@ -493,7 +493,7 @@ pub struct SapodillaApp {
     #[cfg(target_arch = "wasm32")]
     next_external_calibration_request_id: u64,
     calibration_session: Option<CalibrationSession>,
-    calibration_scan_started_at: [Option<std::time::Instant>; 2],
+    calibration_scan_watchdogs: [Option<CalibrationScanWatchdog>; 2],
     calibration_ui_state: calibration_ui::CalibrationUiState,
     show_calibration_profiles: bool,
     calibration_message: Option<String>,
@@ -537,6 +537,16 @@ pub struct SapodillaApp {
     compact_layout: bool,
     appearance: AppearancePreferences,
     custom_accent_rgb: [u8; 3],
+}
+
+#[derive(Debug)]
+struct CalibrationScanWatchdog {
+    started_at: std::time::Instant,
+    run_id: String,
+    validation_generation: u32,
+    physical_sheet_attempt: u32,
+    scan_request_generation: u32,
+    slot: ScanSlot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1467,7 +1477,7 @@ impl SapodillaApp {
             #[cfg(target_arch = "wasm32")]
             next_external_calibration_request_id: 1,
             calibration_session,
-            calibration_scan_started_at: [None, None],
+            calibration_scan_watchdogs: [None, None],
             calibration_ui_state: calibration_ui::CalibrationUiState::default(),
             show_calibration_profiles: false,
             calibration_message: None,
@@ -3672,8 +3682,15 @@ impl SapodillaApp {
                         &file_name,
                         current_timestamp_millis(),
                     );
-                    self.calibration_scan_started_at[CalibrationSession::scan_slot_index(slot)] =
-                        Some(std::time::Instant::now());
+                    self.calibration_scan_watchdogs[CalibrationSession::scan_slot_index(slot)] =
+                        Some(CalibrationScanWatchdog {
+                            started_at: std::time::Instant::now(),
+                            run_id,
+                            validation_generation,
+                            physical_sheet_attempt,
+                            scan_request_generation,
+                            slot,
+                        });
                 }
                 Action::CalibrationScanAnalyzed {
                     run_id,
@@ -3695,7 +3712,7 @@ impl SapodillaApp {
                     }) else {
                         continue;
                     };
-                    self.calibration_scan_started_at[CalibrationSession::scan_slot_index(slot)] =
+                    self.calibration_scan_watchdogs[CalibrationSession::scan_slot_index(slot)] =
                         None;
                     let now = current_timestamp_millis();
                     match result {
@@ -3941,6 +3958,7 @@ impl SapodillaApp {
             physical_sheet_attempts: [0; 3],
             scan_request_generations: [0; 2],
         });
+        self.calibration_scan_watchdogs = [None, None];
         self.calibration_ui_state = calibration_ui::CalibrationUiState::default();
         self.calibration_ui_state.selected_printer = printer_label;
         self.calibration_ui_state.selected_media = media_label;
@@ -4188,7 +4206,7 @@ impl SapodillaApp {
             (result, stale_queue_jobs, reset_scan_indexes)
         };
         for scan_index in reset_scan_indexes {
-            self.calibration_scan_started_at[scan_index] = None;
+            self.calibration_scan_watchdogs[scan_index] = None;
         }
         for job_id in stale_queue_jobs {
             self.pending_print_jobs.remove(&job_id);
@@ -4343,13 +4361,24 @@ impl SapodillaApp {
         const SCAN_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
         for slot in [ScanSlot::Training, ScanSlot::Validation] {
             let index = CalibrationSession::scan_slot_index(slot);
-            let timed_out = self.calibration_scan_started_at[index]
-                .is_some_and(|started| started.elapsed() >= SCAN_IMPORT_TIMEOUT);
+            let timed_out = self.calibration_scan_watchdogs[index]
+                .as_ref()
+                .is_some_and(|watchdog| watchdog.started_at.elapsed() >= SCAN_IMPORT_TIMEOUT);
             if !timed_out {
                 continue;
             }
-            self.calibration_scan_started_at[index] = None;
-            let Some(session) = self.calibration_session.as_mut() else {
+            let watchdog = self.calibration_scan_watchdogs[index]
+                .take()
+                .expect("timed-out watchdog was checked above");
+            let Some(session) = self.calibration_session.as_mut().filter(|session| {
+                session.accepts_scan_result(
+                    &watchdog.run_id,
+                    watchdog.validation_generation,
+                    watchdog.slot,
+                    watchdog.physical_sheet_attempt,
+                    watchdog.scan_request_generation,
+                )
+            }) else {
                 continue;
             };
             session.scan_request_generations[index] =
@@ -4770,6 +4799,7 @@ impl SapodillaApp {
                 // Close the finished walkthrough and open the profile list so
                 // the operator immediately sees which profile is now active.
                 self.calibration_session = None;
+                self.calibration_scan_watchdogs = [None, None];
                 self.show_calibration_profiles = true;
             }
             Err(message) => {
@@ -8142,6 +8172,7 @@ impl eframe::App for SapodillaApp {
                 }
                 calibration_ui::CalibrationUiEvent::Discard => {
                     self.calibration_session = None;
+                    self.calibration_scan_watchdogs = [None, None];
                 }
             }
         }
