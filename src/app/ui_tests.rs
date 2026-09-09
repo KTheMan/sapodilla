@@ -254,6 +254,64 @@ fn scan_evidence_opens_fullscreen_and_escape_returns_to_the_wizard() {
 }
 
 #[test]
+fn incomplete_scan_import_shows_the_exact_target_and_fit_diagnostics() {
+    let mut harness = app_harness(Vec2::new(1180.0, 900.0));
+    open_calibration_fixture(&mut harness);
+    {
+        let session = harness.state_mut().calibration_session.as_mut().unwrap();
+        session.wizard.method = Some(CalibrationMethod::FlatbedScanner);
+        session.wizard.step = crate::calibration::WizardStep::ImportValidationScan;
+        session.wizard.validation_scan = crate::calibration::ScanImportStatus::Imported {
+            file_name: "physical-scan.png".into(),
+            accepted_targets: 5,
+            all_quadrants: true,
+        };
+        session.validation_scan_report = Some(crate::calibration::ScanAnalysisReport {
+            format: crate::calibration::ScanImageFormat::Png,
+            scan_dimensions_px: [5100, 7012],
+            orientation: crate::calibration::ScanOrientation::Degrees0,
+            scanner_to_print: crate::calibration::Affine2d::IDENTITY,
+            backing_rgb: [245.0, 247.0, 242.0],
+            fiducial_rms_px: 0.25,
+            run_binding_sha1: "0".repeat(40),
+            targets: (1..=6)
+                .map(|index| crate::calibration::ApertureDetection {
+                    target_id: format!("VA{index}"),
+                    status: if index == 1 {
+                        crate::calibration::ScanTargetStatus::Review(
+                            crate::calibration::ScanFailureReason::LowConfidence,
+                        )
+                    } else {
+                        crate::calibration::ScanTargetStatus::Accepted
+                    },
+                    expected_center_mm: [15.0, 25.0],
+                    observed_center_mm: Some([14.92, 24.80]),
+                    radius_mm: Some(if index == 1 { 4.6721 } else { 5.0 }),
+                    circle_rms_mm: Some(if index == 1 { 0.0776 } else { 0.01 }),
+                    confidence: if index == 1 { 0.4319 } else { 0.80 },
+                    covariance: None,
+                    boundary_points_used: 119,
+                })
+                .collect(),
+        });
+    }
+    harness.run();
+
+    harness.get_by_label("Target-by-target detection");
+    harness.get_by_label("VA1");
+    harness.get_by_label("Review — marginal fit confidence");
+    harness.get_by_label("4.67 / 0.078 mm");
+    harness.get_by_label("Marginal fit: inspect the target's radius, fit RMS, and edge-sample count below; flatten or rescan only if the cut edge is torn or obscured.");
+    assert!(
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Next")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness.get_by_label("Choose scan image…");
+}
+
+#[test]
 fn discard_uses_a_modal_confirmation_and_can_return_to_calibration() {
     let mut harness = app_harness(Vec2::new(700.0, 620.0));
     open_calibration_fixture(&mut harness);

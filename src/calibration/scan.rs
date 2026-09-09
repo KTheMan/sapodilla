@@ -87,6 +87,7 @@ pub enum ScanFailureReason {
     RegionOutsideScan,
     RetainedSlug,
     LowContrast,
+    LowConfidence,
     InsufficientBoundary,
     ExcessiveCircleResidual,
     ImplausibleRadius,
@@ -1246,6 +1247,7 @@ fn detect_aperture(
         .collect();
     let mut boundary = Vec::new();
     let samples = 180;
+    let mut eligible_samples = 0_usize;
     for index in 0..samples {
         let angle = std::f64::consts::TAU * index as f64 / samples as f64;
         if target
@@ -1256,6 +1258,7 @@ fn detect_aperture(
         {
             continue;
         }
+        eligible_samples += 1;
         let mut last_backing = None;
         let steps = (expected_radius * scale * 1.45).ceil() as usize;
         for step in 1..=steps {
@@ -1293,10 +1296,11 @@ fn detect_aperture(
         );
     };
     let radius_error = (fit.radius_mm - expected_radius).abs();
-    let coverage = boundary.len() as f64 / samples as f64;
-    let confidence = (coverage / 0.72).min(1.0)
-        * (-fit.rms_mm / config.maximum_circle_rms_mm.max(0.01)).exp()
-        * (-radius_error / 0.8).exp();
+    // Bridge windows are deliberately ineligible for edge detection. Dividing
+    // by every ray made a complete four-bridge aperture look only two-thirds
+    // covered and could reject an otherwise strong circle fit.
+    let coverage = boundary.len() as f64 / eligible_samples.max(1) as f64;
+    let confidence = aperture_confidence(coverage, fit.rms_mm, radius_error, config);
     // Registration is local: printed ticks/ring define the intended center.
     // The page affine supplies units and orientation but any small global
     // fiducial bias cancels instead of being mistaken for cutter error.
@@ -1310,7 +1314,7 @@ fn detect_aperture(
     } else if fit.rms_mm > config.maximum_circle_rms_mm {
         ScanTargetStatus::Review(ScanFailureReason::ExcessiveCircleResidual)
     } else if confidence < config.accepted_confidence {
-        ScanTargetStatus::Review(ScanFailureReason::LowContrast)
+        ScanTargetStatus::Review(ScanFailureReason::LowConfidence)
     } else {
         ScanTargetStatus::Accepted
     };
@@ -1325,6 +1329,17 @@ fn detect_aperture(
         covariance: Some(fit.covariance),
         boundary_points_used: fit.points_used,
     }
+}
+
+fn aperture_confidence(
+    eligible_coverage: f64,
+    circle_rms_mm: f64,
+    radius_error_mm: f64,
+    config: ScanAnalysisConfig,
+) -> f64 {
+    (eligible_coverage / 0.72).min(1.0)
+        * (-circle_rms_mm / config.maximum_circle_rms_mm.max(0.01)).exp()
+        * (-radius_error_mm / 0.8).exp()
 }
 
 fn failed_detection(target: &super::TargetStation, status: ScanTargetStatus) -> ApertureDetection {
@@ -1965,6 +1980,19 @@ mod tests {
             "center error {maximum_center_error}"
         );
         assert_eq!(report.run_binding_sha1.len(), 40);
+    }
+
+    #[test]
+    fn complete_non_bridge_edge_coverage_accepts_a_stable_undersized_aperture() {
+        let config = ScanAnalysisConfig::default();
+        // Metrics captured from a physical validation aperture: all but one
+        // eligible ray found the edge, despite the four designed bridges.
+        let confidence = aperture_confidence(119.0 / 120.0, 0.0776, 0.3279, config);
+        assert!(confidence > config.accepted_confidence, "{confidence}");
+
+        // Genuinely sparse evidence remains below the same acceptance gate.
+        let sparse = aperture_confidence(75.0 / 120.0, 0.0776, 0.3279, config);
+        assert!(sparse < config.accepted_confidence, "{sparse}");
     }
 
     #[test]
