@@ -494,6 +494,7 @@ fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
         session.device_job_ids.push(111);
         session.device_job_ids_by_slot[2].push(111);
     }
+    harness.state_mut().calibration_scan_started_at[1] = Some(std::time::Instant::now());
     harness.run();
     harness.get_by_label("Prepare the validation sheet");
     harness.get_by_label("Use existing sheet").click_accesskit();
@@ -515,6 +516,16 @@ fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
     assert!(session.plotter_commands[2].is_empty());
     assert!(!session.device_job_ids.contains(&111));
     assert!(session.device_job_ids_by_slot[2].is_empty());
+    assert_eq!(session.physical_sheet_attempts[2], 1);
+    assert_eq!(session.scan_request_generations[1], 1);
+    assert!(!session.accepts_scan_result(
+        &session.wizard.run_id,
+        session.wizard.validation_generation,
+        crate::calibration::ScanSlot::Validation,
+        0,
+        0,
+    ));
+    assert!(harness.state().calibration_scan_started_at[1].is_none());
 }
 
 fn add_selected_fixture(harness: &mut Harness<'_, SapodillaApp>) {

@@ -588,7 +588,9 @@ fn render_print_job(
     } else if slot == JobSlot::Second {
         ui.weak("You can reuse an earlier manual measurement sheet with the same target layout. Use a different physical sheet from the first set of measurements.");
     } else if slot == JobSlot::Validation {
-        ui.weak("You can reuse an earlier validation sheet when it has the same six-aperture target layout.");
+        ui.weak(
+            "You can reuse an earlier validation sheet when it has the matching target layout.",
+        );
     }
     ui.add_space(8.0);
     ui.label(format!("Job status: {}", job_status_label(status)));

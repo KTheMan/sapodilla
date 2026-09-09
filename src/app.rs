@@ -4150,15 +4150,29 @@ impl SapodillaApp {
         }
 
         let now = current_timestamp_millis();
-        let (result, stale_queue_jobs) = {
+        let (result, stale_queue_jobs, reset_scan_indexes) = {
             let Some(session) = self.calibration_session.as_mut() else {
                 return;
             };
             let result = session.wizard.skip_current_step(now);
             let mut stale_queue_jobs = Vec::new();
+            let mut reset_scan_indexes = Vec::new();
             if result.is_ok() {
                 for reset_slot in &reset_slots {
                     let index = CalibrationSession::slot_index(*reset_slot);
+                    session.physical_sheet_attempts[index] =
+                        session.physical_sheet_attempts[index].saturating_add(1);
+                    let scan_slot = match reset_slot {
+                        CalibrationJobSlot::Primary => Some(ScanSlot::Training),
+                        CalibrationJobSlot::Validation => Some(ScanSlot::Validation),
+                        CalibrationJobSlot::Second => None,
+                    };
+                    if let Some(scan_slot) = scan_slot {
+                        let scan_index = CalibrationSession::scan_slot_index(scan_slot);
+                        session.scan_request_generations[scan_index] =
+                            session.scan_request_generations[scan_index].saturating_add(1);
+                        reset_scan_indexes.push(scan_index);
+                    }
                     stale_queue_jobs.extend(session.take_queue_job(*reset_slot));
                     session.historical_queue_job_ids[index] = None;
                     session.image_sha1[index] = None;
@@ -4171,8 +4185,11 @@ impl SapodillaApp {
                         .retain(|id| !stale_device_ids.contains(id));
                 }
             }
-            (result, stale_queue_jobs)
+            (result, stale_queue_jobs, reset_scan_indexes)
         };
+        for scan_index in reset_scan_indexes {
+            self.calibration_scan_started_at[scan_index] = None;
+        }
         for job_id in stale_queue_jobs {
             self.pending_print_jobs.remove(&job_id);
             self.active_queue_jobs
