@@ -1287,6 +1287,50 @@ fn layer_preview_right_click_exposes_the_shared_artwork_menu() {
 }
 
 #[test]
+fn layers_have_a_large_default_viewport() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    add_selected_fixture(&mut harness);
+
+    let layers = harness.get_by_label("Layers").rect();
+    let selection = harness.get_by_label("Selection").rect();
+    assert!(
+        selection.top() - layers.bottom() >= 350.0,
+        "Layers should reserve a tall default viewport, got {layers:?} to {selection:?}"
+    );
+}
+
+#[test]
+fn long_layer_filename_is_truncated_without_covering_actions() {
+    let mut harness = app_harness(Vec2::new(1280.0, 900.0));
+    let name =
+        "A very long sticker filename that should be truncated before the layer action buttons.png";
+    let select_label = format!("Select layer {name}");
+    let visibility_label = format!("Hide {name}");
+    let actions_label = format!("Actions for layer {name}");
+    import_fixture(&mut harness, name);
+
+    harness.get_by_label(&select_label).scroll_to_me();
+    harness.run();
+
+    let filename = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, &select_label)
+        .rect();
+    let visibility = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, &visibility_label)
+        .rect();
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, &actions_label);
+
+    assert!(
+        filename.height() <= 24.0,
+        "a long filename should remain on one line, got {filename:?}"
+    );
+    assert!(
+        filename.right() <= visibility.left(),
+        "the truncated filename must not overlap layer actions: {filename:?} vs {visibility:?}"
+    );
+}
+
+#[test]
 fn artwork_commands_preserve_block_order_selection_and_lock_protection() {
     let mut harness = app_harness(Vec2::new(1280.0, 900.0));
     let images = ["A", "B", "C", "D"]
