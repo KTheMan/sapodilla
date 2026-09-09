@@ -43,11 +43,30 @@ fn spawn_blocking<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    if let Err(error) = try_spawn_blocking(f) {
+        tracing::error!(%error, "could not start background worker");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn try_spawn_blocking<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
     #[cfg(feature = "web-workers")]
-    wasm_thread::spawn(f);
+    {
+        wasm_thread::Builder::new()
+            .spawn(f)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 
     #[cfg(not(feature = "web-workers"))]
-    f();
+    {
+        f();
+        Ok(())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,7 +84,17 @@ fn spawn_blocking<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    let _ = try_spawn_blocking(f);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn try_spawn_blocking<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
     tokio::task::spawn_blocking(f);
+    Ok(())
 }
 
 /// Create a stream that resolves every given interval.

@@ -27,9 +27,8 @@ use crate::{
         CalibrationWizard, CanvasToPlotter, CutPathDirection, JobSlot as CalibrationJobSlot,
         ManifestIdentity, PrinterCalibrationKey, ScanAnalysisConfig, ScanAnalysisReport, ScanSlot,
         StablePrinterIdentity, TargetCutMode, TargetManifest, TransformBounds, ValidationMetrics,
-        analyze_flatbed_scan_with_preview, flatbed_calibration, flatbed_validation,
-        manual_calibration, manual_validation, observation_error_metrics, render_print_raster,
-        solve_calibration,
+        flatbed_calibration, flatbed_validation, manual_calibration, manual_validation,
+        observation_error_metrics, render_print_raster, solve_calibration,
     },
     cut::{CutAction, CutGenerator, CutImage, CutTuning, OvercutSettings, apply_overcut},
     export::{ToolpathStats, cut_svg, jpeg_pdf, toolpath_debug_svg},
@@ -46,7 +45,7 @@ use crate::{
     theme,
     toolpath::{CutMode, CutPhase, effective_cut_modes, plan_cut_phases},
     transports::*,
-    views,
+    try_spawn_blocking, views,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,16 +94,7 @@ struct PendingExternalCalibrationCommit {
 }
 
 const MAX_ACTIONS_PER_FRAME: usize = 256;
-
-#[cfg(target_arch = "wasm32")]
-async fn yield_compute_task() {
-    gloo_timers::future::TimeoutFuture::new(0).await;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn yield_compute_task() {
-    tokio::task::yield_now().await;
-}
+const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 mod calibration_ui;
 
@@ -261,6 +251,7 @@ pub enum Action {
         #[debug(skip)]
         job: PendingPrintJob,
     },
+    PrintPreparationFailed(String),
     PrintRouteEncoded {
         printer_id: String,
         job_id: u64,
@@ -712,8 +703,26 @@ impl<A> ContextSender<A> {
     /// repaint callback on that worker. The UI polls while background work is
     /// active and performs the repaint request on the main thread.
     pub fn send_background(&self, action: A) -> Result<(), mpsc::SendError<A>> {
-        self.tx.send(action)
+        self.tx.send(action)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.ctx.request_repaint();
+        Ok(())
     }
+
+    /// Called on the UI thread immediately after a background worker starts so
+    /// its completion cannot sit unread when no further browser input arrives.
+    pub fn request_background_poll(&self) {
+        self.ctx.request_repaint_after(BACKGROUND_POLL_INTERVAL);
+    }
+}
+
+fn try_spawn_ui_background<A, F>(tx: &ContextSender<A>, f: F) -> Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
+    try_spawn_blocking(f)?;
+    tx.request_background_poll();
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -3578,6 +3587,10 @@ impl SapodillaApp {
                         .enqueue(JobSpec::named("Sapodilla sheet").requiring(capabilities));
                     self.pending_print_jobs.insert(queue_id, job);
                 }
+                Action::PrintPreparationFailed(message) => {
+                    self.print_preparing = false;
+                    self.calibration_message = Some(message);
+                }
                 Action::PrintRouteEncoded {
                     printer_id,
                     job_id,
@@ -4114,12 +4127,16 @@ impl SapodillaApp {
             }
         }
         let tx = self.tx.clone();
-        // Calibration sheet generation is bounded and substantially smaller
-        // than scan analysis. Keep it on the browser event loop after yielding
-        // one task instead of sharing the UI allocator with a wasm thread;
-        // allocator contention there can make Chromium appear hung.
-        spawn(async move {
-            yield_compute_task().await;
+        let name = match slot {
+            CalibrationJobSlot::Primary => "Calibration sheet",
+            CalibrationJobSlot::Second => "Calibration sheet 2",
+            CalibrationJobSlot::Validation => "Calibration validation sheet",
+        };
+        let spec = calibration_job_spec(name, printer_id);
+        let failure_spec = spec.clone();
+        let failure_run_id = run_id.clone();
+        let worker_tx = tx.clone();
+        let spawn_result = try_spawn_ui_background(&tx, move || {
             let result = build_calibration_print_job(
                 manifest_identity,
                 method,
@@ -4127,13 +4144,7 @@ impl SapodillaApp {
                 material,
                 mapping_override,
             );
-            let name = match slot {
-                CalibrationJobSlot::Primary => "Calibration sheet",
-                CalibrationJobSlot::Second => "Calibration sheet 2",
-                CalibrationJobSlot::Validation => "Calibration validation sheet",
-            };
-            let spec = calibration_job_spec(name, printer_id);
-            let _ = tx.send(Action::CalibrationJobPrepared {
+            let _ = worker_tx.send_background(Action::CalibrationJobPrepared {
                 run_id,
                 validation_generation,
                 physical_sheet_attempt,
@@ -4142,6 +4153,18 @@ impl SapodillaApp {
                 result,
             });
         });
+        if let Err(error) = spawn_result {
+            let _ = tx.send(Action::CalibrationJobPrepared {
+                run_id: failure_run_id,
+                validation_generation,
+                physical_sheet_attempt,
+                slot,
+                spec: failure_spec,
+                result: Err(anyhow::anyhow!(
+                    "could not start calibration print worker: {error}"
+                )),
+            });
+        }
     }
 
     fn use_existing_calibration_sheet(&mut self, slot: CalibrationJobSlot) {
@@ -4304,36 +4327,17 @@ impl SapodillaApp {
                 file_name: file_name.clone(),
             });
             let bytes = file.read().await;
-            #[cfg(target_arch = "wasm32")]
-            let bytes = match browser_downsample_calibration_scan(&bytes).await {
-                Ok(Some(downsampled)) => downsampled,
-                Ok(None) => bytes,
-                Err(message) => {
-                    let _ = tx.send(Action::CalibrationScanAnalyzed {
-                        run_id,
-                        validation_generation,
-                        physical_sheet_attempt,
-                        scan_request_generation,
-                        slot,
-                        file_name,
-                        result: Err(message),
-                    });
-                    return;
-                }
-            };
-            spawn_blocking(move || {
+            let failure_run_id = run_id.clone();
+            let failure_file_name = file_name.clone();
+            let worker_tx = tx.clone();
+            let spawn_result = try_spawn_ui_background(&tx, move || {
                 let manifest =
                     calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
                 let result = manifest
                     .map_err(|error| error.to_string())
                     .and_then(|manifest| {
-                        analyze_flatbed_scan_with_preview(
-                            &bytes,
-                            &manifest,
-                            scan_config,
-                            CALIBRATION_SCAN_PREVIEW_MAX_SIDE,
-                        )
-                        .map_err(|error| error.to_string())
+                        analyze_calibration_scan_for_platform(&bytes, &manifest, scan_config)
+                            .map_err(|error| error.to_string())
                     })
                     .and_then(|(report, preview)| {
                         calibration_scan_preview(&preview)
@@ -4344,7 +4348,7 @@ impl SapodillaApp {
                             })
                             .map_err(|error| error.to_string())
                     });
-                let _ = tx.send_background(Action::CalibrationScanAnalyzed {
+                let _ = worker_tx.send_background(Action::CalibrationScanAnalyzed {
                     run_id,
                     validation_generation,
                     physical_sheet_attempt,
@@ -4354,6 +4358,17 @@ impl SapodillaApp {
                     result,
                 });
             });
+            if let Err(error) = spawn_result {
+                let _ = tx.send(Action::CalibrationScanAnalyzed {
+                    run_id: failure_run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name: failure_file_name,
+                    result: Err(format!("could not start calibration scan worker: {error}")),
+                });
+            }
         });
     }
 
@@ -4839,7 +4854,8 @@ impl SapodillaApp {
         let mode_index = self.selected_mode;
         let canvas_index = self.selected_canvas_size;
         let tx = self.tx.clone();
-        spawn_blocking(move || {
+        let worker_tx = tx.clone();
+        let spawn_result = try_spawn_ui_background(&tx, move || {
             let image = encode_image(&snapshot.render());
             let job = PendingPrintJob {
                 encoded_image_len: image.len(),
@@ -4862,8 +4878,13 @@ impl SapodillaApp {
                 calibration_phases: None,
                 mapping_override: None,
             };
-            let _ = tx.send(Action::PrintPrepared { capabilities, job });
+            let _ = worker_tx.send_background(Action::PrintPrepared { capabilities, job });
         });
+        if let Err(error) = spawn_result {
+            let _ = tx.send(Action::PrintPreparationFailed(format!(
+                "could not start print preparation worker: {error}"
+            )));
+        }
     }
 
     fn dispatch_queued_jobs(&mut self) {
@@ -4896,25 +4917,25 @@ impl SapodillaApp {
             let tx = self.tx.clone();
             let queue_id = route.job_id;
             let printer_id = route.printer_id;
-            let payload_is_calibration = payload.calibration_phases.is_some();
+            let failure_printer_id = printer_id.clone();
+            let worker_tx = tx.clone();
             let encode = move || {
                 let result =
                     encode_and_validate_print_route(payload, plotter_mapping, mode, &canvas_size);
-                let _ = tx.send(Action::PrintRouteEncoded {
+                let _ = worker_tx.send_background(Action::PrintRouteEncoded {
                     printer_id,
                     job_id: queue_id,
                     result,
                 });
             };
-            if payload_is_calibration {
-                // See prepare_calibration_job: the small calibration route must
-                // not contend with the browser UI through shared wasm memory.
-                spawn(async move {
-                    yield_compute_task().await;
-                    encode();
+            if let Err(error) = try_spawn_ui_background(&tx, encode) {
+                let _ = tx.send(Action::PrintRouteEncoded {
+                    printer_id: failure_printer_id,
+                    job_id: queue_id,
+                    result: Err(anyhow::anyhow!(
+                        "could not start print encoding worker: {error}"
+                    )),
                 });
-            } else {
-                spawn_blocking(encode);
             }
         }
     }
@@ -6735,18 +6756,40 @@ impl eframe::App for SapodillaApp {
             ctx.request_repaint();
         }
         self.expire_stalled_calibration_scans();
-        if self.calibration_session.as_ref().is_some_and(|session| {
-            matches!(
-                session.wizard.training_scan,
-                crate::calibration::ScanImportStatus::Importing { .. }
-            ) || matches!(
-                session.wizard.validation_scan,
-                crate::calibration::ScanImportStatus::Importing { .. }
-            )
-        }) {
-            // Worker-side egui repaint callbacks are not Window-safe on the
-            // web. Poll from the main thread while analysis is outstanding.
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let calibration_background_work =
+                self.calibration_session.as_ref().is_some_and(|session| {
+                    matches!(
+                        session.wizard.training_scan,
+                        crate::calibration::ScanImportStatus::Importing { .. }
+                    ) || matches!(
+                        session.wizard.validation_scan,
+                        crate::calibration::ScanImportStatus::Importing { .. }
+                    ) || [
+                        CalibrationJobSlot::Primary,
+                        CalibrationJobSlot::Second,
+                        CalibrationJobSlot::Validation,
+                    ]
+                    .into_iter()
+                    .any(|slot| {
+                        let status = match slot {
+                            CalibrationJobSlot::Primary => session.wizard.primary_job,
+                            CalibrationJobSlot::Second => session.wizard.second_job,
+                            CalibrationJobSlot::Validation => session.wizard.validation_job,
+                        };
+                        status == crate::calibration::JobStatus::Queued
+                            && session.queue_job(slot).is_none()
+                    })
+                });
+            if calibration_background_work
+                || self.print_preparing
+                || !self.active_queue_jobs.is_empty()
+            {
+                // Worker-side egui repaint callbacks are not Window-safe on
+                // the web. Poll on the main thread while work is outstanding.
+                ctx.request_repaint_after(BACKGROUND_POLL_INTERVAL);
+            }
         }
         #[cfg(target_arch = "wasm32")]
         if let Some(pending) = self.ready_external_calibration_commit.take() {
@@ -8777,72 +8820,32 @@ fn scan_report_observations(
 
 const CALIBRATION_SCAN_PREVIEW_MAX_SIDE: u32 = 1_200;
 #[cfg(target_arch = "wasm32")]
-const CALIBRATION_SCAN_ANALYSIS_MAX_SIDE: u32 = 6_000;
+const CALIBRATION_SCAN_ANALYSIS_MAX_SIDE: u32 = 8_000;
 
-#[cfg(target_arch = "wasm32")]
-async fn browser_downsample_calibration_scan(encoded: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    use wasm_bindgen::JsCast as _;
-
-    let [declared_width, declared_height] =
-        crate::calibration::flatbed_scan_dimensions(encoded).map_err(|error| error.to_string())?;
-    if declared_width.max(declared_height) <= CALIBRATION_SCAN_ANALYSIS_MAX_SIDE {
-        return Ok(None);
-    }
-    let parts = js_sys::Array::new();
-    parts.push(&js_sys::Uint8Array::from(encoded));
-    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)
-        .map_err(|error| format!("could not prepare scan image: {error:?}"))?;
-    let window = web_sys::window().ok_or("browser window is unavailable")?;
-    let bitmap = wasm_bindgen_futures::JsFuture::from(
-        window
-            .create_image_bitmap_with_blob(&blob)
-            .map_err(|error| format!("could not decode scan image: {error:?}"))?,
-    )
-    .await
-    .map_err(|error| format!("could not decode scan image: {error:?}"))?
-    .dyn_into::<web_sys::ImageBitmap>()
-    .map_err(|_| "browser returned an invalid decoded scan image".to_owned())?;
-    let result = async {
-        let source_width = bitmap.width();
-        let source_height = bitmap.height();
-        let longest = source_width.max(source_height).max(1);
-        let scale = f64::from(CALIBRATION_SCAN_ANALYSIS_MAX_SIDE) / f64::from(longest);
-        let width = (f64::from(source_width) * scale).round().max(1.0) as u32;
-        let height = (f64::from(source_height) * scale).round().max(1.0) as u32;
-        let canvas = web_sys::OffscreenCanvas::new(width, height)
-            .map_err(|error| format!("could not prepare scan canvas: {error:?}"))?;
-        let context = canvas
-            .get_context("2d")
-            .map_err(|error| format!("could not prepare scan canvas: {error:?}"))?
-            .ok_or("browser did not provide a scan canvas")?
-            .dyn_into::<web_sys::OffscreenCanvasRenderingContext2d>()
-            .map_err(|_| "browser returned an invalid scan canvas".to_owned())?;
-        context
-            .draw_image_with_image_bitmap_and_dw_and_dh(
-                &bitmap,
-                0.0,
-                0.0,
-                f64::from(width),
-                f64::from(height),
-            )
-            .map_err(|error| format!("could not resize scan image: {error:?}"))?;
-        let resized_blob = wasm_bindgen_futures::JsFuture::from(
-            canvas
-                .convert_to_blob()
-                .map_err(|error| format!("could not encode resized scan: {error:?}"))?,
+fn analyze_calibration_scan_for_platform(
+    encoded: &[u8],
+    manifest: &TargetManifest,
+    config: ScanAnalysisConfig,
+) -> Result<(ScanAnalysisReport, image::RgbImage), crate::calibration::ScanAnalysisError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::calibration::analyze_flatbed_scan_bounded_with_preview(
+            encoded,
+            manifest,
+            config,
+            CALIBRATION_SCAN_ANALYSIS_MAX_SIDE,
+            CALIBRATION_SCAN_PREVIEW_MAX_SIDE,
         )
-        .await
-        .map_err(|error| format!("could not encode resized scan: {error:?}"))?
-        .dyn_into::<web_sys::Blob>()
-        .map_err(|_| "browser returned an invalid resized scan".to_owned())?;
-        let buffer = wasm_bindgen_futures::JsFuture::from(resized_blob.array_buffer())
-            .await
-            .map_err(|error| format!("could not read resized scan: {error:?}"))?;
-        Ok(js_sys::Uint8Array::new(&buffer).to_vec())
     }
-    .await;
-    bitmap.close();
-    result.map(Some)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::calibration::analyze_flatbed_scan_with_preview(
+            encoded,
+            manifest,
+            config,
+            CALIBRATION_SCAN_PREVIEW_MAX_SIDE,
+        )
+    }
 }
 
 fn calibration_scan_preview(preview: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
@@ -9651,6 +9654,33 @@ mod ui_tests;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn assert_background_worker_launch_schedules_poll() {
+        let context = egui::Context::default();
+        let (action_tx, _action_rx) = mpsc::channel::<Action>();
+        let tx = ContextSender::new(action_tx, context.clone());
+
+        let output = context.run(egui::RawInput::default(), |_| {
+            try_spawn_ui_background(&tx, || {}).unwrap();
+        });
+        let root = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output");
+        assert!(root.repaint_delay <= BACKGROUND_POLL_INTERVAL);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_worker_launch_schedules_poll_without_external_input() {
+        assert_background_worker_launch_schedules_poll();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn background_worker_launch_schedules_poll_without_external_input() {
+        assert_background_worker_launch_schedules_poll();
+    }
 
     #[derive(Default)]
     struct CalibrationTestStorage {

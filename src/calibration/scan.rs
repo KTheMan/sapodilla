@@ -216,6 +216,51 @@ pub fn analyze_flatbed_scan_with_preview(
     Ok((report, preview))
 }
 
+/// Decode and resize a large scan before analysis, deriving the review preview
+/// from the same bounded pixel buffer. This is intended for browser workers:
+/// the encoded file can cross the worker boundary cheaply while every costly
+/// decode, resize, analysis, and preview operation stays off the UI thread.
+pub fn analyze_flatbed_scan_bounded_with_preview(
+    encoded: &[u8],
+    manifest: &TargetManifest,
+    config: ScanAnalysisConfig,
+    maximum_analysis_side: u32,
+    maximum_preview_side: u32,
+) -> Result<(ScanAnalysisReport, RgbImage), ScanAnalysisError> {
+    let (image, format) = decode_flatbed_scan(encoded)?;
+    let image = bound_analysis_image(image, maximum_analysis_side);
+    let report = analyze_decoded(&image, format, manifest, config)?;
+    let maximum_preview_side = maximum_preview_side.max(1);
+    let longest = image.width().max(image.height()).max(1);
+    let preview = if longest <= maximum_preview_side {
+        image.clone()
+    } else {
+        let scale = f64::from(maximum_preview_side) / f64::from(longest);
+        image::imageops::resize(
+            &image,
+            (f64::from(image.width()) * scale).round().max(1.0) as u32,
+            (f64::from(image.height()) * scale).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+    Ok((report, preview))
+}
+
+fn bound_analysis_image(image: RgbImage, maximum_side: u32) -> RgbImage {
+    let maximum_side = maximum_side.max(1);
+    let longest = image.width().max(image.height()).max(1);
+    if longest <= maximum_side {
+        image
+    } else {
+        let scale = f64::from(maximum_side) / f64::from(longest);
+        image::imageops::thumbnail(
+            &image,
+            (f64::from(image.width()) * scale).round().max(1.0) as u32,
+            (f64::from(image.height()) * scale).round().max(1.0) as u32,
+        )
+    }
+}
+
 fn decode_flatbed_scan(encoded: &[u8]) -> Result<(RgbImage, ScanImageFormat), ScanAnalysisError> {
     let (guessed, format, _) = inspect_flatbed_scan(encoded)?;
     let mut reader = ImageReader::with_format(Cursor::new(encoded), guessed);
@@ -1885,8 +1930,14 @@ mod tests {
             flatbed_scan_dimensions(&encoded).unwrap(),
             [image.width(), image.height()]
         );
-        let expected =
-            analyze_flatbed_scan(&encoded, &manifest, ScanAnalysisConfig::default()).unwrap();
+        let (expected, bounded_preview) = analyze_flatbed_scan_bounded_with_preview(
+            &encoded,
+            &manifest,
+            ScanAnalysisConfig::default(),
+            image.width().max(image.height()),
+            320,
+        )
+        .unwrap();
         let (actual, preview) = analyze_flatbed_scan_with_preview(
             &encoded,
             &manifest,
@@ -1896,10 +1947,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
+        assert_eq!(preview, bounded_preview);
         assert!(preview.width().max(preview.height()) <= 320);
         let original_ratio = f64::from(image.width()) / f64::from(image.height());
         let preview_ratio = f64::from(preview.width()) / f64::from(preview.height());
         assert!((preview_ratio - original_ratio).abs() < 0.01);
+    }
+
+    #[test]
+    fn browser_analysis_bound_preserves_aspect_ratio_without_upscaling() {
+        let source = RgbImage::from_pixel(1_000, 500, Rgb([17, 18, 19]));
+        let bounded = bound_analysis_image(source.clone(), 800);
+        assert_eq!(bounded.dimensions(), (800, 400));
+        assert_eq!(bound_analysis_image(source.clone(), 1_000), source);
     }
 
     #[test]
