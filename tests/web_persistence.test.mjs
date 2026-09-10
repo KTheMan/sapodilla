@@ -264,6 +264,27 @@ test("service-worker bootstrap reads Trunk's build hash before registering", asy
   assert.match(index, /coi-serviceworker\.js/);
   assert.match(index, /updateViaCache:\s*"none"/);
   assert.match(index, /controllerchange/);
+  assert.match(
+    index,
+    /sessionStorage\.getItem\("sapodilla-coi-reload"\)\s*!==\s*buildRevision/,
+  );
+});
+
+test("threaded browser startup and worker spawning both require isolation", async () => {
+  const main = await readFile(new URL("../src/main.rs", import.meta.url), "utf8");
+  const library = await readFile(new URL("../src/lib.rs", import.meta.url), "utf8");
+
+  assert.match(main, /if !sapodilla::browser_workers_ready\(\)\s*\{\s*return;/s);
+  assert.match(library, /crossOriginIsolated/);
+  assert.match(library, /SharedArrayBuffer/);
+  assert.match(
+    library,
+    /if !browser_workers_ready\(\)\s*\{\s*return Err\(/s,
+  );
+  assert.ok(
+    library.indexOf("if !browser_workers_ready()") <
+      library.indexOf("wasm_thread::Builder::new()"),
+  );
 });
 
 test("calibration client gives every request a disposable isolated worker", async () => {

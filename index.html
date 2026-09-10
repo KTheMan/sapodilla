@@ -54,9 +54,12 @@
               return;
             } else if (
               needsIsolation &&
-              sessionStorage.getItem("sapodilla-coi-reload") !== "1"
+              sessionStorage.getItem("sapodilla-coi-reload") !== buildRevision
             ) {
-              sessionStorage.setItem("sapodilla-coi-reload", "1");
+              // Retry once for every content-addressed build. A reload that
+              // bypassed the service worker must not leave a newer app build
+              // trapped behind an earlier build's session guard.
+              sessionStorage.setItem("sapodilla-coi-reload", buildRevision);
               window.location.reload();
             } else {
               window.clearTimeout(startupTimeout);
