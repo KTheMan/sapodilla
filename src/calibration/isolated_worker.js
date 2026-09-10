@@ -1,7 +1,3 @@
-let workerPromise;
-let workerInstance;
-let nextRequestId = 1;
-const pending = new Map();
 const INITIALIZATION_TIMEOUT_MS = 30_000;
 const REQUEST_TIMEOUT_MS = {
   scan: 5 * 60_000,
@@ -20,99 +16,68 @@ function applicationModuleUrls() {
   return { shimUrl, wasmUrl };
 }
 
-function rejectPending(message) {
-  for (const request of pending.values()) {
-    clearTimeout(request.timeout);
-    request.callback({ ok: false, error: message });
-  }
-  pending.clear();
-}
+// Every request owns a fresh worker and a fresh WebAssembly memory. A scan can
+// neither retain its peak memory nor block printing, another scan, or the UI.
+function submitDisposable(kind, payload, transfer, callback) {
+  let worker;
+  let settled = false;
+  let initializationTimeout;
+  let requestTimeout;
 
-function discardWorker(message) {
-  workerInstance?.terminate();
-  workerInstance = undefined;
-  workerPromise = undefined;
-  rejectPending(message);
-}
-
-function isolatedWorker() {
-  if (workerPromise) {
-    return workerPromise;
-  }
-  workerPromise = new Promise((resolve, reject) => {
-    const worker = new Worker(
-      new URL("calibration-worker.js", document.baseURI),
-      { type: "module", name: "sapodilla-calibration" },
-    );
-    workerInstance = worker;
-    const initializationTimeout = setTimeout(() => {
-      const message = "calibration worker initialization timed out";
-      discardWorker(message);
-      reject(new Error(message));
-    }, INITIALIZATION_TIMEOUT_MS);
-    const fail = (message) => {
-      clearTimeout(initializationTimeout);
-      discardWorker(message);
-      reject(new Error(message));
-    };
-    worker.onerror = (event) =>
-      fail(event.message || "calibration worker failed");
-    worker.onmessageerror = () => fail("calibration worker returned unreadable data");
-    worker.onmessage = (event) => {
-      const message = event.data;
-      if (message.type === "ready") {
-        clearTimeout(initializationTimeout);
-        resolve(worker);
-        return;
-      }
-      if (message.type !== "result") {
-        return;
-      }
-      const request = pending.get(message.id);
-      if (!request) {
-        return;
-      }
-      pending.delete(message.id);
-      clearTimeout(request.timeout);
-      request.callback(message);
-    };
-    try {
-      const { shimUrl, wasmUrl } = applicationModuleUrls();
-      worker.postMessage({ type: "initialize", shimUrl, wasmUrl });
-    } catch (error) {
+  const finish = (message) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(initializationTimeout);
+    clearTimeout(requestTimeout);
+    if (worker) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      worker.onmessageerror = null;
       worker.terminate();
-      fail(String(error));
     }
-  });
-  return workerPromise;
-}
+    callback(message);
+  };
 
-function submit(kind, payload, transfer, callback) {
-  const id = nextRequestId++;
-  isolatedWorker().then(
-    (worker) => {
-      const timeout = setTimeout(() => {
-        discardWorker(`${kind} calibration worker timed out`);
-      }, REQUEST_TIMEOUT_MS[kind]);
-      pending.set(id, { callback, timeout });
-      try {
-        worker.postMessage({ type: "request", id, kind, ...payload }, transfer);
-      } catch (error) {
-        discardWorker(`could not submit ${kind} calibration work: ${error}`);
+  try {
+    worker = new Worker(new URL("calibration-worker.js", document.baseURI), {
+      type: "module",
+      name: `sapodilla-calibration-${kind}`,
+    });
+    worker.onerror = (event) =>
+      finish({ ok: false, error: event.message || `${kind} worker failed` });
+    worker.onmessageerror = () =>
+      finish({ ok: false, error: `${kind} worker returned unreadable data` });
+    worker.onmessage = (event) => {
+      if (event.data?.type === "ready") {
+        clearTimeout(initializationTimeout);
+        requestTimeout = setTimeout(
+          () => finish({ ok: false, error: `${kind} calibration worker timed out` }),
+          REQUEST_TIMEOUT_MS[kind],
+        );
+        try {
+          worker.postMessage({ type: "request", id: 1, kind, ...payload }, transfer);
+        } catch (error) {
+          finish({ ok: false, error: `could not submit ${kind} calibration work: ${error}` });
+        }
+      } else if (event.data?.type === "result") {
+        finish(event.data);
       }
-    },
-    (error) => callback({ ok: false, error: String(error) }),
-  );
+    };
+
+    const { shimUrl, wasmUrl } = applicationModuleUrls();
+    initializationTimeout = setTimeout(
+      () => finish({ ok: false, error: `${kind} calibration worker initialization timed out` }),
+      INITIALIZATION_TIMEOUT_MS,
+    );
+    worker.postMessage({ type: "initialize", shimUrl, wasmUrl });
+  } catch (error) {
+    finish({ ok: false, error: `could not start ${kind} calibration worker: ${error}` });
+  }
 }
 
-export function isolatedCalibrationScan(
-  bytes,
-  manifestJson,
-  configJson,
-  callback,
-) {
+export function isolatedCalibrationScan(bytes, manifestJson, configJson, callback) {
   const owned = Uint8Array.from(bytes);
-  submit(
+  submitDisposable(
     "scan",
     { bytes: owned.buffer, manifestJson, configJson },
     [owned.buffer],
@@ -120,6 +85,56 @@ export function isolatedCalibrationScan(
   );
 }
 
+// Keep the browser File out of the UI WebAssembly heap entirely. The File is
+// structured-cloned to a disposable worker, which reads and decodes it there.
+export function pickIsolatedCalibrationScan(
+  manifestJson,
+  configJson,
+  selectedCallback,
+  callback,
+) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".png,.jpg,.jpeg,image/png,image/jpeg";
+  input.style.display = "none";
+  document.body.appendChild(input);
+  let completed = false;
+  const finish = (message) => {
+    if (completed) return;
+    completed = true;
+    input.remove();
+    callback(message);
+  };
+  input.addEventListener(
+    "change",
+    () => {
+      const file = input.files?.[0];
+      if (!file) {
+        selectedCallback("");
+        finish({ ok: false, cancelled: true, fileName: "scan", error: "Scan import was cancelled." });
+        return;
+      }
+      selectedCallback(file.name);
+      submitDisposable(
+        "scan",
+        { file, manifestJson, configJson },
+        [],
+        (message) => finish({ ...message, fileName: file.name }),
+      );
+    },
+    { once: true },
+  );
+  input.addEventListener(
+    "cancel",
+    () => {
+      selectedCallback("");
+      finish({ ok: false, cancelled: true, fileName: "scan", error: "Scan import was cancelled." });
+    },
+    { once: true },
+  );
+  input.click();
+}
+
 export function isolatedCalibrationPrint(requestJson, callback) {
-  submit("print", { requestJson }, [], callback);
+  submitDisposable("print", { requestJson }, [], callback);
 }
