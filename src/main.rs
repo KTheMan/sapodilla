@@ -23,6 +23,11 @@ fn main() -> eframe::Result {
 fn main() {
     use eframe::wasm_bindgen::JsCast as _;
 
+    // Install this for both the UI and isolated computation workers so a Rust
+    // panic is reported with its message instead of only `RuntimeError:
+    // unreachable`.
+    console_error_panic_hook::set_once();
+
     // The calibration worker initializes this same WebAssembly module with a
     // separate linear memory. It needs the exported calibration functions,
     // not a second eframe application (Workers have no Window or canvas).
@@ -30,7 +35,6 @@ fn main() {
         return;
     }
 
-    console_error_panic_hook::set_once();
     wasm_tracing::set_as_global_default();
 
     let web_options = eframe::WebOptions::default();
