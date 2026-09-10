@@ -8,6 +8,30 @@ async function importSource(path, tag) {
   return import(`data:text/javascript;base64,${encoded}#${tag}`);
 }
 
+async function loadCalibrationWorker(tag) {
+  const messages = [];
+  globalThis.self = {
+    postMessage: (message, transfer = []) => messages.push({ message, transfer }),
+  };
+  globalThis.__calibrationWorkerInput = undefined;
+  const bindings = [
+    "export default async function initialize() {}",
+    "export function isolated_calibration_scan(bytes) {",
+    "  globalThis.__calibrationWorkerInput = Array.from(bytes);",
+    "  return [true, '{}', new Uint8Array([4, 5])];",
+    "}",
+    "export function isolated_calibration_print() {",
+    "  return [true, '', new Uint8Array(0)];",
+    "}",
+  ].join("\n");
+  const shimUrl = `data:text/javascript,${encodeURIComponent(bindings)}`;
+  await importSource("../static/calibration-worker.js", tag);
+  await globalThis.self.onmessage({
+    data: { type: "initialize", shimUrl, wasmUrl: "test.wasm" },
+  });
+  return messages;
+}
+
 function installIndexedDb() {
   const values = new Map();
   let upgraded = false;
@@ -179,7 +203,7 @@ test("service-worker activation deletes only obsolete Sapodilla caches", async (
   ]);
 });
 
-test("calibration client reuses one isolated worker and transfers scan bytes", async () => {
+test("calibration client gives every request a disposable isolated worker", async () => {
   const workers = [];
   const appModule = "https://example.test/sapodilla/sapodilla-0123456789abcdef.js";
   globalThis.document = {
@@ -213,12 +237,14 @@ test("calibration client reuses one isolated worker and transfers scan bytes", a
       }
     }
 
-    terminate() {}
+    terminate() {
+      this.terminated = true;
+    }
   };
 
   const client = await importSource(
     "../src/calibration/isolated_worker.js",
-    "persistent-worker",
+    "disposable-worker",
   );
   const scan = await new Promise((resolve) =>
     client.isolatedCalibrationScan(new Uint8Array([1, 2, 3]), "{}", "{}", resolve),
@@ -229,7 +255,7 @@ test("calibration client reuses one isolated worker and transfers scan bytes", a
 
   assert.equal(scan.ok, true);
   assert.equal(print.ok, true);
-  assert.equal(workers.length, 1);
+  assert.equal(workers.length, 2);
   assert.equal(workers[0].options.type, "module");
   assert.equal(workers[0].messages[0].message.wasmUrl,
     "https://example.test/sapodilla/sapodilla-0123456789abcdef_bg.wasm");
@@ -238,6 +264,152 @@ test("calibration client reuses one isolated worker and transfers scan bytes", a
   );
   assert.equal(scanMessage.transfer.length, 1);
   assert.equal(scanMessage.transfer[0], scanMessage.message.bytes);
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[1].terminated, true);
+});
+
+test("scan picker passes the browser File directly to its disposable worker", async () => {
+  const workers = [];
+  const listeners = new Map();
+  const file = { name: "full-resolution-scan.png" };
+  const input = {
+    files: [file],
+    style: {},
+    addEventListener: (name, handler) => listeners.set(name, handler),
+    click: () => queueMicrotask(() => listeners.get("change")()),
+    remove() {},
+  };
+  globalThis.document = {
+    baseURI: "https://example.test/sapodilla/",
+    querySelectorAll: () => [{
+      href: "https://example.test/sapodilla/sapodilla-0123456789abcdef.js",
+    }],
+    createElement: () => input,
+    body: { appendChild() {} },
+  };
+  globalThis.Worker = class {
+    constructor() {
+      this.messages = [];
+      workers.push(this);
+    }
+    postMessage(message, transfer = []) {
+      this.messages.push({ message, transfer });
+      if (message.type === "initialize") {
+        queueMicrotask(() => this.onmessage({ data: { type: "ready" } }));
+      } else {
+        queueMicrotask(() => this.onmessage({ data: {
+          type: "result",
+          id: 1,
+          ok: true,
+          text: "{}",
+          bytes: new ArrayBuffer(0),
+        } }));
+      }
+    }
+    terminate() {
+      this.terminated = true;
+    }
+  };
+
+  const client = await importSource(
+    "../src/calibration/isolated_worker.js",
+    "direct-file-worker",
+  );
+  let selectedName;
+  const result = await new Promise((resolve) =>
+    client.pickIsolatedCalibrationScan(
+      "{}",
+      "{}",
+      (name) => { selectedName = name; },
+      resolve,
+    ),
+  );
+  const request = workers[0].messages.find(({ message }) => message.type === "request");
+
+  assert.equal(result.ok, true);
+  assert.equal(selectedName, file.name);
+  assert.equal(result.fileName, file.name);
+  assert.equal(request.message.file, file);
+  assert.equal("bytes" in request.message, false);
+  assert.equal(request.transfer.length, 0);
+  assert.equal(workers[0].terminated, true);
+});
+
+test("scan worker downsamples an oversized file without reading it on the UI side", async () => {
+  let canvasSize;
+  let bitmapClosed = false;
+  globalThis.createImageBitmap = async () => ({
+    width: 8000,
+    height: 4000,
+    close: () => { bitmapClosed = true; },
+  });
+  globalThis.OffscreenCanvas = class {
+    constructor(width, height) {
+      canvasSize = [width, height];
+    }
+    getContext() {
+      return { drawImage() {} };
+    }
+    async convertToBlob() {
+      return { arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer };
+    }
+  };
+  const messages = await loadCalibrationWorker("oversized-scan-resample");
+  await globalThis.self.onmessage({ data: {
+    type: "request",
+    id: 1,
+    kind: "scan",
+    file: { arrayBuffer: () => { throw new Error("original file must not be reread"); } },
+    manifestJson: "{}",
+    configJson: "{}",
+  } });
+
+  assert.deepEqual(canvasSize, [4000, 2000]);
+  assert.equal(bitmapClosed, true);
+  assert.deepEqual(globalThis.__calibrationWorkerInput, [7, 8, 9]);
+  assert.equal(messages.filter(({ message }) => message.type === "result").length, 1);
+});
+
+test("scan worker retains original bytes at or below the analysis bound", async () => {
+  let canvases = 0;
+  globalThis.createImageBitmap = async () => ({
+    width: 4000,
+    height: 2500,
+    close() {},
+  });
+  globalThis.OffscreenCanvas = class {
+    constructor() { canvases += 1; }
+  };
+  await loadCalibrationWorker("bounded-scan-original");
+  await globalThis.self.onmessage({ data: {
+    type: "request",
+    id: 2,
+    kind: "scan",
+    file: { arrayBuffer: async () => new Uint8Array([1, 3, 5]).buffer },
+    manifestJson: "{}",
+    configJson: "{}",
+  } });
+
+  assert.equal(canvases, 0);
+  assert.deepEqual(globalThis.__calibrationWorkerInput, [1, 3, 5]);
+});
+
+test("scan worker reports bitmap failures exactly once", async () => {
+  globalThis.createImageBitmap = async () => { throw new Error("bad scan bitmap"); };
+  const messages = await loadCalibrationWorker("scan-bitmap-failure");
+  await globalThis.self.onmessage({ data: {
+    type: "request",
+    id: 3,
+    kind: "scan",
+    file: {},
+    manifestJson: "{}",
+    configJson: "{}",
+  } });
+  const results = messages.filter(({ message }) => message.type === "result");
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].message.ok, false);
+  assert.match(results[0].message.error, /bad scan bitmap/);
 });
 
 test("calibration worker initialization failure completes its request exactly once", async () => {

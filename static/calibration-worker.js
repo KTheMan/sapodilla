@@ -1,5 +1,29 @@
 let bindings;
 
+const MAX_SCAN_EDGE = 4000;
+
+async function workerOwnedScanBytes(file) {
+  const bitmap = await createImageBitmap(file);
+  const longestEdge = Math.max(bitmap.width, bitmap.height);
+  if (longestEdge <= MAX_SCAN_EDGE) {
+    bitmap.close();
+    return new Uint8Array(await file.arrayBuffer());
+  }
+  const scale = MAX_SCAN_EDGE / longestEdge;
+  const width = Math.max(1, Math.round(bitmap.width * scale));
+  const height = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = new OffscreenCanvas(width, height);
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) {
+    bitmap.close();
+    throw new Error("could not create the isolated scan resampler");
+  }
+  context.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+  const blob = await canvas.convertToBlob({ type: "image/png" });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
 function sendResult(id, result) {
   const ok = Boolean(result[0]);
   const text = String(result[1] ?? "");
@@ -27,10 +51,13 @@ self.onmessage = async (event) => {
   }
   try {
     if (message.kind === "scan") {
+      const encoded = message.file
+        ? await workerOwnedScanBytes(message.file)
+        : new Uint8Array(message.bytes);
       sendResult(
         message.id,
         bindings.isolated_calibration_scan(
-          new Uint8Array(message.bytes),
+          encoded,
           message.manifestJson,
           message.configJson,
         ),

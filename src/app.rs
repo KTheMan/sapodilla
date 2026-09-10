@@ -99,11 +99,11 @@ const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 #[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/calibration/isolated_worker.js")]
 extern "C" {
-    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = isolatedCalibrationScan)]
-    fn isolated_calibration_scan_js(
-        bytes: &js_sys::Uint8Array,
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = pickIsolatedCalibrationScan)]
+    fn pick_isolated_calibration_scan_js(
         manifest_json: &str,
         config_json: &str,
+        selected_callback: &js_sys::Function,
         callback: &js_sys::Function,
     ) -> Result<(), wasm_bindgen::JsValue>;
 
@@ -4398,6 +4398,63 @@ impl SapodillaApp {
             }
         }
         let tx = self.tx.clone();
+
+        #[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+        {
+            let failure_run_id = run_id.clone();
+            let result =
+                calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation)
+                    .map_err(|error| error.to_string())
+                    .and_then(|manifest| {
+                        let completion_tx = tx.clone();
+                        let started_tx = tx.clone();
+                        let started_run_id = run_id.clone();
+                        start_isolated_calibration_scan_picker(
+                            manifest,
+                            scan_config,
+                            move |file_name| {
+                                if file_name.is_empty() {
+                                    return;
+                                }
+                                let _ = started_tx.send(Action::CalibrationScanStarted {
+                                    run_id: started_run_id,
+                                    validation_generation,
+                                    physical_sheet_attempt,
+                                    scan_request_generation,
+                                    slot,
+                                    file_name,
+                                });
+                            },
+                            move |file_name, result| {
+                                let _ = completion_tx.send(Action::CalibrationScanAnalyzed {
+                                    run_id,
+                                    validation_generation,
+                                    physical_sheet_attempt,
+                                    scan_request_generation,
+                                    slot,
+                                    file_name,
+                                    result,
+                                });
+                            },
+                        )
+                    });
+            if let Err(error) = result {
+                let _ = tx.send(Action::CalibrationScanAnalyzed {
+                    run_id: failure_run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    scan_request_generation,
+                    slot,
+                    file_name: "scan".into(),
+                    result: Err(format!(
+                        "could not start isolated calibration scan picker: {error}"
+                    )),
+                });
+            }
+            return;
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "web-workers")))]
         spawn(async move {
             let Some(file) = rfd::AsyncFileDialog::new()
                 .add_filter("600 DPI color scan", &["png", "jpg", "jpeg"])
@@ -8734,20 +8791,27 @@ fn deliver_isolated_worker_start_error(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
-fn start_isolated_calibration_scan<F>(
-    encoded: Vec<u8>,
+fn start_isolated_calibration_scan_picker<S, F>(
     manifest: TargetManifest,
     config: ScanAnalysisConfig,
+    selected: S,
     completion: F,
 ) -> Result<(), String>
 where
-    F: FnOnce(Result<CalibrationScanImport, String>) + 'static,
+    S: FnOnce(String) + 'static,
+    F: FnOnce(String, Result<CalibrationScanImport, String>) + 'static,
 {
-    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::{JsCast as _, JsValue};
 
     let manifest_json = serde_json::to_string(&manifest).map_err(|error| error.to_string())?;
     let config_json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
-    let callback = wasm_bindgen::closure::Closure::once_into_js(move |response| {
+    let selected_callback =
+        wasm_bindgen::closure::Closure::once_into_js(move |file_name: String| selected(file_name));
+    let callback = wasm_bindgen::closure::Closure::once_into_js(move |response: JsValue| {
+        let file_name = js_sys::Reflect::get(&response, &JsValue::from_str("fileName"))
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_else(|| "scan".into());
         let result =
             decode_isolated_worker_result(response).and_then(|(report_json, preview_png)| {
                 let report = serde_json::from_str(&report_json)
@@ -8758,13 +8822,12 @@ where
                     preview_png: preview_png.into(),
                 })
             });
-        completion(result);
+        completion(file_name, result);
     });
-    let bytes = js_sys::Uint8Array::from(encoded.as_slice());
-    isolated_calibration_scan_js(
-        &bytes,
+    pick_isolated_calibration_scan_js(
         &manifest_json,
         &config_json,
+        selected_callback.unchecked_ref(),
         callback.unchecked_ref(),
     )
     .unwrap_or_else(|error| deliver_isolated_worker_start_error(&callback, error));
