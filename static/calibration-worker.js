@@ -42,7 +42,14 @@ self.onmessage = async (event) => {
       await bindings.default({ module_or_path: message.wasmUrl });
       self.postMessage({ type: "ready" });
     } catch (error) {
-      throw new Error(`could not initialize calibration worker: ${error}`);
+      // Throwing from this async message handler only creates an unhandled
+      // rejection inside the Worker; it does not reliably dispatch an error
+      // event to the owning Window. Report bootstrap failures explicitly so
+      // the UI does not mislabel them as a timeout thirty seconds later.
+      self.postMessage({
+        type: "initialization-error",
+        error: `could not initialize calibration worker: ${error}`,
+      });
     }
     return;
   }
