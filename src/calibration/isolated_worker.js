@@ -103,22 +103,37 @@ export function pickIsolatedCalibrationScan(
   input.style.display = "none";
   document.body.appendChild(input);
   let completed = false;
+  let selectionReported = false;
+  let fileChosen = false;
+  const reportSelection = (fileName) => {
+    if (selectionReported) return;
+    selectionReported = true;
+    selectedCallback(fileName);
+  };
   const finish = (message) => {
     if (completed) return;
     completed = true;
     input.remove();
     callback(message);
   };
+  const onCancel = () => {
+    if (fileChosen) return;
+    reportSelection("");
+    finish({ ok: false, cancelled: true, fileName: "scan", error: "Scan import was cancelled." });
+  };
   input.addEventListener(
     "change",
     () => {
+      input.removeEventListener("cancel", onCancel);
+      if (completed) return;
       const file = input.files?.[0];
       if (!file) {
-        selectedCallback("");
+        reportSelection("");
         finish({ ok: false, cancelled: true, fileName: "scan", error: "Scan import was cancelled." });
         return;
       }
-      selectedCallback(file.name);
+      fileChosen = true;
+      reportSelection(file.name);
       submitDisposable(
         "scan",
         { file, manifestJson, configJson },
@@ -130,10 +145,7 @@ export function pickIsolatedCalibrationScan(
   );
   input.addEventListener(
     "cancel",
-    () => {
-      selectedCallback("");
-      finish({ ok: false, cancelled: true, fileName: "scan", error: "Scan import was cancelled." });
-    },
+    onCancel,
     { once: true },
   );
   input.click();

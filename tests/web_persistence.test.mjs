@@ -326,7 +326,17 @@ test("scan picker passes the browser File directly to its disposable worker", as
     files: [file],
     style: {},
     addEventListener: (name, handler) => listeners.set(name, handler),
-    click: () => queueMicrotask(() => listeners.get("change")()),
+    removeEventListener: (name, handler) => {
+      if (listeners.get(name) === handler) listeners.delete(name);
+    },
+    // Chromium may report a cancel after a completed change. The Rust
+    // selection callback is one-shot, so the client must suppress the second
+    // notification.
+    click: () => queueMicrotask(() => {
+      const cancel = listeners.get("cancel");
+      listeners.get("change")();
+      cancel();
+    }),
     remove() {},
   };
   globalThis.document = {
@@ -366,17 +376,22 @@ test("scan picker passes the browser File directly to its disposable worker", as
     "direct-file-worker",
   );
   let selectedName;
+  let selectedCalls = 0;
   const result = await new Promise((resolve) =>
     client.pickIsolatedCalibrationScan(
       "{}",
       "{}",
-      (name) => { selectedName = name; },
+      (name) => {
+        selectedCalls += 1;
+        selectedName = name;
+      },
       resolve,
     ),
   );
   const request = workers[0].messages.find(({ message }) => message.type === "request");
 
   assert.equal(result.ok, true);
+  assert.equal(selectedCalls, 1);
   assert.equal(selectedName, file.name);
   assert.equal(result.fileName, file.name);
   assert.equal(request.message.file, file);
