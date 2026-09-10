@@ -1,10 +1,17 @@
 const CACHE_PREFIX = "sapodilla-app-shell-";
-const CACHE_NAME = `${CACHE_PREFIX}v2`;
+const BUILD_REVISION =
+  new URL(self.location.href).searchParams.get("build") || "development";
+const CACHE_NAME = `${CACHE_PREFIX}${BUILD_REVISION}`;
+const versionedPath = (path) => {
+  const url = new URL(path, self.registration.scope);
+  url.searchParams.set("build", BUILD_REVISION);
+  return url.href;
+};
 const SHELL_PATHS = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
-  "./calibration-worker.js",
+  versionedPath("./calibration-worker.js"),
   "./icons/sapodilla-192.png",
   "./icons/sapodilla-512.png",
 ];
@@ -83,7 +90,12 @@ self.addEventListener("fetch", (event) => {
       }
 
       try {
-        const response = withIsolationHeaders(await fetch(request));
+        // "Network first" alone may still reuse the browser's HTTP cache.
+        // Stable filenames must bypass it so static-only deployments update.
+        const networkRequest = isImmutableAsset
+          ? request
+          : new Request(request, { cache: "no-store" });
+        const response = withIsolationHeaders(await fetch(networkRequest));
         if (response && response.ok) {
           await cache.put(request, response.clone());
         }

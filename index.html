@@ -5,11 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#ff2daa" />
     <title>Sapodilla</title>
+    <!-- Trunk replaces this at the same position with the content-addressed
+         application module. The following bootstrap uses that hash as the
+         revision for every stable PWA/worker URL. -->
+    <link data-trunk rel="rust" data-wasm-opt="2" data-bindgen-target="web" />
     <script>
       // GitHub Pages cannot configure COOP/COEP response headers. Install a
       // same-origin service worker before starting the threaded WASM build;
       // its first activation reloads this page under cross-origin isolation.
       if ("serviceWorker" in navigator) {
+        const moduleSource =
+          document.querySelector('script[type="module"]')?.textContent || "";
+        const buildRevision =
+          moduleSource.match(/sapodilla-([a-f0-9]+)\.js/)?.[1] || "development";
         const needsIsolation = !window.crossOriginIsolated;
         const showStartupError = () => {
           const show = () => {
@@ -26,19 +34,24 @@
           }
         };
         const workerUrl = new URL("coi-serviceworker.js", document.baseURI);
+        workerUrl.searchParams.set("build", buildRevision);
         const startupTimeout = window.setTimeout(showStartupError, 10000);
+        let controllerReloadStarted = false;
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+          if (controllerReloadStarted) {
+            return;
+          }
+          controllerReloadStarted = true;
+          window.clearTimeout(startupTimeout);
+          window.location.reload();
+        });
         navigator.serviceWorker
-          .register(workerUrl.href, { scope: "./" })
+          .register(workerUrl.href, { scope: "./", updateViaCache: "none" })
           .then(() => {
             if (!navigator.serviceWorker.controller) {
-              // Reload the first controlled page even when server headers
-              // already provide isolation. That lets the worker observe and
-              // cache the hashed JS/WASM requests for subsequent offline use.
-              navigator.serviceWorker.addEventListener(
-                "controllerchange",
-                () => window.location.reload(),
-                { once: true },
-              );
+              // The controllerchange handler reloads as soon as this build's
+              // worker claims the page.
+              return;
             } else if (
               needsIsolation &&
               sessionStorage.getItem("sapodilla-coi-reload") !== "1"
@@ -67,7 +80,6 @@
     <link rel="manifest" href="manifest.webmanifest" />
     <link rel="apple-touch-icon" href="icons/sapodilla-192.png" />
 
-    <link data-trunk rel="rust" data-wasm-opt="2" data-bindgen-target="web" />
     <link data-trunk rel="copy-file" href="static/_headers" />
     <link data-trunk rel="copy-file" href="static/coi-serviceworker.js" />
     <link data-trunk rel="copy-file" href="static/calibration-worker.js" />

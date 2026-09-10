@@ -17,5 +17,8 @@
 /coi-serviceworker.js
   Cache-Control: no-cache
 
+/calibration-worker.js
+  Cache-Control: no-cache
+
 /manifest.webmanifest
   Cache-Control: no-cache

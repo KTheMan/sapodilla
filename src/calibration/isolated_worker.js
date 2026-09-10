@@ -13,7 +13,9 @@ function applicationModuleUrls() {
   }
   const shimUrl = preload.href;
   const wasmUrl = shimUrl.replace(/\.js(?:$|([?#]))/, "_bg.wasm$1");
-  return { shimUrl, wasmUrl };
+  const buildRevision =
+    /sapodilla-([a-f0-9]+)\.js(?:$|[?#])/.exec(shimUrl)?.[1] || "development";
+  return { shimUrl, wasmUrl, buildRevision };
 }
 
 // Every request owns a fresh worker and a fresh WebAssembly memory. A scan can
@@ -39,7 +41,10 @@ function submitDisposable(kind, payload, transfer, callback) {
   };
 
   try {
-    worker = new Worker(new URL("calibration-worker.js", document.baseURI), {
+    const { shimUrl, wasmUrl, buildRevision } = applicationModuleUrls();
+    const workerUrl = new URL("calibration-worker.js", document.baseURI);
+    workerUrl.searchParams.set("build", buildRevision);
+    worker = new Worker(workerUrl, {
       type: "module",
       name: `sapodilla-calibration-${kind}`,
     });
@@ -64,7 +69,6 @@ function submitDisposable(kind, payload, transfer, callback) {
       }
     };
 
-    const { shimUrl, wasmUrl } = applicationModuleUrls();
     initializationTimeout = setTimeout(
       () => finish({ ok: false, error: `${kind} calibration worker initialization timed out` }),
       INITIALIZATION_TIMEOUT_MS,

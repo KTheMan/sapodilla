@@ -175,9 +175,20 @@ test("an interrupted primary write preserves the last verified backup", async ()
 test("service-worker activation deletes only obsolete Sapodilla caches", async () => {
   const handlers = new Map();
   const deleted = [];
+  const added = [];
+  const cache = {
+    add: async (url) => added.push(String(url)),
+    match: async () => undefined,
+    put: async () => {},
+  };
   globalThis.self = {
     registration: { scope: "https://example.test/sapodilla/" },
+    location: {
+      href: "https://example.test/sapodilla/coi-serviceworker.js?build=build-abcdef",
+      origin: "https://example.test",
+    },
     clients: { claim: async () => {} },
+    skipWaiting: async () => {},
     addEventListener: (name, handler) => handlers.set(name, handler),
   };
   globalThis.caches = {
@@ -185,8 +196,10 @@ test("service-worker activation deletes only obsolete Sapodilla caches", async (
       "sapodilla-app-shell-v0",
       "sapodilla-app-shell-v1",
       "sapodilla-app-shell-v2",
+      "sapodilla-app-shell-build-abcdef",
       "another-project-app-shell-v9",
     ],
+    open: async () => cache,
     delete: async (key) => {
       deleted.push(key);
       return true;
@@ -194,13 +207,46 @@ test("service-worker activation deletes only obsolete Sapodilla caches", async (
   };
 
   await importSource("../static/coi-serviceworker.js", "cache-ownership");
+  let installation;
+  handlers.get("install")({ waitUntil: (promise) => (installation = promise) });
+  await installation;
+  assert.ok(added.includes(
+    "https://example.test/sapodilla/calibration-worker.js?build=build-abcdef",
+  ));
   let activation;
   handlers.get("activate")({ waitUntil: (promise) => (activation = promise) });
   await activation;
   assert.deepEqual(deleted, [
     "sapodilla-app-shell-v0",
     "sapodilla-app-shell-v1",
+    "sapodilla-app-shell-v2",
   ]);
+
+  let fetchedRequest;
+  globalThis.fetch = async (request) => {
+    fetchedRequest = request;
+    return new Response("fresh worker", { status: 200 });
+  };
+  let fetchResponse;
+  handlers.get("fetch")({
+    request: new Request(
+      "https://example.test/sapodilla/calibration-worker.js?build=build-abcdef",
+    ),
+    respondWith: (promise) => (fetchResponse = promise),
+  });
+  await fetchResponse;
+  assert.equal(fetchedRequest.cache, "no-store");
+});
+
+test("service-worker bootstrap reads Trunk's build hash before registering", async () => {
+  const index = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const rustLink = index.indexOf('data-trunk rel="rust"');
+  const revisionLookup = index.indexOf("const moduleSource");
+
+  assert.ok(rustLink >= 0 && rustLink < revisionLookup);
+  assert.match(index, /coi-serviceworker\.js/);
+  assert.match(index, /updateViaCache:\s*"none"/);
+  assert.match(index, /controllerchange/);
 });
 
 test("calibration client gives every request a disposable isolated worker", async () => {
@@ -257,6 +303,10 @@ test("calibration client gives every request a disposable isolated worker", asyn
   assert.equal(print.ok, true);
   assert.equal(workers.length, 2);
   assert.equal(workers[0].options.type, "module");
+  assert.equal(
+    workers[0].url,
+    "https://example.test/sapodilla/calibration-worker.js?build=0123456789abcdef",
+  );
   assert.equal(workers[0].messages[0].message.wasmUrl,
     "https://example.test/sapodilla/sapodilla-0123456789abcdef_bg.wasm");
   const scanMessage = workers[0].messages.find(
