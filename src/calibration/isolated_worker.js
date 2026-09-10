@@ -18,6 +18,27 @@ function applicationModuleUrls() {
   return { shimUrl, wasmUrl, buildRevision };
 }
 
+async function reloadIfBuildChanged(openBuildRevision) {
+  if (typeof fetch !== "function") return;
+  try {
+    const response = await fetch(new URL(".", document.baseURI), { cache: "no-store" });
+    if (!response.ok) return;
+    const html = await response.text();
+    const currentBuildRevision =
+      /sapodilla-([a-f0-9]+)\.js(?:$|[?#'"<])/m.exec(html)?.[1];
+    if (
+      currentBuildRevision &&
+      currentBuildRevision !== openBuildRevision &&
+      typeof globalThis.window?.location?.reload === "function"
+    ) {
+      globalThis.window.location.reload();
+    }
+  } catch {
+    // The concrete worker error remains visible when an update check cannot
+    // reach the app shell (for example, while offline).
+  }
+}
+
 // Every request owns a fresh worker and a fresh WebAssembly memory. A scan can
 // neither retain its peak memory nor block printing, another scan, or the UI.
 function submitDisposable(kind, payload, transfer, callback) {
@@ -64,6 +85,13 @@ function submitDisposable(kind, payload, transfer, callback) {
         } catch (error) {
           finish({ ok: false, error: `could not submit ${kind} calibration work: ${error}` });
         }
+      } else if (event.data?.type === "initialization-error") {
+        const error = event.data.error || `could not initialize ${kind} calibration worker`;
+        finish({ ok: false, error });
+        // An app left open across a static deployment still references its old
+        // content-addressed shim/WASM. If those assets have been replaced,
+        // reload into the current build instead of leaving calibration broken.
+        void reloadIfBuildChanged(buildRevision);
       } else if (event.data?.type === "result") {
         finish(event.data);
       }

@@ -8,13 +8,13 @@ async function importSource(path, tag) {
   return import(`data:text/javascript;base64,${encoded}#${tag}`);
 }
 
-async function loadCalibrationWorker(tag) {
+async function loadCalibrationWorker(tag, bindingsSource) {
   const messages = [];
   globalThis.self = {
     postMessage: (message, transfer = []) => messages.push({ message, transfer }),
   };
   globalThis.__calibrationWorkerInput = undefined;
-  const bindings = [
+  const bindings = bindingsSource || [
     "export default async function initialize() {}",
     "export function isolated_calibration_scan(bytes) {",
     "  globalThis.__calibrationWorkerInput = Array.from(bytes);",
@@ -31,6 +31,23 @@ async function loadCalibrationWorker(tag) {
   });
   return messages;
 }
+
+test("calibration worker reports asynchronous initialization failures", async () => {
+  const messages = await loadCalibrationWorker(
+    "initialization-error-message",
+    [
+      "export default async function initialize() {",
+      "  throw new Error('simulated WASM bootstrap failure');",
+      "}",
+    ].join("\n"),
+  );
+  const failures = messages.filter(
+    ({ message }) => message.type === "initialization-error",
+  );
+
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].message.error, /simulated WASM bootstrap failure/);
+});
 
 function installIndexedDb() {
   const values = new Map();
@@ -507,6 +524,52 @@ test("calibration worker initialization failure completes its request exactly on
   assert.equal(calls, 1);
   assert.equal(result.ok, false);
   assert.match(result.error, /simulated startup failure/);
+});
+
+test("an explicit worker initialization error completes immediately and reloads a stale build", async () => {
+  let reloads = 0;
+  let terminated = false;
+  globalThis.document = {
+    baseURI: "https://example.test/sapodilla/",
+    querySelectorAll: () => [{
+      href: "https://example.test/sapodilla/sapodilla-0123456789abcdef.js",
+    }],
+  };
+  globalThis.window = {
+    location: { reload: () => { reloads += 1; } },
+  };
+  globalThis.fetch = async () => new Response(
+    '<script type="module">import init from "./sapodilla-fedcba9876543210.js";</script>',
+    { status: 200 },
+  );
+  globalThis.Worker = class {
+    postMessage(message) {
+      if (message.type === "initialize") {
+        queueMicrotask(() => this.onmessage({ data: {
+          type: "initialization-error",
+          error: "could not initialize calibration worker: missing old build",
+        } }));
+      }
+    }
+    terminate() {
+      terminated = true;
+    }
+  };
+  const client = await importSource(
+    "../src/calibration/isolated_worker.js",
+    "explicit-initialization-error",
+  );
+  const started = performance.now();
+  const result = await new Promise((resolve) =>
+    client.isolatedCalibrationPrint("{}", resolve),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /missing old build/);
+  assert.ok(performance.now() - started < 1_000);
+  assert.equal(terminated, true);
+  assert.equal(reloads, 1);
 });
 
 test("a timed-out calibration request is completed once and the worker is recreated", async () => {
