@@ -5059,6 +5059,7 @@ impl SapodillaApp {
         let device_index = self.selected_device;
         let mode_index = self.selected_mode;
         let canvas_index = self.selected_canvas_size;
+        let created_at = current_timestamp_millis();
         let tx = self.tx.clone();
         let worker_tx = tx.clone();
         let spawn_result = try_spawn_ui_background(&tx, move || {
@@ -5067,7 +5068,7 @@ impl SapodillaApp {
                 encoded_image_len: image.len(),
                 image_hash: hex::encode(sha1::Sha1::digest(&image)),
                 encoded_image: image.into(),
-                created_at: current_timestamp_millis(),
+                created_at,
                 copies,
                 device_index,
                 mode_index,
@@ -10033,7 +10034,10 @@ fn sanitize_printer_fallback_names(names: BTreeMap<String, String>) -> BTreeMap<
 
 #[cfg(target_arch = "wasm32")]
 fn current_timestamp_millis() -> u64 {
-    web_sys::window().unwrap().performance().unwrap().now() as u64
+    // Background `wasm_thread` workers have no `Window`. `Date.now()` is
+    // exposed on every browser worker global and also gives persisted wizard
+    // records the same Unix-epoch semantics as the native implementation.
+    js_sys::Date::now() as u64
 }
 
 #[cfg(test)]
