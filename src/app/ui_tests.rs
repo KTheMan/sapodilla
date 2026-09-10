@@ -531,7 +531,7 @@ fn flatbed_validation_can_reuse_an_earlier_print_and_scan() {
         session.device_job_ids_by_slot[2].push(111);
     }
     harness.state_mut().calibration_scan_watchdogs[1] = Some(CalibrationScanWatchdog {
-        started_at: std::time::Instant::now(),
+        started_at: web_time::Instant::now(),
         run_id: "ui-calibration".into(),
         validation_generation: 0,
         physical_sheet_attempt: 0,
@@ -583,7 +583,7 @@ fn discarded_run_watchdog_cannot_expire_a_new_scan() {
         .wizard
         .run_id = "discarded-run".into();
     harness.state_mut().calibration_scan_watchdogs[0] = Some(CalibrationScanWatchdog {
-        started_at: std::time::Instant::now() - std::time::Duration::from_secs(301),
+        started_at: web_time::Instant::now() - std::time::Duration::from_secs(301),
         run_id: "discarded-run".into(),
         validation_generation: 0,
         physical_sheet_attempt: 0,
