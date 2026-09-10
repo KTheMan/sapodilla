@@ -4627,16 +4627,15 @@ impl SapodillaApp {
             .wizard
             .mark_candidate_computing(current_timestamp_millis());
         let validation_generation = session.wizard.validation_generation;
-        let tx = self.tx.clone();
-        spawn_blocking(move || {
-            let result =
-                solve_calibration(method, &observations, CalibrationPolicy::pixcut_s1_4x7())
-                    .map_err(|error| error.to_string());
-            let _ = tx.send(Action::CalibrationCandidateSolved {
-                run_id,
-                validation_generation,
-                result,
-            });
+        // This is a tiny six-observation least-squares solve. Keeping it on the
+        // UI thread avoids creating another shared-memory worker at the exact
+        // transition where the operator accepts scan evidence.
+        let result = solve_calibration(method, &observations, CalibrationPolicy::pixcut_s1_4x7())
+            .map_err(|error| error.to_string());
+        let _ = self.tx.send(Action::CalibrationCandidateSolved {
+            run_id,
+            validation_generation,
+            result,
         });
     }
 

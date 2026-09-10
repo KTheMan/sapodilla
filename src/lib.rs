@@ -28,6 +28,35 @@ type Rc<T> = std::rc::Rc<T>;
 #[cfg(not(target_arch = "wasm32"))]
 type Rc<T> = std::sync::Arc<T>;
 
+/// Whether this browser context can safely share the application's WebAssembly
+/// memory with a worker. `wasm_thread` panics internally instead of returning
+/// an error when `postMessage` rejects a `SharedArrayBuffer`, so callers must
+/// enforce this precondition before entering the dependency.
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+#[doc(hidden)]
+pub fn browser_workers_ready() -> bool {
+    let global = js_sys::global();
+    let isolated = js_sys::Reflect::get(
+        &global,
+        &wasm_bindgen::JsValue::from_str("crossOriginIsolated"),
+    )
+    .ok()
+    .and_then(|value| value.as_bool())
+    .unwrap_or(false);
+    let shared_array_buffer = js_sys::Reflect::has(
+        &global,
+        &wasm_bindgen::JsValue::from_str("SharedArrayBuffer"),
+    )
+    .unwrap_or(false);
+    isolated && shared_array_buffer
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "web-workers")))]
+#[doc(hidden)]
+pub fn browser_workers_ready() -> bool {
+    true
+}
+
 #[cfg(target_arch = "wasm32")]
 #[inline]
 fn spawn<F>(future: F)
@@ -56,6 +85,11 @@ where
 {
     #[cfg(feature = "web-workers")]
     {
+        if !browser_workers_ready() {
+            return Err(
+                "browser workers require a cross-origin-isolated page; reload Sapodilla".into(),
+            );
+        }
         wasm_thread::Builder::new()
             .spawn(f)
             .map(|_| ())

@@ -31,7 +31,17 @@ fn main() {
     // The calibration worker initializes this same WebAssembly module with a
     // separate linear memory. It needs the exported calibration functions,
     // not a second eframe application (Workers have no Window or canvas).
-    if web_sys::window().is_none() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    // A threaded build can initialize its shared memory in a non-isolated
+    // document, but its first background operation will then trap inside
+    // wasm_thread while posting that memory to a Worker. Do not expose a
+    // partially functional UI while the service worker is still arranging
+    // cross-origin isolation; index.html will reload this document once the
+    // isolated controller is ready.
+    if !sapodilla::browser_workers_ready() {
         return;
     }
 
@@ -39,11 +49,8 @@ fn main() {
 
     let web_options = eframe::WebOptions::default();
 
-    wasm_bindgen_futures::spawn_local(async {
-        let document = web_sys::window()
-            .expect("No window")
-            .document()
-            .expect("No document");
+    wasm_bindgen_futures::spawn_local(async move {
+        let document = window.document().expect("No document");
 
         let canvas = document
             .get_element_by_id("sapodilla_canvas")
