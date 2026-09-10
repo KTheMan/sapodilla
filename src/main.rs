@@ -23,6 +23,13 @@ fn main() -> eframe::Result {
 fn main() {
     use eframe::wasm_bindgen::JsCast as _;
 
+    // The calibration worker initializes this same WebAssembly module with a
+    // separate linear memory. It needs the exported calibration functions,
+    // not a second eframe application (Workers have no Window or canvas).
+    if web_sys::window().is_none() {
+        return;
+    }
+
     console_error_panic_hook::set_once();
     wasm_tracing::set_as_global_default();
 

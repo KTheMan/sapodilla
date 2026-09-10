@@ -96,6 +96,32 @@ struct PendingExternalCalibrationCommit {
 const MAX_ACTIONS_PER_FRAME: usize = 256;
 const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/src/calibration/isolated_worker.js")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = isolatedCalibrationScan)]
+    fn isolated_calibration_scan_js(
+        bytes: &js_sys::Uint8Array,
+        manifest_json: &str,
+        config_json: &str,
+        callback: &js_sys::Function,
+    ) -> Result<(), wasm_bindgen::JsValue>;
+
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = isolatedCalibrationPrint)]
+    fn isolated_calibration_print_js(
+        request_json: &str,
+        callback: &js_sys::Function,
+    ) -> Result<(), wasm_bindgen::JsValue>;
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IsolatedCalibrationPrintRequest {
+    identity: ManifestIdentity,
+    method: CalibrationMethod,
+    validation: bool,
+}
+
 mod calibration_ui;
 
 const MATERIAL_PROFILES_STORAGE_KEY: &str = "sapodilla.material-profiles.v1";
@@ -430,6 +456,7 @@ pub struct SapodillaApp {
     pub active_queue_job: Option<u64>,
     pub active_queue_jobs: BTreeMap<String, u64>,
     pending_print_jobs: BTreeMap<u64, PendingPrintJob>,
+    print_routes_encoding: BTreeSet<u64>,
     print_preparing: bool,
     document_saving: bool,
     pub send_progress: Option<f32>,
@@ -1432,6 +1459,7 @@ impl SapodillaApp {
             active_queue_job: None,
             active_queue_jobs: BTreeMap::new(),
             pending_print_jobs: BTreeMap::new(),
+            print_routes_encoding: BTreeSet::new(),
             print_preparing: false,
             document_saving: false,
             send_progress: None,
@@ -2062,8 +2090,10 @@ impl SapodillaApp {
             overcut_reach_mm: self.overcut.reach_pixels * 25.4 / DEVICES[self.selected_device].dpi,
             overcut_snap_to_pixels: self.overcut.snap_to_pixels,
         };
+        // `bool::then_some` evaluates its argument eagerly, which panicked on
+        // the first Save in an empty workspace by indexing an empty selection.
         let sticker_selection = (kind == DocumentKind::Sticker && self.selected_images.len() == 1)
-            .then_some(self.selected_images[0]);
+            .then(|| self.selected_images[0]);
         for (index, image) in self.loaded_images.iter().enumerate() {
             if sticker_selection.is_some_and(|selected| selected != index) {
                 continue;
@@ -2266,6 +2296,20 @@ impl SapodillaApp {
                 let _ = tx.send(Action::DocumentSaveFinished(Ok(())));
                 return;
             };
+
+            // Starting a shared-memory wasm worker can contend with the UI's
+            // allocator. An empty project has no image data to compress, so
+            // encoding it inline is both effectively free and avoids spinning
+            // up a worker for the very first Save action.
+            if snapshot.images.is_empty() {
+                let result = match snapshot.encode().and_then(|document| document.to_json()) {
+                    Ok(data) => file.write(&data).await.map_err(anyhow::Error::from),
+                    Err(error) => Err(error),
+                };
+                let _ = tx.send(Action::DocumentSaveFinished(result));
+                return;
+            }
+
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             spawn_blocking(move || {
                 let result = snapshot.encode().and_then(|document| document.to_json());
@@ -3589,13 +3633,14 @@ impl SapodillaApp {
                 }
                 Action::PrintPreparationFailed(message) => {
                     self.print_preparing = false;
-                    self.calibration_message = Some(message);
+                    self.error = Some(anyhow::anyhow!(message));
                 }
                 Action::PrintRouteEncoded {
                     printer_id,
                     job_id,
                     result,
                 } => {
+                    self.print_routes_encoding.remove(&job_id);
                     // The worker may finish after a retry, cancellation, or
                     // calibration-generation change detached this route.
                     if self.active_queue_jobs.get(&printer_id) != Some(&job_id) {
@@ -4135,35 +4180,88 @@ impl SapodillaApp {
         let spec = calibration_job_spec(name, printer_id);
         let failure_spec = spec.clone();
         let failure_run_id = run_id.clone();
-        let worker_tx = tx.clone();
-        let spawn_result = try_spawn_ui_background(&tx, move || {
-            let result = build_calibration_print_job(
-                manifest_identity,
+
+        #[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+        {
+            let request = IsolatedCalibrationPrintRequest {
+                identity: manifest_identity.clone(),
                 method,
-                slot,
-                material,
-                mapping_override,
-            );
-            let _ = worker_tx.send_background(Action::CalibrationJobPrepared {
-                run_id,
-                validation_generation,
-                physical_sheet_attempt,
-                slot,
-                spec,
-                result,
+                validation: slot == CalibrationJobSlot::Validation,
+            };
+            let created_at = current_timestamp_millis();
+            let completion_tx = tx.clone();
+            let completion_run_id = run_id.clone();
+            let completion_spec = spec.clone();
+            let completion = move |rendered: Result<Vec<u8>, String>| {
+                let result = rendered
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|encoded_image| {
+                        assemble_calibration_print_job(
+                            manifest_identity,
+                            method,
+                            slot == CalibrationJobSlot::Validation,
+                            material,
+                            mapping_override,
+                            encoded_image,
+                            created_at,
+                        )
+                    });
+                let _ = completion_tx.send(Action::CalibrationJobPrepared {
+                    run_id: completion_run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    slot,
+                    spec: completion_spec,
+                    result,
+                });
+            };
+            if let Err(error) = start_isolated_calibration_print(request, completion) {
+                let _ = tx.send(Action::CalibrationJobPrepared {
+                    run_id: failure_run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    slot,
+                    spec: failure_spec,
+                    result: Err(anyhow::anyhow!(
+                        "could not start isolated calibration print worker: {error}"
+                    )),
+                });
+            }
+            return;
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "web-workers")))]
+        {
+            let worker_tx = tx.clone();
+            let spawn_result = try_spawn_ui_background(&tx, move || {
+                let result = build_calibration_print_job(
+                    manifest_identity,
+                    method,
+                    slot,
+                    material,
+                    mapping_override,
+                );
+                let _ = worker_tx.send_background(Action::CalibrationJobPrepared {
+                    run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    slot,
+                    spec,
+                    result,
+                });
             });
-        });
-        if let Err(error) = spawn_result {
-            let _ = tx.send(Action::CalibrationJobPrepared {
-                run_id: failure_run_id,
-                validation_generation,
-                physical_sheet_attempt,
-                slot,
-                spec: failure_spec,
-                result: Err(anyhow::anyhow!(
-                    "could not start calibration print worker: {error}"
-                )),
-            });
+            if let Err(error) = spawn_result {
+                let _ = tx.send(Action::CalibrationJobPrepared {
+                    run_id: failure_run_id,
+                    validation_generation,
+                    physical_sheet_attempt,
+                    slot,
+                    spec: failure_spec,
+                    result: Err(anyhow::anyhow!(
+                        "could not start calibration print worker: {error}"
+                    )),
+                });
+            }
         }
     }
 
@@ -4329,45 +4427,94 @@ impl SapodillaApp {
             let bytes = file.read().await;
             let failure_run_id = run_id.clone();
             let failure_file_name = file_name.clone();
-            let worker_tx = tx.clone();
-            let spawn_result = try_spawn_ui_background(&tx, move || {
-                let manifest =
-                    calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation);
-                let result = manifest
-                    .map_err(|error| error.to_string())
-                    .and_then(|manifest| {
-                        analyze_calibration_scan_for_platform(&bytes, &manifest, scan_config)
-                            .map_err(|error| error.to_string())
-                    })
-                    .and_then(|(report, preview)| {
-                        calibration_scan_preview(&preview)
-                            .map(|preview_png| CalibrationScanImport {
-                                report,
-                                preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
-                                preview_png: preview_png.into(),
-                            })
-                            .map_err(|error| error.to_string())
+
+            #[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+            {
+                let result =
+                    calibration_manifest(manifest_identity, method, slot == ScanSlot::Validation)
+                        .map_err(|error| error.to_string())
+                        .and_then(|manifest| {
+                            let completion_tx = tx.clone();
+                            let completion_run_id = run_id.clone();
+                            let completion_file_name = file_name.clone();
+                            start_isolated_calibration_scan(
+                                bytes,
+                                manifest,
+                                scan_config,
+                                move |result| {
+                                    let _ = completion_tx.send(Action::CalibrationScanAnalyzed {
+                                        run_id: completion_run_id,
+                                        validation_generation,
+                                        physical_sheet_attempt,
+                                        scan_request_generation,
+                                        slot,
+                                        file_name: completion_file_name,
+                                        result,
+                                    });
+                                },
+                            )
+                        });
+                if let Err(error) = result {
+                    let _ = tx.send(Action::CalibrationScanAnalyzed {
+                        run_id: failure_run_id,
+                        validation_generation,
+                        physical_sheet_attempt,
+                        scan_request_generation,
+                        slot,
+                        file_name: failure_file_name,
+                        result: Err(format!(
+                            "could not start isolated calibration scan worker: {error}"
+                        )),
                     });
-                let _ = worker_tx.send_background(Action::CalibrationScanAnalyzed {
-                    run_id,
-                    validation_generation,
-                    physical_sheet_attempt,
-                    scan_request_generation,
-                    slot,
-                    file_name,
-                    result,
+                }
+                return;
+            }
+
+            #[cfg(not(all(target_arch = "wasm32", feature = "web-workers")))]
+            {
+                let worker_tx = tx.clone();
+                let spawn_result = try_spawn_ui_background(&tx, move || {
+                    let manifest = calibration_manifest(
+                        manifest_identity,
+                        method,
+                        slot == ScanSlot::Validation,
+                    );
+                    let result = manifest
+                        .map_err(|error| error.to_string())
+                        .and_then(|manifest| {
+                            analyze_calibration_scan_for_platform(&bytes, &manifest, scan_config)
+                                .map_err(|error| error.to_string())
+                        })
+                        .and_then(|(report, preview)| {
+                            calibration_scan_preview(&preview)
+                                .map(|preview_png| CalibrationScanImport {
+                                    report,
+                                    preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
+                                    preview_png: preview_png.into(),
+                                })
+                                .map_err(|error| error.to_string())
+                        });
+                    let _ = worker_tx.send_background(Action::CalibrationScanAnalyzed {
+                        run_id,
+                        validation_generation,
+                        physical_sheet_attempt,
+                        scan_request_generation,
+                        slot,
+                        file_name,
+                        result,
+                    });
                 });
-            });
-            if let Err(error) = spawn_result {
-                let _ = tx.send(Action::CalibrationScanAnalyzed {
-                    run_id: failure_run_id,
-                    validation_generation,
-                    physical_sheet_attempt,
-                    scan_request_generation,
-                    slot,
-                    file_name: failure_file_name,
-                    result: Err(format!("could not start calibration scan worker: {error}")),
-                });
+                if let Err(error) = spawn_result {
+                    let _ = tx.send(Action::CalibrationScanAnalyzed {
+                        run_id: failure_run_id,
+                        validation_generation,
+                        physical_sheet_attempt,
+                        scan_request_generation,
+                        slot,
+                        file_name: failure_file_name,
+                        result: Err(format!("could not start calibration scan worker: {error}")),
+                    });
+                }
             }
         });
     }
@@ -4918,6 +5065,23 @@ impl SapodillaApp {
             let queue_id = route.job_id;
             let printer_id = route.printer_id;
             let failure_printer_id = printer_id.clone();
+
+            // Calibration rasterization already ran in a dedicated worker
+            // with its own Wasm memory. Its small, pre-planned PLT route must
+            // not be handed back to wasm_thread, which shares the UI allocator
+            // and was the source of repeated browser stalls.
+            if payload.calibration_phases.is_some() {
+                let result =
+                    encode_and_validate_print_route(payload, plotter_mapping, mode, &canvas_size);
+                let _ = tx.send(Action::PrintRouteEncoded {
+                    printer_id,
+                    job_id: queue_id,
+                    result,
+                });
+                continue;
+            }
+
+            self.print_routes_encoding.insert(queue_id);
             let worker_tx = tx.clone();
             let encode = move || {
                 let result =
@@ -6758,36 +6922,10 @@ impl eframe::App for SapodillaApp {
         self.expire_stalled_calibration_scans();
         #[cfg(target_arch = "wasm32")]
         {
-            let calibration_background_work =
-                self.calibration_session.as_ref().is_some_and(|session| {
-                    matches!(
-                        session.wizard.training_scan,
-                        crate::calibration::ScanImportStatus::Importing { .. }
-                    ) || matches!(
-                        session.wizard.validation_scan,
-                        crate::calibration::ScanImportStatus::Importing { .. }
-                    ) || [
-                        CalibrationJobSlot::Primary,
-                        CalibrationJobSlot::Second,
-                        CalibrationJobSlot::Validation,
-                    ]
-                    .into_iter()
-                    .any(|slot| {
-                        let status = match slot {
-                            CalibrationJobSlot::Primary => session.wizard.primary_job,
-                            CalibrationJobSlot::Second => session.wizard.second_job,
-                            CalibrationJobSlot::Validation => session.wizard.validation_job,
-                        };
-                        status == crate::calibration::JobStatus::Queued
-                            && session.queue_job(slot).is_none()
-                    })
-                });
-            if calibration_background_work
-                || self.print_preparing
-                || !self.active_queue_jobs.is_empty()
-            {
+            if self.print_preparing || !self.print_routes_encoding.is_empty() {
                 // Worker-side egui repaint callbacks are not Window-safe on
-                // the web. Poll on the main thread while work is outstanding.
+                // the web. Only poll while the legacy shared-memory workers
+                // are actually computing, never for an entire physical print.
                 ctx.request_repaint_after(BACKGROUND_POLL_INTERVAL);
             }
         }
@@ -8555,6 +8693,161 @@ fn validate_pixcut_job_envelope(
     Ok(())
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn decode_isolated_worker_result(
+    response: wasm_bindgen::JsValue,
+) -> Result<(String, Vec<u8>), String> {
+    use wasm_bindgen::JsValue;
+
+    let get = |name: &str| {
+        js_sys::Reflect::get(&response, &JsValue::from_str(name))
+            .map_err(|_| format!("calibration worker response omitted {name}"))
+    };
+    if !get("ok")?.as_bool().unwrap_or(false) {
+        return Err(get("error")?
+            .as_string()
+            .unwrap_or_else(|| "calibration worker failed without an error message".into()));
+    }
+    let text = get("text")?.as_string().unwrap_or_default();
+    let bytes = js_sys::Uint8Array::new(&get("bytes")?).to_vec();
+    Ok((text, bytes))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn deliver_isolated_worker_start_error(
+    callback: &wasm_bindgen::JsValue,
+    error: wasm_bindgen::JsValue,
+) {
+    use wasm_bindgen::{JsCast as _, JsValue};
+
+    let response = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&response, &JsValue::from_str("ok"), &JsValue::FALSE);
+    let message = error.as_string().unwrap_or_else(|| format!("{error:?}"));
+    let _ = js_sys::Reflect::set(
+        &response,
+        &JsValue::from_str("error"),
+        &JsValue::from_str(&message),
+    );
+    let _ = callback
+        .unchecked_ref::<js_sys::Function>()
+        .call1(&JsValue::NULL, &response);
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn start_isolated_calibration_scan<F>(
+    encoded: Vec<u8>,
+    manifest: TargetManifest,
+    config: ScanAnalysisConfig,
+    completion: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Result<CalibrationScanImport, String>) + 'static,
+{
+    use wasm_bindgen::JsCast as _;
+
+    let manifest_json = serde_json::to_string(&manifest).map_err(|error| error.to_string())?;
+    let config_json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
+    let callback = wasm_bindgen::closure::Closure::once_into_js(move |response| {
+        let result =
+            decode_isolated_worker_result(response).and_then(|(report_json, preview_png)| {
+                let report = serde_json::from_str(&report_json)
+                    .map_err(|error| format!("invalid calibration worker report: {error}"))?;
+                Ok(CalibrationScanImport {
+                    report,
+                    preview_sha1: hex::encode(sha1::Sha1::digest(&preview_png)),
+                    preview_png: preview_png.into(),
+                })
+            });
+        completion(result);
+    });
+    let bytes = js_sys::Uint8Array::from(encoded.as_slice());
+    isolated_calibration_scan_js(
+        &bytes,
+        &manifest_json,
+        &config_json,
+        callback.unchecked_ref(),
+    )
+    .unwrap_or_else(|error| deliver_isolated_worker_start_error(&callback, error));
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn start_isolated_calibration_print<F>(
+    request: IsolatedCalibrationPrintRequest,
+    completion: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Result<Vec<u8>, String>) + 'static,
+{
+    use wasm_bindgen::JsCast as _;
+
+    let request_json = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    let callback = wasm_bindgen::closure::Closure::once_into_js(move |response| {
+        completion(decode_isolated_worker_result(response).map(|(_, bytes)| bytes));
+    });
+    isolated_calibration_print_js(&request_json, callback.unchecked_ref())
+        .unwrap_or_else(|error| deliver_isolated_worker_start_error(&callback, error));
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn isolated_worker_success(text: String, bytes: Vec<u8>) -> js_sys::Array {
+    use wasm_bindgen::JsValue;
+
+    let result = js_sys::Array::new();
+    result.push(&JsValue::TRUE);
+    result.push(&JsValue::from_str(&text));
+    result.push(&js_sys::Uint8Array::from(bytes.as_slice()));
+    result
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+fn isolated_worker_failure(error: impl std::fmt::Display) -> js_sys::Array {
+    use wasm_bindgen::JsValue;
+
+    let result = js_sys::Array::new();
+    result.push(&JsValue::FALSE);
+    result.push(&JsValue::from_str(&error.to_string()));
+    result.push(&js_sys::Uint8Array::new_with_length(0));
+    result
+}
+
+/// Runs only inside the separately initialized calibration WebAssembly worker.
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn isolated_calibration_scan(
+    encoded: &[u8],
+    manifest_json: &str,
+    config_json: &str,
+) -> js_sys::Array {
+    let result = (|| {
+        let manifest: TargetManifest = serde_json::from_str(manifest_json)?;
+        let config: ScanAnalysisConfig = serde_json::from_str(config_json)?;
+        let (report, preview) = analyze_calibration_scan_for_platform(encoded, &manifest, config)?;
+        let preview_png = calibration_scan_preview(&preview)?;
+        Ok::<_, anyhow::Error>((serde_json::to_string(&report)?, preview_png))
+    })();
+    match result {
+        Ok((report_json, preview_png)) => isolated_worker_success(report_json, preview_png),
+        Err(error) => isolated_worker_failure(error),
+    }
+}
+
+/// Runs only inside the separately initialized calibration WebAssembly worker.
+#[cfg(all(target_arch = "wasm32", feature = "web-workers"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn isolated_calibration_print(request_json: &str) -> js_sys::Array {
+    let result = (|| {
+        let request: IsolatedCalibrationPrintRequest = serde_json::from_str(request_json)?;
+        render_calibration_print_image(request.identity, request.method, request.validation)
+    })();
+    match result {
+        Ok(encoded_image) => isolated_worker_success(String::new(), encoded_image),
+        Err(error) => isolated_worker_failure(error),
+    }
+}
+
+#[cfg(any(test, not(all(target_arch = "wasm32", feature = "web-workers"))))]
 fn build_calibration_print_job(
     identity: ManifestIdentity,
     method: CalibrationMethod,
@@ -8562,10 +8855,41 @@ fn build_calibration_print_job(
     material: MaterialProfile,
     mapping_override: Option<CanvasToPlotter>,
 ) -> anyhow::Result<PendingPrintJob> {
+    let created_at = current_timestamp_millis();
     let validation = slot == CalibrationJobSlot::Validation;
+    let encoded_image = render_calibration_print_image(identity.clone(), method, validation)?;
+    assemble_calibration_print_job(
+        identity,
+        method,
+        validation,
+        material,
+        mapping_override,
+        encoded_image,
+        created_at,
+    )
+}
+
+fn render_calibration_print_image(
+    identity: ManifestIdentity,
+    method: CalibrationMethod,
+    validation: bool,
+) -> anyhow::Result<Vec<u8>> {
     let manifest = calibration_manifest(identity, method, validation)?;
     let raster = render_print_raster(&manifest)?;
-    let encoded_image = encode_image(&image::DynamicImage::ImageRgb8(raster));
+    Ok(encode_image(&image::DynamicImage::ImageRgb8(raster)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_calibration_print_job(
+    identity: ManifestIdentity,
+    method: CalibrationMethod,
+    validation: bool,
+    material: MaterialProfile,
+    mapping_override: Option<CanvasToPlotter>,
+    encoded_image: Vec<u8>,
+    created_at: u64,
+) -> anyhow::Result<PendingPrintJob> {
+    let manifest = calibration_manifest(identity, method, validation)?;
     let pixels_per_mm = f64::from(DEVICES[0].dpi) / 25.4;
     let mut kiss_paths = Vec::new();
     let mut through_paths = Vec::new();
@@ -8611,7 +8935,7 @@ fn build_calibration_print_job(
         encoded_image_len: encoded_image.len(),
         image_hash: hex::encode(sha1::Sha1::digest(&encoded_image)),
         encoded_image: encoded_image.into(),
-        created_at: current_timestamp_millis(),
+        created_at,
         copies: 1,
         device_index: 0,
         mode_index: 1,
