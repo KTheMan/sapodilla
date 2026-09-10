@@ -559,7 +559,9 @@ pub struct SapodillaApp {
 
 #[derive(Debug)]
 struct CalibrationScanWatchdog {
-    started_at: std::time::Instant,
+    // `std::time::Instant::now()` panics in browser WASM. `web_time` uses the
+    // global Performance clock and works in both Window and Worker contexts.
+    started_at: web_time::Instant,
     run_id: String,
     validation_generation: u32,
     physical_sheet_attempt: u32,
@@ -3742,7 +3744,7 @@ impl SapodillaApp {
                     );
                     self.calibration_scan_watchdogs[CalibrationSession::scan_slot_index(slot)] =
                         Some(CalibrationScanWatchdog {
-                            started_at: std::time::Instant::now(),
+                            started_at: web_time::Instant::now(),
                             run_id,
                             validation_generation,
                             physical_sheet_attempt,
