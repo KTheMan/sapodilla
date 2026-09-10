@@ -1,9 +1,10 @@
 const CACHE_PREFIX = "sapodilla-app-shell-";
-const CACHE_NAME = `${CACHE_PREFIX}v1`;
+const CACHE_NAME = `${CACHE_PREFIX}v2`;
 const SHELL_PATHS = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
+  "./calibration-worker.js",
   "./icons/sapodilla-192.png",
   "./icons/sapodilla-512.png",
 ];
@@ -64,7 +65,13 @@ self.addEventListener("fetch", (event) => {
   }
 
   const isNavigation = request.mode === "navigate";
-  const isImmutableAsset = /\.(?:js|wasm|png)$/.test(url.pathname);
+  // Only content-addressed build artifacts are immutable. Trunk's generated
+  // snippet names and our worker scripts can keep the same URL while their
+  // bytes (and SRI digest) change, so serving those cache-first can prevent a
+  // corrected build from ever loading.
+  const isImmutableAsset =
+    /\/[a-z0-9_-]+-[a-f0-9]{16,}(?:_bg)?\.(?:js|wasm)$/.test(url.pathname) ||
+    /\/icons\/[^/]+\.png$/.test(url.pathname);
   event.respondWith(
     (async () => {
       const cache = await caches.open(CACHE_NAME);

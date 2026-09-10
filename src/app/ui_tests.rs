@@ -11,6 +11,20 @@ fn app_harness(size: Vec2) -> Harness<'static, SapodillaApp> {
         .build_eframe(|cc| SapodillaApp::new(cc))
 }
 
+#[test]
+fn fresh_workspace_can_snapshot_an_empty_sticker_document_for_save() {
+    let harness = app_harness(Vec2::new(900.0, 700.0));
+
+    assert!(harness.state().selected_images.is_empty());
+    let snapshot = harness
+        .state()
+        .document_snapshot(DocumentKind::Sticker)
+        .expect("an empty first-save snapshot should not panic or fail");
+
+    assert!(snapshot.images.is_empty());
+    assert!(snapshot.document.images.is_empty());
+}
+
 fn open_calibration_fixture(harness: &mut Harness<'_, SapodillaApp>) {
     let wizard = CalibrationWizard::new("ui-calibration", 1).unwrap();
     harness.state_mut().calibration_session = Some(CalibrationSession {
@@ -54,6 +68,28 @@ fn open_calibration_fixture(harness: &mut Harness<'_, SapodillaApp>) {
     });
     harness.state_mut().calibration_ui_state = calibration_ui::CalibrationUiState::default();
     harness.run();
+}
+
+#[test]
+fn print_preparation_failure_opens_the_visible_error_modal() {
+    let mut harness = app_harness(Vec2::new(900.0, 700.0));
+    harness.state_mut().print_preparing = true;
+    harness
+        .state()
+        .tx
+        .send(Action::PrintPreparationFailed(
+            "print preparation worker stopped".into(),
+        ))
+        .unwrap();
+    harness.run();
+
+    assert!(!harness.state().print_preparing);
+    assert_eq!(
+        harness.state().error.as_ref().map(ToString::to_string),
+        Some("print preparation worker stopped".into())
+    );
+    harness.get_by_label("Error");
+    harness.get_by_label("print preparation worker stopped");
 }
 
 #[test]

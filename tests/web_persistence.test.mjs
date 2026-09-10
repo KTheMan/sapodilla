@@ -160,6 +160,7 @@ test("service-worker activation deletes only obsolete Sapodilla caches", async (
     keys: async () => [
       "sapodilla-app-shell-v0",
       "sapodilla-app-shell-v1",
+      "sapodilla-app-shell-v2",
       "another-project-app-shell-v9",
     ],
     delete: async (key) => {
@@ -172,5 +173,165 @@ test("service-worker activation deletes only obsolete Sapodilla caches", async (
   let activation;
   handlers.get("activate")({ waitUntil: (promise) => (activation = promise) });
   await activation;
-  assert.deepEqual(deleted, ["sapodilla-app-shell-v0"]);
+  assert.deepEqual(deleted, [
+    "sapodilla-app-shell-v0",
+    "sapodilla-app-shell-v1",
+  ]);
+});
+
+test("calibration client reuses one isolated worker and transfers scan bytes", async () => {
+  const workers = [];
+  const appModule = "https://example.test/sapodilla/sapodilla-0123456789abcdef.js";
+  globalThis.document = {
+    baseURI: "https://example.test/sapodilla/",
+    querySelectorAll: () => [{ href: appModule }],
+  };
+  globalThis.Worker = class {
+    constructor(url, options) {
+      this.url = String(url);
+      this.options = options;
+      this.messages = [];
+      workers.push(this);
+    }
+
+    postMessage(message, transfer = []) {
+      this.messages.push({ message, transfer });
+      if (message.type === "initialize") {
+        queueMicrotask(() => this.onmessage({ data: { type: "ready" } }));
+      } else if (message.type === "request") {
+        queueMicrotask(() =>
+          this.onmessage({
+            data: {
+              type: "result",
+              id: message.id,
+              ok: true,
+              text: message.kind === "scan" ? "{}" : "",
+              bytes: new Uint8Array([9, 8]).buffer,
+            },
+          }),
+        );
+      }
+    }
+
+    terminate() {}
+  };
+
+  const client = await importSource(
+    "../src/calibration/isolated_worker.js",
+    "persistent-worker",
+  );
+  const scan = await new Promise((resolve) =>
+    client.isolatedCalibrationScan(new Uint8Array([1, 2, 3]), "{}", "{}", resolve),
+  );
+  const print = await new Promise((resolve) =>
+    client.isolatedCalibrationPrint("{}", resolve),
+  );
+
+  assert.equal(scan.ok, true);
+  assert.equal(print.ok, true);
+  assert.equal(workers.length, 1);
+  assert.equal(workers[0].options.type, "module");
+  assert.equal(workers[0].messages[0].message.wasmUrl,
+    "https://example.test/sapodilla/sapodilla-0123456789abcdef_bg.wasm");
+  const scanMessage = workers[0].messages.find(
+    ({ message }) => message.kind === "scan",
+  );
+  assert.equal(scanMessage.transfer.length, 1);
+  assert.equal(scanMessage.transfer[0], scanMessage.message.bytes);
+});
+
+test("calibration worker initialization failure completes its request exactly once", async () => {
+  globalThis.document = {
+    baseURI: "https://example.test/sapodilla/",
+    querySelectorAll: () => [{
+      href: "https://example.test/sapodilla/sapodilla-0123456789abcdef.js",
+    }],
+  };
+  globalThis.Worker = class {
+    postMessage(message) {
+      if (message.type === "initialize") {
+        queueMicrotask(() => this.onerror({ message: "simulated startup failure" }));
+      }
+    }
+    terminate() {}
+  };
+  const client = await importSource(
+    "../src/calibration/isolated_worker.js",
+    "startup-failure",
+  );
+  let calls = 0;
+  const result = await new Promise((resolve) =>
+    client.isolatedCalibrationPrint("{}", (message) => {
+      calls += 1;
+      resolve(message);
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /simulated startup failure/);
+});
+
+test("a timed-out calibration request is completed once and the worker is recreated", async () => {
+  const workers = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) =>
+    realSetTimeout(callback, delay >= 30_000 ? 5 : delay, ...args);
+  globalThis.document = {
+    baseURI: "https://example.test/sapodilla/",
+    querySelectorAll: () => [{
+      href: "https://example.test/sapodilla/sapodilla-0123456789abcdef.js",
+    }],
+  };
+  globalThis.Worker = class {
+    constructor() {
+      this.index = workers.length;
+      this.terminated = false;
+      workers.push(this);
+    }
+    postMessage(message) {
+      if (message.type === "initialize") {
+        queueMicrotask(() => this.onmessage({ data: { type: "ready" } }));
+      } else if (message.type === "request" && this.index > 0) {
+        queueMicrotask(() => this.onmessage({
+          data: {
+            type: "result",
+            id: message.id,
+            ok: true,
+            text: "",
+            bytes: new ArrayBuffer(0),
+          },
+        }));
+      }
+    }
+    terminate() {
+      this.terminated = true;
+    }
+  };
+
+  try {
+    const client = await importSource(
+      "../src/calibration/isolated_worker.js",
+      "request-timeout",
+    );
+    let firstCalls = 0;
+    const first = await new Promise((resolve) =>
+      client.isolatedCalibrationPrint("{}", (message) => {
+        firstCalls += 1;
+        resolve(message);
+      }),
+    );
+    const second = await new Promise((resolve) =>
+      client.isolatedCalibrationPrint("{}", resolve),
+    );
+
+    assert.equal(firstCalls, 1);
+    assert.equal(first.ok, false);
+    assert.match(first.error, /timed out/);
+    assert.equal(workers[0].terminated, true);
+    assert.equal(workers.length, 2);
+    assert.equal(second.ok, true);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 });
